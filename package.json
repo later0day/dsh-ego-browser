@@ -53,20 +53,37 @@
     "schemastery": "^3.18.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-client-locale": { "optional": true },
-    "@deepseek-ai/dsh-client-store": { "optional": true },
-    "@deepseek-ai/dsh-client-ui-settings-plugins": { "optional": true },
-    "@deepseek-ai/dsh-client-ui-slots": { "optional": true },
-    "@deepseek-ai/dsh-settings": { "optional": true },
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "react": { "optional": true },
-    "schemastery": { "optional": true }
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-store": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-settings-plugins": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-slots": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "schemastery": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
     "@types/react": "~18.3.31",
     "@types/ws": "^8.5.10",
     "jsdom": "^26.0.0",
+    "schemastery": "^3.18.0",
     "tsdown": "^0.15.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0",

@@ -14,12 +14,11 @@
 // settings RPC domain only serves a fixed namespace set to browser
 // configuration clients; the gateway bypasses it through a self-hosted HTTP
 // route).
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { Config } from './config.ts'
 import type { EgoContext, SettingsScope } from './types.ts'
 
 /** Settings namespace under which ego-browser config persists. */
-export const SETTINGS_NAMESPACE = settingsNamespace('ego-browser')
+export const SETTINGS_NAMESPACE = 'ego-browser'
 
 const SHARED_SCOPE_KEY = Symbol.for('dsh-ego-browser.settings-scope')
 
