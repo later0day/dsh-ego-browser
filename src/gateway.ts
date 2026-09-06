@@ -35,7 +35,7 @@ const API_PREFIX = '/ego/api'
 const ALLOWED_KEYS = new Set<string>([
   'chromePath', 'captureBackend', 'streamProfile', 'cdpFps', 'cdpQuality',
   'cdpMaxWidth', 'cdpBackstopIntervalMs', 'ffmpegFps', 'ffmpegMaxWidth', 'ffmpegBitrateKbps',
-  'ffmpegEncoder', 'ffmpegPath', 'githubMirror',
+  'ffmpegEncoder', 'ffmpegPath', 'githubMirror', 'egoCliArgs', 'chromeArgs',
 ])
 
 interface EnvelopeOk<T> { ok: true; value: T }

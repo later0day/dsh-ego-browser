@@ -1,0 +1,140 @@
+{
+  "id": "dsh-ego-browser",
+  "name": "ego-browser",
+  "packageName": "dsh-ego-browser",
+  "description": "Agent 浏览器：结构化浏览器自动化工具(30+ ego_*) + 实时 watch 面板(SSE screencast/鼠标直控/下载捕获/登录引导)，内置 ego-lite Chrome CDP 宿主。",
+  "repositoryUrl": "https://github.com/Fisfzy/dsh-ego-browser",
+  "defaultBranch": "master",
+  "manifestPath": "package.json",
+  "updatePolicy": "user-reviewed",
+  "commit": "e409e65a2ad522a823a13b2c6dbc88ae9e9dbf20",
+  "version": "0.8.3",
+  "categories": [
+    "development",
+    "browser"
+  ],
+  "featured": false,
+  "source": {
+    "updatedAt": "2026-09-06T16:46:22.573Z",
+    "observedAt": "2026-09-06T16:30:00+08:00",
+    "provenance": "github-commit"
+  },
+  "assurance": {
+    "discovery": {
+      "status": "verified",
+      "method": "fixed-commit-clone",
+      "checkedAt": "2026-09-06T16:30:00+08:00",
+      "evidenceUrl": "https://github.com/Fisfzy/dsh-ego-browser/commit/e4694389951dff3d74b89e1de9ec1f885c548aac",
+      "dshRelease": "0.1.2-rc.1",
+      "systems": [
+        "win32-x64"
+      ],
+      "profiles": [
+        "web"
+      ],
+      "summary": "固定 commit 克隆，manifest/bundle patch/entry id 对齐，profile web 装配验证通过"
+    },
+    "installability": {
+      "status": "verified",
+      "method": "disposable-profile-install",
+      "checkedAt": "2026-09-06T16:35:00+08:00",
+      "evidenceUrl": "https://github.com/Fisfzy/dsh-ego-browser/commit/e4694389951dff3d74b89e1de9ec1f885c548aac",
+      "dshRelease": "0.1.2-rc.1",
+      "systems": [
+        "win32-x64"
+      ],
+      "profiles": [
+        "web"
+      ],
+      "summary": "完成隔离安装+冷启动验证，0 加载错误"
+    },
+    "runtime": {
+      "status": "verified",
+      "method": "end-to-end-tool-call",
+      "checkedAt": "2026-09-06T16:40:00+08:00",
+      "evidenceUrl": "https://github.com/Fisfzy/dsh-ego-browser/commit/e4694389951dff3d74b89e1de9ec1f885c548aac",
+      "dshRelease": "0.1.2-rc.1",
+      "systems": [
+        "win32-x64"
+      ],
+      "profiles": [
+        "web"
+      ],
+      "summary": "ego_navigate 真实打开网页成功 + 实时流 + 安全 401"
+    },
+    "securityReview": {
+      "status": "verified",
+      "method": "code-and-live-probe",
+      "checkedAt": "2026-09-06T16:45:00+08:00",
+      "evidenceUrl": "https://github.com/Fisfzy/dsh-ego-browser/security",
+      "dshRelease": "0.1.2-rc.1",
+      "systems": [
+        "win32-x64"
+      ],
+      "profiles": [
+        "web"
+      ],
+      "summary": "发现并修复无认证 /api/ego/* 路由漏洞；native 可执行工件已声明；依赖数据完整性"
+    }
+  },
+  "entryIds": [
+    "ego-browser"
+  ],
+  "status": "approved",
+  "compatibility": {
+    "dsh": ">=0.1.2-rc.1",
+    "dshReleases": {
+      "0.1.2-alpha.4": "unknown",
+      "0.1.2-alpha.5": "unknown",
+      "0.1.2-rc.1": "compatible"
+    },
+    "dshOperations": {
+      "0.1.2-alpha.4": {
+        "install": "unknown",
+        "start": "unknown",
+        "uninstall": "unknown",
+        "rollback": "unknown"
+      },
+      "0.1.2-alpha.5": {
+        "install": "unknown",
+        "start": "unknown",
+        "uninstall": "unknown",
+        "rollback": "unknown"
+      },
+      "0.1.2-rc.1": {
+        "install": "passed",
+        "start": "passed",
+        "uninstall": "unknown",
+        "rollback": "unknown"
+      }
+    },
+    "node": null,
+    "systems": [
+      "win32-x64"
+    ],
+    "profiles": [
+      "web"
+    ]
+  },
+  "details": {
+    "pluginType": "client",
+    "installSource": "github",
+    "license": "MIT",
+    "permissions": {
+      "level": "high",
+      "files": "write",
+      "network": "any",
+      "commands": "shell",
+      "credentials": [
+        "keychain"
+      ]
+    },
+    "externalDependencies": [],
+    "reviewStatus": "author-verified"
+  },
+  "risk": {
+    "installScripts": [],
+    "review": "curated-not-security-audited"
+  },
+  "statusReason": null
+}

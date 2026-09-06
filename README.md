@@ -7,7 +7,7 @@
 
 > **仓库**：`github.com/Fisfzy/ego-browser`｜版本历史见 [CHANGELOG.md](CHANGELOG.md)｜详情页：[dshfind](https://dshfind.com/zh/plugins/Fisfzy/ego-browser)
 
-**DSH 版本支持**：本版本针对 **DeepSeek Harness ≥ `0.1.2-alpha.1`** 适配（2026-08-28），`engines.dsh` 声明兼容地板为 `0.1.2-alpha.1`。适配点：client 运行时改名（`@deepseek-ai/dsh-client-store`）、client 模块注册 id 与装载行名按声明包名、`dsh.client.inject` 仅声明真实模块图行、`webServer` 以嵌套注入交付（可选服务），并同步侧边栏 Tab（dsh-better-sidebar）模式。较早的 0.1.0-rc.x / 0.1.1-rc.x 宿主请使用 v0.8.0 及更早版本。
+**DSH 版本支持**：本版本 **v0.8.3** 针对 **DeepSeek Harness ≥ `0.1.2-rc.1`** 适配（`engines.dsh` 声明兼容地板即 `0.1.2-rc.1`；peer 依赖同步锁定 `>=0.1.2-rc.1`。已在本机 DSH 0.1.2-rc.1 + Windows + web profile 完成实机安装、启动、工具调用与 watch 面板验收）。**0.1.2-alpha.x 系列按声明可装但未实测**（审计如实记录为 unknown）；**0.1.0-rc.x / 0.1.1-rc.x 宿主请使用 v0.8.0 及更早版本**。v0.8.2 → v0.8.3 主要变更：合并 6 个社区 PR（root/xvfb/macOS headless 适配、rc.1 兼容、Windows 稳定性），修复无认证 `/api/ego/*` 路由安全漏洞、无 dsh-better-sidebar 宿主 client 启动失败（#29）、Windows 冷启动回归（#22 引入的 Xvfb 误判），并修复 gateway 设置白名单缺 `egoCliArgs`/`chromeArgs`。适配点：client 运行时改名（`@deepseek-ai/dsh-client-store`）、client 模块注册 id 与装载行名按声明包名、`dsh.client.inject` 仅声明真实模块图行、`webServer` 以嵌套注入交付（可选服务），并同步侧边栏 Tab（dsh-better-sidebar）模式。
 
 **侧边栏支持（[dsh-better-sidebar](https://www.npmjs.com/package/dsh-better-sidebar)）**：当宿主安装了 `dsh-better-sidebar`（实测 0.17.x）时，实时观察窗注册为**侧边栏原生 Tab**——「Agent 浏览器」出现在侧边栏「+」菜单中，点击即打开并随侧边栏抽屉固定展示；agent 首次调用 `ego_*` 工具时会自动打开该 Tab。未安装 `dsh-better-sidebar` 时自动回退为右下角**浮动观察球**（`#dsh-ego-fab`）模式。两种形态共用同一套 SSE 实时推流 / 点击 / 输入 / 下载捕获能力。
 
@@ -168,6 +168,17 @@ pnpm run build   # tsdown 三 bundle：lib/index.js + lib/client.js + bin/ego-ca
 ## 许可与署名
 
 插件本体 MIT。内置运行时嵌入 ego-lite 的 MIT 代码；可选下载的 FFmpeg 构建涉及 GPL-3.0-or-later 义务。使用或再分发前请阅读构建来源的许可证与源码获取信息，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 供应链与权限说明
+
+为目录收录与审查提供的确定性事实：
+
+- **运行文件**：`lib/`（构建产物，由 `npm run build` 从 `src/` TypeScript 以 tsdown 确定性生成）、`bin/`（worker 与 ffmpeg-probe 的可执行入口脚本）、`cordis.patch.yml`（装配层）、`dsh-plugin.json`（manifest）。`*.map` 仅为调试用 sourcemap，不参与运行，已声明排除。
+- **原生/可执行工件**：`runtime/` 内置 ego-lite 运行时（MIT，来源与逐文件清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）——它是本插件的核心功能（自带受管 Chrome/CDP 宿主），属有意携带的可执行工件，非构建副产物。`runtime/PATCHES.md` 记录对上游的全部本地补丁。
+- **依赖**：运行时依赖仅 `@deepseek-ai/schemastery`（由 DSH 宿主提供对等实现）；peer 依赖全部为 `@deepseek-ai/dsh-*` 宿主服务。客户端 bundle 的外部模块由宿主模块表解析，不携带 npm 运行时依赖。
+- **外部服务**：无遥测、无外部 API 调用。唯一的网络行为是**可选的** FFmpeg 安装器按用户指令从 GitHub（或用户配置的镜像）下载构建件，来源校验与许可义务见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- **失败边界**：宿主无 webServer（TUI/headless）时 watch 路由安全跳过；worker 启动失败时 watch 路由返回 `ok:false` 的 JSON 而非挂起；浏览器进程随宿主 teardown 一并终止（`--stop` fire-and-forget，不阻塞宿主退出）。
+- **权限**：manifest `permissions` 为空——工具集的文件读写被限定在 ego 自管的空间目录与用户工作区，网络访问经由受管的 agent 浏览器而非宿主进程。
 
 ---
 

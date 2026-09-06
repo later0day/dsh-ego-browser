@@ -2,6 +2,26 @@
 
 所有对用户可见的变更集中在各版本号下。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本语义遵循 [SemVer](http://semver.org/)。
 
+## [0.8.3] - 2026-09-07 — DSH 0.1.2-rc.1 兼容 + 安全/稳定性修复
+
+### 安全
+- **修复无认证 `/api/ego/*` 路由**：exact 路由先于宿主 `/api` prefix 信任栅栏命中，导致 `GET /api/ego/stream` 无凭据流出实时画面帧、`POST /api/ego/input` 无凭据即可提交输入（跨站驱动）。统一包装 webServer.register，所有 ego 路由要求 SameSite=Strict 的 `dsh-auth-*` cookie，恶意网页天然不携带；守卫仅作用于本插件自身路由，不污染宿主单例上其他插件的注册。
+
+### 修复
+- **无 dsh-better-sidebar 宿主 client 启动失败（#29）**：hard-declared `inject` 与裸 `ctx.betterSidebar` 属性访问在 strict resolver 下抛 "without inject"。保留声明（它是解析条件）+ 将访问包进 try/catch 并显式传参，无 sidebar 宿主落到浮动观察球而非整包挂死。
+- **Windows 冷启动回归**：#22 的 Xvfb 支持将无 `DISPLAY` 时默认由 headless 改为起 Xvfb，而 Windows 有桌面会话、无 Xvfb → "no X display / no Xvfb binary" 冷启动失败。`ensureXDisplay` 与入口 `hasDisplay` 增加 win32 分支（桌面会话视为 display，headed 直开窗口，恢复 v0.4.0 适配行为）。
+- **gateway 设置白名单缺 `egoCliArgs`/`chromeArgs`**：`/ego/api/set` 把这俩配置字段静默丢弃，设置无法持久化——已补入 `ALLOWED_KEYS`。
+
+### 合并(社区 PR + 本地)
+- 合并 6 个社区 PR：`#20` root 运行支持、`#22` xvfb、`#16` macOS headless 检测、`#24` schemastery `link:` 修复、`#28` DSH 0.1.2-rc.1/v0.1.3-alpha.1 兼容（peer/engines 收紧）、`#13` Windows 稳定性。
+- 修复 dsh-plugin.json 缺逗号导致的 manifest JSON 语法错误（目录收录阻断源）。
+- 新增 MIT LICENSE；补充供应链/权限说明；源码不追踪 `*.map`。
+- 通过 build-dsh-plugin 官方审计：`status: READY_FOR_PINNED_SOURCE_VERIFICATION`，`route: direct`，`blockers: 0`。
+
+### 兼容
+- `engines.dsh: >=0.1.2-rc.1`；peer 依赖全部锁定 `>=0.1.2-rc.1`。
+- 已在 DSH 0.1.2-rc.1(Windows/web profile) 完成安装、启动、`ego_navigate` 真实调用、实时观察面板验收；`0.1.2-alpha.x` 声明可装但未实测；`<0.1.2-rc.1` 请用 v0.8.0 及更早。
+
 ## [0.8.1] - 2026-08-28 — DSH 0.1.2-alpha.1 兼容
 
 ### 变更

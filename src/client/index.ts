@@ -62,6 +62,10 @@ declare function require(id: string): any
 			}
 		}
 
+		// 'betterSidebar' must NOT be declared here: hosts without
+		// dsh-better-sidebar have no such module-table key, and a strict
+		// resolver throws on the ctx.betterSidebar property access itself
+		// (issue #29). Probe it defensively below instead.
 		const inject = ['slots', 'locale', 'connection', 'betterSidebar']
 
 		// ── Settings card: locale ─────────────────────────────────────────
@@ -956,7 +960,6 @@ declare function require(id: string): any
 				yield ctx.slots.register({
 					name: 'settings.plugin.item',
 					key: SETTINGS_NS,
-					id: 'ego-browser',
 					order: 60,
 					locale: SETTINGS_NS,
 					inject: function () { return { controller: controller, useSnapshot: useSnapshot } },
@@ -965,11 +968,13 @@ declare function require(id: string): any
 
 		// ── Watch panel: sidebar tab (betterSidebar injected so the tab shows in
 		// the dsh-better-sidebar '+' menu). The floating fallback is kept only
-		// for a HOST without the sidebar — with 'betterSidebar' in inject the
-		// client bundle requires dsh-better-sidebar to load, so the else branch
-		// is effectively a safety net.
-		if (ctx.betterSidebar !== undefined) {
-			ctx.effect(() => mountSidebarTab(ctx), 'ego-browser sidebar tab')
+		// for a HOST without the sidebar — a strict resolver throws on the
+		// ctx.betterSidebar property access itself when the service is absent
+		// (issue #29), so the probe below is wrapped and never assumed.
+		var betterSidebarService
+		try { betterSidebarService = ctx.betterSidebar } catch (e) { betterSidebarService = undefined }
+		if (betterSidebarService !== undefined) {
+			ctx.effect(() => mountSidebarTab(ctx, betterSidebarService), 'ego-browser sidebar tab')
 		} else {
 			ctx.effect(() => mountFloatingWatch(ctx), 'ego-browser watch panel')
 		}
@@ -3014,8 +3019,7 @@ clearTimeout((panel as any)._dshHideT)
 		}
 
 		// ── mountSidebarTab: register the ego-browser watch tab ────────────────
-		function mountSidebarTab(ctx) {
-			var betterSidebar = ctx.betterSidebar
+		function mountSidebarTab(ctx, betterSidebar) {
 			if (!betterSidebar) return function () {}
 			// Inject Tab CSS once (cleaned up on dispose)
 			var styleEl = document.createElement('style')
