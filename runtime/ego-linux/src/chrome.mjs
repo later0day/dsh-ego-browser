@@ -650,7 +650,17 @@ async function launch({ headless }) {
     ...LAUNCH_FLAGS,
     `${PROFILE_FLAG}${PROFILE_DIR}`,
     "--remote-debugging-port=0",
-    ...(headless ? ["--headless=new"] : []),
+    ...(headless ? [
+      "--headless=new",
+      // Headless fingerprint stripping (issue #2): the `-headless` UA and
+      // navigator.webdriver flag both mark us as automation to high-risk
+      // sites (Douyin/Doubao reject agent sessions otherwise). Only inject on
+      // the headless path so a headed window keeps its real UA. The UA version
+      // tracks the bundled Chromium major (152 in this runtime snapshot); if a
+      // future update bumps the vendored Chromium, bump it here too.
+      "--disable-blink-features=AutomationControlled",
+      "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+    ] : []),
     // Optional HTTP proxy for the agent browser, e.g. EGO_LINUX_PROXY=http://host:7890
     // (WSL2 -> Windows Clash). Explicit flags are used instead of relying on
     // http_proxy env propagation: the CLI's own fetch/CDP traffic must never go

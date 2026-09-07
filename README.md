@@ -93,6 +93,18 @@
 
 ## 安装
 
+> **包名迁移（DSH Desktop 2.0.5+）**：本插件包名是 **`dsh-ego-browser`**（非 `@dsh-external/ego-browser`）。DSH Desktop 2.0.5 起增加了「profile 依赖名 == 包实际 name」的一致性校验，若 profile 仍用旧名 `@dsh-external/ego-browser` 引用，启动会挂进恢复模式（`profile package identity is invalid for @dsh-external/ego-browser`）。升级到 2.0.5 后请把 profile 的 `package.json` 依赖键 **和** `dsh.profile.bundles` 条目**两处**都改为 `dsh-ego-browser`：
+
+   ```diff
+   - "@dsh-external/ego-browser": "git+https://github.com/Fisfzy/ego-browser.git",
+   + "dsh-ego-browser": "git+https://github.com/Fisfzy/ego-browser.git",
+   ```
+
+   ```diff
+   - "@dsh-external/ego-browser",
+   + "dsh-ego-browser",
+   ```
+
 ```sh
 dshx install ego-browser <ego-browser.tgz>                             # tarball 或 git URL 均可
 dshx list                                                # 应显示：[on] ego-browser

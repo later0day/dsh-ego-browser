@@ -2210,6 +2210,9 @@ clearTimeout((panel as any)._dshHideT)
 			this.liveFlushRaf = null
 			this.liveImg = null
 			this.liveImgTargetId = null
+			this.wiringStale = false
+			this._lastUnwiredAt = 0
+			this._wiredRecomputeQueued = false
 			this.historyOpen = false
 			this._zoomHint = null
 			this._zoomHintTimer = null
@@ -2231,6 +2234,7 @@ clearTimeout((panel as any)._dshHideT)
 				captchaKind: null,
 				historyOpen: false,
 				zoomHint: null,
+				wiringStale: false,
 				backend: 'cdp', streamState: 'idle', streamMessage: '', streamGeneration: 0, streamMime: 'video/mp4; codecs="avc1.42E01E"',
 			}
 		}
@@ -2274,6 +2278,12 @@ clearTimeout((panel as any)._dshHideT)
 				}
 			}
 			this.currentActiveId = currentTargetId
+			// Wiring watchdog: the live <img>/<video> is bound to this controller by a
+			// ref callback at attach time. If the binding was ever missed (mount-order
+			// race) or the element was replaced, liveImgTargetId drifts from the
+			// current target and every click/keypress would be silently dropped.
+			// Surface the drift on the badge instead of hiding it.
+			this.wiringStale = currentTargetId != null && this.liveImgTargetId !== currentTargetId
 			var showLogin = hasPage && !captchaHit && !this.dismissedGuides.login
 			var captchaKind = (captchaHit && !this.dismissedGuides.captcha) ? (captchaHit.humanCheck.kind || 'captcha') : null
 			this.store.update(function (s) {
@@ -2288,6 +2298,7 @@ clearTimeout((panel as any)._dshHideT)
 				s.captchaKind = captchaKind
 				s.historyOpen = self.historyOpen
 				s.zoomHint = self._zoomHint
+				s.wiringStale = self.wiringStale
 				s.backend = self.backend
 				s.streamState = self.streamState
 				s.streamMessage = self.streamMessage
@@ -2662,6 +2673,33 @@ clearTimeout((panel as any)._dshHideT)
 				self._recompute()
 			}, 2000)
 		}
+		// Called by the element ref callbacks right after a (re)bind. If the badge
+		// was showing ⚠未接管, clear it via a microtask recompute — store updates
+		// scheduled from the commit phase are safe and cannot loop (the flag is
+		// already false when the next render runs).
+		LivePreviewController.prototype.noteWired = function () {
+			if (!this.wiringStale) return
+			this.wiringStale = false
+			if (this._wiredRecomputeQueued) return
+			this._wiredRecomputeQueued = true
+			var self = this
+			Promise.resolve().then(function () {
+				self._wiredRecomputeQueued = false
+				if (!self.disposed) self._recompute()
+			})
+		}
+		// Fail visible, never silent: a pointer/wheel intent that cannot be mapped
+		// (browserXY → null because the live view was never wired) used to vanish
+		// without a trace. Warn once per 5s and show a hint; _showHint triggers a
+		// recompute → re-render → ref callback re-fires → the view rebinds, so the
+		// NEXT click already works (self-healing through the retry).
+		LivePreviewController.prototype._signalUnwired = function () {
+			var now = Date.now()
+			if (now - this._lastUnwiredAt < 5e3) return
+			this._lastUnwiredAt = now
+			try { console.warn('[ego-browser] live view not wired (liveImgTargetId=' + this.liveImgTargetId + ', current=' + this.currentActiveId + ') — input dropped') } catch (e) {}
+			this._showHint('画面未接管 · 本次操作未送达 · 再点一次即可恢复')
+		}
 		LivePreviewController.prototype._applyZoom = function () {
 			if (!this.liveImg) return
 			this.liveImg.style.transformOrigin = '0 0'
@@ -2695,6 +2733,8 @@ clearTimeout((panel as any)._dshHideT)
 					deltaX: e.deltaX || 0,
 					deltaY: e.deltaY || (e.deltaMode === 1 ? 40 : (e.deltaY || 100)),
 				})
+			} else {
+				this._signalUnwired()
 			}
 		}
 		LivePreviewController.prototype.handlePointerDown = function (e) {
@@ -2719,6 +2759,8 @@ clearTimeout((panel as any)._dshHideT)
 			if (p) {
 				this._pointerState.lastDragPos = p
 				this.sendInput(this._pointerState.targetId, 'mousePressed', { x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: 1 })
+			} else {
+				this._signalUnwired()
 			}
 		}
 		LivePreviewController.prototype.handlePointerMove = function (e) {
@@ -2788,6 +2830,30 @@ clearTimeout((panel as any)._dshHideT)
 
 			var imgRef = React.useRef(null)
 			var videoRef = React.useRef(null)
+
+			// Bind the live <img>/<video> to the controller the moment the element
+			// attaches. The deps-based effect below only fires when target/backend/
+			// generation change — but the <img> typically mounts LATER (placeholder →
+			// first cached frame → thumbnail branch), with no dep change at that
+			// moment, so the effect never wires it: liveImgTargetId stays null and
+			// every click/keypress is silently dropped. A ref callback fires on every
+			// attach, so the wiring cannot be missed regardless of mount order.
+			var bindLiveImg = function (el) {
+				imgRef.current = el
+				if (el && state.currentTargetId != null &&
+					(controller.liveImg !== el || controller.liveImgTargetId !== state.currentTargetId)) {
+					controller.setLiveImg(el, state.currentTargetId)
+					controller.noteWired()
+				}
+			}
+			var bindLiveVideo = function (el) {
+				videoRef.current = el
+				if (el && state.currentTargetId != null &&
+					(controller.liveImg !== el || controller.liveImgTargetId !== state.currentTargetId)) {
+					controller.setLiveVideo(el, state.currentTargetId)
+					controller.noteWired()
+				}
+			}
 
 			React.useEffect(function () {
 				controller.start()
@@ -2916,12 +2982,12 @@ clearTimeout((panel as any)._dshHideT)
 			} else {
 				var liveImg = state.backend === 'ffmpeg'
 					? h('video', {
-						ref: videoRef, key: 'livevideo-' + state.streamGeneration, className: 'dsh-ego-side-liveimg', muted: true, autoPlay: true, playsInline: true,
+						ref: bindLiveVideo, key: 'livevideo-' + state.streamGeneration, className: 'dsh-ego-side-liveimg', muted: true, autoPlay: true, playsInline: true,
 						onPointerDown: function (e) { controller.handlePointerDown(e) }, onPointerMove: function (e) { controller.handlePointerMove(e) }, onPointerUp: function (e) { controller.handlePointerUp(e) }, onPointerCancel: function (e) { controller.handlePointerUp(e) }, onDoubleClick: function (e) { controller.handleDoubleClick(e) },
 					})
 					: currentSpace.thumbnail
 					? h('img', {
-						ref: imgRef,
+						ref: bindLiveImg,
 						key: 'liveimg',
 						className: 'dsh-ego-side-liveimg',
 						src: currentSpace.thumbnail,
@@ -2939,7 +3005,7 @@ clearTimeout((panel as any)._dshHideT)
 					h('div', { className: 'dsh-ego-side-liveview' },
 						h('div', { className: 'dsh-ego-side-livebadge' },
 							h('span', { className: 'dsh-ego-side-state-dot' + (state.pinned ? ' pin' : state.busy ? ' busy' : '') }),
-							h('span', { style: { flex: 1 } }, (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · ' + (state.streamState === 'failed' ? (state.streamMessage || '失败') : state.streamState)),
+							h('span', { style: { flex: 1 } }, (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · ' + (state.streamState === 'failed' ? (state.streamMessage || '失败') : state.streamState) + (state.currentTargetId ? (state.wiringStale ? ' · ⚠ 未接管' : ' · 已接管') : '')),
 							state.pinned
 								? h('button', {
 									className: 'dsh-ego-side-back', type: 'button',

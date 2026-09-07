@@ -1060,12 +1060,12 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_click',
       description:
-        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=@N value from ego_snapshot, or viewport coordinates.',
+        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=N value from ego_snapshot, or viewport coordinates.',
       parameters: {
         selector: {
           type: 'string',
           description:
-            'CSS selector, xpath=..., loc=..., or ref=@N from the snapshot. Required unless x/y are given.',
+            'CSS selector, xpath=..., loc=..., or ref=N from the snapshot. Required unless x/y are given.',
         },
         x: {
           type: 'number',
@@ -1124,13 +1124,13 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_fill',
       description:
-        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=@N from ego_snapshot.',
+        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=N from ego_snapshot.',
       parameters: {
         selector: {
           type: 'string',
           required: true,
           description:
-            'CSS selector, xpath=..., loc=..., or ref=@N for the input.',
+            'CSS selector, xpath=..., loc=..., or ref=N for the input.',
         },
         text: {
           type: 'string',
@@ -1427,7 +1427,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
       parameters: {
         selector: {
           type: 'string',
-          description: 'CSS selector, xpath=..., loc=..., or ref=@N for the element.',
+          description: 'CSS selector, xpath=..., loc=..., or ref=N for the element.',
         },
         x: { type: 'number', description: 'Viewport x (only with y).' },
         y: { type: 'number', description: 'Viewport y (only with x).' },
