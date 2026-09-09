@@ -352,6 +352,35 @@ type EnsureWorker = () => Promise<number | null>
 type PushConfig = (cfg: ResolvedConfig) => Promise<void>
 
 /**
+ * Environment for the ego-cast worker child.
+ *
+ * The cast worker is the READ-ONLY observation half of the panel. When the
+ * host operator points the panel at an already-running external browser (e.g.
+ * a cloak container's CDP), they set `EGO_CAST_CDP_URL` — an `http(s)://host:port`
+ * base (preferred; the worker re-resolves the live wsUrl from /json/version so
+ * a browser/GUID restart auto-recovers), a bare `host:port`, or a literal
+ * `ws://` endpoint.
+ *
+ * We map it to `EGO_LINUX_CDP_URL` ONLY for this child so the observation
+ * worker attaches to that browser. We deliberately do NOT set EGO_LINUX_CDP_URL
+ * in the host/automation environment: the vendored automation runtime
+ * (runtime/ego-linux/src/chrome.mjs) reads the same var, and hijacking it there
+ * would repoint the AGENT's browser too. Scoping to the worker child keeps the
+ * observation target independent of the automation target.
+ *
+ * Return ONLY the one deliberate key. The subprocess service merges spec.env
+ * over its own scrubbed parent base (dsh-subprocess scrubbedParentEnv), which
+ * strips DSH_* managed facts and credential-shaped names; spreading the full
+ * parent process.env here would re-inject those stripped keys (notably the
+ * managed DSH_SUBPROCESS_RUNNER selector) and break the spawn.
+ */
+function castWorkerEnv(): NodeJS.ProcessEnv | undefined {
+  const target = process.env.EGO_CAST_CDP_URL
+  if (!target || target.trim() === '') return undefined
+  return { EGO_LINUX_CDP_URL: target.trim() }
+}
+
+/**
  * Ensure a single ego-cast worker is running (idempotent). Launches it via
  * ctx.subprocess. Re-spawns whenever the previous worker is found dead (its
  * pid no longer alive or its /api/health does not answer), so a crashed
@@ -381,6 +410,8 @@ function makeEnsureWorker(ctx: EgoContext, cfg: ResolvedConfig, ffmpegManager: F
         const initCfg = JSON.stringify(captureConfig(cfg, ffmpegManager))
         const handle = ctx.subprocess.spawn({
           argv: [process.execPath, WORKER_BIN, initCfg],
+          cwd: process.cwd(),
+          env: castWorkerEnv(),
           stdio: {
             stdin: { data: '' },
             stdout: { maxBytes: 8192 },
