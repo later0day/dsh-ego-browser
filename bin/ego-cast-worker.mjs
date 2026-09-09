@@ -5265,23 +5265,51 @@ async function readBrowserState() {
 		return null;
 	}
 }
-async function resolveBrowser() {
-	if (process.env.EGO_LINUX_CDP_URL) return {
-		wsUrl: process.env.EGO_LINUX_CDP_URL,
-		port: null
-	};
-	const state = await readBrowserState();
-	if (!state?.port) return null;
+/**
+* Fetch the browser-level webSocketDebuggerUrl from a DevTools HTTP endpoint
+* (`/json/version`). Returns null if unreachable or malformed.
+*/
+async function fetchBrowserWsUrl(base) {
 	try {
-		const response = await fetch(`http://127.0.0.1:${state.port}/json/version`, { signal: AbortSignal.timeout(1500) });
-		const wsUrl = response.ok ? (await response.json()).webSocketDebuggerUrl : null;
-		return wsUrl ? {
-			port: state.port ?? null,
-			wsUrl
-		} : null;
+		const response = await fetch(`${base}/json/version`, { signal: AbortSignal.timeout(1500) });
+		return (response.ok ? (await response.json()).webSocketDebuggerUrl : null) || null;
 	} catch {
 		return null;
 	}
+}
+/**
+* Resolve the CDP endpoint the cast worker should attach to.
+*
+* EGO_LINUX_CDP_URL (set panel-side by cast-server from EGO_CAST_CDP_URL) may be:
+*   - a literal `ws://` / `wss://` browser endpoint — used verbatim; OR
+*   - an `http(s)://host:port` base, or a bare `host:port` — in which case we
+*     resolve the LIVE browser wsUrl from `/json/version` on every attempt.
+*
+* The http/base form is preferred for long-lived external browsers (e.g. a
+* cloak container) because the browser-level GUID in the ws path rotates on
+* every browser restart; re-resolving each connect attempt keeps the panel
+* auto-recovering without a host restart.
+*/
+async function resolveBrowser() {
+	const configured = process.env.EGO_LINUX_CDP_URL;
+	if (configured) {
+		if (/^wss?:\/\//i.test(configured)) return {
+			wsUrl: configured,
+			port: null
+		};
+		const wsUrl$1 = await fetchBrowserWsUrl(/^https?:\/\//i.test(configured) ? configured.replace(/\/+$/, "") : `http://${configured.replace(/\/+$/, "")}`);
+		return wsUrl$1 ? {
+			wsUrl: wsUrl$1,
+			port: null
+		} : null;
+	}
+	const state = await readBrowserState();
+	if (!state?.port) return null;
+	const wsUrl = await fetchBrowserWsUrl(`http://127.0.0.1:${state.port}`);
+	return wsUrl ? {
+		port: state.port ?? null,
+		wsUrl
+	} : null;
 }
 async function listTargets() {
 	if (!active) return [];

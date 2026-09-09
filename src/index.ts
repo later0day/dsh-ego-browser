@@ -44,6 +44,7 @@ import { HUMAN_CHECK_PROBE } from './captcha.ts'
 import { Config as ConfigSchema, resolveConfig, EGO_CLI_BLOCKED, CHROME_BLOCKED, filterArgs } from './config.ts'
 import { installEgoBrowserSettings } from './settings.ts'
 import { registerEgoBrowserGateway } from './gateway.ts'
+import { registerRemoteUiTrust } from './remote-ui-trust.ts'
 import { getSharedFfmpegInstallationManager } from './ffmpeg-installation.ts'
 import { SENTINEL, j, str, num, bool, readAll, SAFE_FN } from './util.ts'
 import type { EgoContext, RawConfig, ResolvedConfig, SubprocessService, ToolExec, WebServerLike } from './types.ts'
@@ -712,6 +713,18 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     } catch (err) {
       ctx.logger?.warn?.(
         `ego-browser: settings gateway init failed: ${(err as Error)?.message ?? err}`,
+      )
+    }
+    // Optional, env-gated (DSH_TRUST_REMOTE_UI, default OFF): on a public-IP
+    // bind, inject globalThis.__DSH_TRANSPORT__={ownsHost:true} so the client's
+    // isLoopback is true and Settings→Models uses host persistence instead of
+    // failing with "settings are unavailable in this browser". Independent of
+    // the ego feature; see remote-ui-trust.ts for the full rationale + safety.
+    try {
+      registerRemoteUiTrust(wctx as EgoContext)
+    } catch (err) {
+      ctx.logger?.warn?.(
+        `ego-browser: remote-ui-trust init failed: ${(err as Error)?.message ?? err}`,
       )
     }
   })
