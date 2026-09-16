@@ -63,16 +63,21 @@ declare function require(id: string): any
 		}
 
 		// 'betterSidebar' must NOT be declared here: hosts without
-		// dsh-better-sidebar have no such module-table key, and a strict
-		// resolver throws on the ctx.betterSidebar property access itself
-		// (issue #29). Probe it defensively below instead.
-		const inject = ['slots', 'locale', 'connection', 'betterSidebar']
+		// dsh-better-sidebar have no such service, and the module loader keeps
+		// any row that statically injects it pending forever — which blocks the
+		// whole web boot (issue #29, reproduced on DSH 0.1.2-rc.1 without the
+		// sidebar installed). Probe it defensively in apply() instead.
+		const inject = ['slots', 'locale', 'connection']
 
 		// ── Settings card: locale ─────────────────────────────────────────
 		var SETTINGS_NS = 'ego-browser'
 		var en = {
 			title: 'ego-browser',
 			intro: 'Agent browser integration. Configure the Chrome/Chromium binary path and cast parameters below.',
+			isolateSpaces: 'Space isolation',
+			isolateSpacesHint: 'Disabled: use persistent disk profile, logins stay across restarts. Enabled: memory-only sandbox per task.',
+			isolateSpacesOff: 'Disabled (persistent profile, keep logins)',
+			isolateSpacesOn: 'Enabled (isolated memory sandbox)',
 			chromePath: 'Browser binary path',
 			chromePathHint: 'Path to the Chrome/Chromium/Edge binary. Empty = auto-detect.',
 			captureBackend: 'Capture backend', streamProfile: 'Quality profile', cdpFps: 'CDP FPS', cdpQuality: 'CDP JPEG quality', cdpMaxWidth: 'CDP max width', cdpBackstopIntervalMs: 'CDP recovery interval', ffmpegFps: 'FFmpeg FPS', ffmpegMaxWidth: 'FFmpeg max width', ffmpegBitrateKbps: 'FFmpeg bitrate', ffmpegEncoder: 'FFmpeg encoder', ffmpegPath: 'FFmpeg binary path', githubMirror: 'GitHub mirror', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
@@ -88,6 +93,10 @@ declare function require(id: string): any
 		var zh = {
 			title: 'ego-browser',
 			intro: 'Agent 浏览器集成。在下方配置 Chrome/Chromium 浏览器路径及推流参数。',
+			isolateSpaces: '任务空间沙盒隔离',
+			isolateSpacesHint: '默认关闭：使用磁盘持久化 Profile，任务中登录的账号跨电脑重启永久保留；开启后使用内存临时沙盒隔离，任务结束不落盘。',
+			isolateSpacesOff: '关闭（持久化登录态，跨电脑重启不丢失）',
+			isolateSpacesOn: '开启（严格沙盒隔离，任务结束不落盘）',
 			chromePath: '浏览器路径',
 			chromePathHint: 'Chrome/Chromium/Edge 可执行文件路径。留空 = 自动检测。',
 			captureBackend: '捕获后端', streamProfile: '画质档位', cdpFps: 'CDP 帧率', cdpQuality: 'CDP JPEG 质量', cdpMaxWidth: 'CDP 最大宽度', cdpBackstopIntervalMs: 'CDP 恢复截图间隔', ffmpegFps: 'FFmpeg 帧率', ffmpegMaxWidth: 'FFmpeg 最大宽度', ffmpegBitrateKbps: 'FFmpeg 码率', ffmpegEncoder: 'FFmpeg 编码器', ffmpegPath: 'FFmpeg 路径', githubMirror: 'GitHub 镜像源', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
@@ -107,7 +116,7 @@ declare function require(id: string): any
 				status: 'idle',        // 'idle' | 'loading' | 'ready'
 				available: false,      // true after a successful /ego/api/get
 				writable: false,       // false when settings service is absent
-				draft: { chromePath: '', captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '960', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
+				draft: { isolateSpaces: false, chromePath: '', captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '960', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
 				ffmpegStatus: { state: 'checking', canDownload: false, canSelectFfmpeg: false },
 				dirty: false,
 				applyState: { kind: 'idle' }, // 'idle' | 'saving' | 'saved' | 'error'
@@ -154,6 +163,7 @@ declare function require(id: string): any
 					s.available = true
 					s.writable = true
 			s.draft = {
+				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
 				chromePath: config.chromePath || '',
 				captureBackend: config.captureBackend === 'ffmpeg' && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
 				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
@@ -276,6 +286,7 @@ declare function require(id: string): any
 				self.store.update(function (s) {
 				s.applyState = { kind: 'saved' }
 			s.draft = {
+				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
 				chromePath: config.chromePath || '',
 				captureBackend: config.captureBackend === 'ffmpeg' && ffmpegStatus && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
 				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
@@ -449,6 +460,18 @@ declare function require(id: string): any
 					!state.writable ? h('p', { className: 'dsh-ego-card__notice', role: 'status' }, t('readOnly')) : null,
 					saved ? h('p', { className: 'dsh-ego-card__saved', role: 'status' }, t('save')) : null,
 					h('div', { className: 'dsh-ego-card__form' },
+						h(SettingsField, {
+							id: 'plugin-config-ego-browser-isolatespaces',
+							label: t('isolateSpaces'),
+							hint: t('isolateSpacesHint'),
+							value: state.draft.isolateSpaces ? 'true' : 'false',
+							options: [
+								{ value: 'false', label: t('isolateSpacesOff') },
+								{ value: 'true', label: t('isolateSpacesOn') },
+							],
+							disabled: busy,
+							onEdit: function (v) { controller.edit('isolateSpaces', v === 'true') },
+						}),
 						h(SettingsField, {
 							id: 'plugin-config-ego-browser-chromepath',
 							label: t('chromePath'),
@@ -966,17 +989,33 @@ declare function require(id: string): any
 				}, EgoBrowserCard)
 			})
 
-		// ── Watch panel: sidebar tab (betterSidebar injected so the tab shows in
-		// the dsh-better-sidebar '+' menu). The floating fallback is kept only
-		// for a HOST without the sidebar — a strict resolver throws on the
-		// ctx.betterSidebar property access itself when the service is absent
-		// (issue #29), so the probe below is wrapped and never assumed.
+		// ── Watch panel: sidebar tab & floating watch ─────────────────────
+		// betterSidebar is an OPTIONAL service and is intentionally absent from
+		// the static inject list (see its declaration above): on hosts without
+		// dsh-better-sidebar the module loader would otherwise keep this row
+		// pending forever and block the whole web boot (issue #29, reproduced
+		// on DSH 0.1.2-rc.1). Probe with ctx.get; when absent, mount the
+		// floating watch panel immediately and upgrade to the sidebar tab if
+		// the service appears later (dynamic ctx.inject, same pattern as PR #45).
 		var betterSidebarService
-		try { betterSidebarService = ctx.betterSidebar } catch (e) { betterSidebarService = undefined }
+		try { betterSidebarService = typeof ctx.get === 'function' ? ctx.get('betterSidebar') : undefined } catch (e) { betterSidebarService = undefined }
 		if (betterSidebarService !== undefined) {
 			ctx.effect(() => mountSidebarTab(ctx, betterSidebarService), 'ego-browser sidebar tab')
 		} else {
-			ctx.effect(() => mountFloatingWatch(ctx), 'ego-browser watch panel')
+			var disposeFloating = null
+			ctx.effect(() => {
+				disposeFloating = mountFloatingWatch(ctx)
+				return function () { if (disposeFloating) { var d = disposeFloating; disposeFloating = null; d() } }
+			}, 'ego-browser watch panel')
+			if (typeof ctx.inject === 'function') {
+				ctx.inject(['betterSidebar'], function (sidebarCtx) {
+					var svc
+					try { svc = typeof sidebarCtx.get === 'function' ? sidebarCtx.get('betterSidebar') : sidebarCtx.betterSidebar } catch (e) { svc = undefined }
+					if (!svc) return
+					if (disposeFloating) { var d2 = disposeFloating; disposeFloating = null; d2() }
+					sidebarCtx.effect(function () { return mountSidebarTab(sidebarCtx, svc) }, 'ego-browser sidebar tab')
+				})
+			}
 		}
 	}
 

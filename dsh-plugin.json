@@ -2,7 +2,7 @@
   "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
   "id": "dsh-ego-browser",
   "name": "ego-browser",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "manifestVersion": "0.15",
   "facets": {
     "host": {
@@ -56,6 +56,14 @@
             "zh": "Agent 浏览器"
           },
           "fields": [
+            {
+              "path": [
+                "isolateSpaces"
+              ],
+              "label": "任务空间沙盒隔离 (Space isolation)",
+              "kind": "boolean",
+              "hint": "默认关闭：使用磁盘持久化 Profile，任务中登录的账号跨电脑重启永久保留；开启后使用内存临时沙盒隔离，任务结束不落盘。"
+            },
             {
               "path": [
                 "chromePath"

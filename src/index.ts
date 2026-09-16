@@ -300,6 +300,13 @@ export function resolveEgoEnv(cfg: Partial<ResolvedConfig>, { platform = process
     return baseEnv
   }
   const env: NodeJS.ProcessEnv = { ...baseEnv }
+  // Electron hosts (DSH Desktop): process.execPath is the Electron binary, and
+  // every spawn below passes this explicit env — without ELECTRON_RUN_AS_NODE=1
+  // the child boots as a second Electron app instead of running the script
+  // (empty stderr, no @@DSH_RESULT@@ sentinel; issue #42). User-set value wins.
+  if ((process.versions as { electron?: string }).electron && env.ELECTRON_RUN_AS_NODE === undefined) {
+    env.ELECTRON_RUN_AS_NODE = '1'
+  }
   const chrome = findChromeBinary()
   // Settings-configured chrome path (highest priority after user-set env).
   // An empty string means "auto-detect" — skip so the platform branches below
@@ -333,6 +340,9 @@ export function resolveEgoEnv(cfg: Partial<ResolvedConfig>, { platform = process
   const configChromeArgs = cfg?.chromeArgs
   if (env.EGO_LINUX_EXTRA_ARGS === undefined && typeof configChromeArgs === 'string' && configChromeArgs.trim() !== '') {
     env.EGO_LINUX_EXTRA_ARGS = configChromeArgs
+  }
+  if (env.EGO_ISOLATE_SPACES === undefined && cfg?.isolateSpaces !== undefined) {
+    env.EGO_ISOLATE_SPACES = cfg.isolateSpaces ? '1' : '0'
   }
   return env
 }
@@ -445,6 +455,7 @@ interface EgoRuntimeConfig {
   readonly githubMirror: string
   readonly egoCliArgs: string
   readonly chromeArgs: string
+  readonly isolateSpaces: boolean
 }
 
 interface ExecLike {
@@ -671,6 +682,7 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     // edits take effect on the next spawn / next browser cold start.
     get egoCliArgs() { return resolveConfig(bridge.source() as RawConfig).egoCliArgs },
     get chromeArgs() { return resolveConfig(bridge.source() as RawConfig).chromeArgs },
+    get isolateSpaces() { return resolveConfig(bridge.source() as RawConfig).isolateSpaces },
   }
   const reg = (tool: ToolHandle): void => {
     const dispose = ctx.tools.register(tool) as unknown as () => void
@@ -938,14 +950,20 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
   reg(
     t({
       name: 'ego_space_open',
-      description:
-        'Open (or reuse) an ego-lite task space — an isolated browsing context that inherits your login state. It becomes the active space for later ego_* calls that omit `space`.',
+      get description() {
+        return cfg.isolateSpaces
+          ? 'Open (or reuse) an ego-lite task space in isolated sandbox mode.'
+          : "Open (or reuse) the ego-lite task space. In persistent profile mode (default), ALWAYS use or reuse the single 'default' space. Login credentials automatically persist on disk across restarts — if a page requires login, prompt user to log in manually in the opened window. DO NOT create numbered spaces like #4, #5."
+      },
       parameters: {
         name: {
           type: 'string',
           required: true,
-          description:
-            'Short name for the active user goal, e.g. "search github issues". Reuse the same name for follow-ups on the same goal.',
+          get description() {
+            return cfg.isolateSpaces
+              ? 'Task-space name or numeric id.'
+              : "Task-space name. In persistent mode, ALWAYS specify 'default'. Reuse this single space for all browsing tasks."
+          },
         },
       },
       buildScript: (args) =>
@@ -958,8 +976,11 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
   reg(
     t({
       name: 'ego_space_close',
-      description:
-        'Complete (close) an ego-lite task space. Must be the final ego_* call for a task — never leave a space hanging. `keep: true` keeps the page open for the user.',
+      get description() {
+        return cfg.isolateSpaces
+          ? 'Complete (close) an ego-lite task space in sandbox mode.'
+          : 'Close an ego-lite task space. WARNING: In persistent profile mode, DO NOT call this tool when finishing tasks! Keep the space, tabs, and browser window alive so login sessions and streams remain intact. Conclude tasks by replying to the user directly without closing the space.'
+      },
       parameters: {
         name: {
           type: 'string',
@@ -1021,7 +1042,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_navigate',
       description:
-        'Open a URL in the task space, or switch to the existing tab for it. Waits for the document to load. Returns the resulting page info.',
+        'Open a URL in the task space, or switch to the existing tab for it. Always prefer reusing existing open tabs before opening duplicate URLs. Waits for document load. Returns resulting page info.',
       parameters: {
         url: {
           type: 'string',

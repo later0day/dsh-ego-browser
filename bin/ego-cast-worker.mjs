@@ -5403,9 +5403,17 @@ function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 function stopSiblingWorkers() {
-	const self = String(process.pid);
+	const self = process.pid;
+	const SCRIPT_ARG_RE = /node(?:\.exe)?"?\s+"?[^"\s]*ego-cast-worker\.mjs(?:["\s]|$)/i;
 	if (IS_WIN) {
-		const ps = `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*ego-cast-worker.mjs*' -and $_.ProcessId -ne ${self} } | Select-Object -ExpandProperty ProcessId`;
+		const ps = [
+			`$self = ${self}`,
+			`$procs = Get-CimInstance Win32_Process`,
+			`$anc = @{}`,
+			`$cur = $procs | Where-Object { $_.ProcessId -eq $self } | Select-Object -First 1`,
+			`while ($cur) { $anc[[int]$cur.ProcessId] = $true; $cur = $procs | Where-Object { $_.ProcessId -eq $cur.ParentProcessId } | Select-Object -First 1 }`,
+			`$procs | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'node(\\.exe)?"?\\s+"?[^"\\s]*ego-cast-worker\\.mjs(["\\s]|$)' -and -not $anc[[int]$_.ProcessId] } | Select-Object -ExpandProperty ProcessId`
+		].join("; ");
 		try {
 			const output = execFileSync("powershell.exe", [
 				"-NoProfile",
@@ -5428,14 +5436,28 @@ function stopSiblingWorkers() {
 		return;
 	}
 	try {
-		const output = execFileSync("ps", ["-eo", "pid=,args="], {
+		const output = execFileSync("ps", ["-eo", "pid=,ppid=,args="], {
 			encoding: "utf8",
 			timeout: 8e3
 		});
+		const rows = /* @__PURE__ */ new Map();
 		for (const line of output.split("\n")) {
-			const match = line.match(/^\s*(\d+)\s+(.+)$/);
-			if (match && match[1] !== self && match[2].includes("ego-cast-worker.mjs")) try {
-				process.kill(Number(match[1]), "SIGTERM");
+			const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+			if (match) rows.set(Number(match[1]), {
+				ppid: Number(match[2]),
+				args: match[3]
+			});
+		}
+		const ancestors = new Set([self]);
+		let pp = rows.get(self)?.ppid;
+		while (pp !== void 0 && pp > 0 && !ancestors.has(pp)) {
+			ancestors.add(pp);
+			pp = rows.get(pp)?.ppid;
+		}
+		for (const [pid, row] of rows) {
+			if (ancestors.has(pid)) continue;
+			if (SCRIPT_ARG_RE.test(row.args)) try {
+				process.kill(pid, "SIGTERM");
 			} catch {}
 		}
 	} catch {}

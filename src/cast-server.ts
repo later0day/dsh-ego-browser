@@ -130,7 +130,7 @@ export async function proxyPost(port: number, path: string, body: unknown, timeo
  * markEgoToolCall() can inject `tool-call` events directly into the live
  * stream (the sidebar auto-open signal), without the client polling.
  */
-function proxyWorkerStream(port: number, res: ServerResponse, path: string): () => void {
+export function proxyWorkerStream(port: number, res: ServerResponse, path: string): () => void {
   let cancelled = false
   let ended = false
   const endOnce = (): void => {
@@ -151,6 +151,21 @@ function proxyWorkerStream(port: number, res: ServerResponse, path: string): () 
   })
   res.write(':ok\n\n')
   sseClients.add(res)
+  // No worker to bridge (ensureWorker() returned null and the handler passed
+  // the -1 sentinel): keep the SSE connection open and quiet so
+  // markEgoToolCall() can still push `tool-call` events and EventSource does
+  // not reconnect-loop. request() below would synchronously throw
+  // ERR_SOCKET_BAD_PORT on port -1 and leave the response dangling, which the
+  // webserver's last-resort guard turns into a bare connection destroy —
+  // the browser then reports net::ERR_EMPTY_RESPONSE.
+  if (!Number.isInteger(port) || port <= 0) {
+    res.on('close', () => {
+      sseClients.delete(res)
+    })
+    return () => {
+      sseClients.delete(res)
+    }
+  }
   // Use node:http (not fetch) to consume the worker's SSE stream. fetch buffers
   // chunked responses in a way that delays/interleaves the first data chunks
   // under Node's undici, which the real-time frame pipeline cannot tolerate —
@@ -410,8 +425,26 @@ function makeEnsureWorker(ctx: EgoContext, cfg: ResolvedConfig, ffmpegManager: F
         const initCfg = JSON.stringify(captureConfig(cfg, ffmpegManager))
         const handle = ctx.subprocess.spawn({
           argv: [process.execPath, WORKER_BIN, initCfg],
+          // cwd is required by the dsh-subprocess provider on DSH >= 0.1.5 —
+          // omitting it throws inside spawn() and the catch below swallowed it
+          // silently, making the watch panel never start (issue #34 defect 1).
           cwd: process.cwd(),
-          env: castWorkerEnv(),
+          // Electron hosts (DSH Desktop): process.execPath is the Electron
+          // binary; children need ELECTRON_RUN_AS_NODE=1 or they boot as a
+          // second Electron app (issue #42). Mirror of resolveEgoEnv's guard —
+          // inlined here because cast-server cannot import from index.ts
+          // (circular import). Only the Electron key is added on top of
+          // castWorkerEnv()'s single key, never a full `...process.env`
+          // spread: the subprocess service merges spec.env over its own
+          // scrubbed parent base, so spreading raw process.env here would
+          // re-inject the credential-shaped/DSH_* keys that base deliberately
+          // strips (see castWorkerEnv()'s doc comment above).
+          env: {
+            ...((process.versions as { electron?: string }).electron
+              ? { ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE ?? '1' }
+              : {}),
+            ...castWorkerEnv(),
+          },
           stdio: {
             stdin: { data: '' },
             stdout: { maxBytes: 8192 },
