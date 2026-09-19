@@ -2,7 +2,7 @@
   "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
   "id": "dsh-ego-browser",
   "name": "ego-browser",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "manifestVersion": "0.15",
   "facets": {
     "host": {
@@ -63,6 +63,14 @@
               "label": "任务空间沙盒隔离 (Space isolation)",
               "kind": "boolean",
               "hint": "默认关闭：使用磁盘持久化 Profile，任务中登录的账号跨电脑重启永久保留；开启后使用内存临时沙盒隔离，任务结束不落盘。"
+            },
+            {
+              "path": [
+                "idleTimeoutMin"
+              ],
+              "label": "空闲自动回收 (Idle auto-stop, minutes)",
+              "kind": "number",
+              "hint": "N 分钟没有任何 ego_* 调用后自动关闭后台浏览器进程（0 = 关闭此功能）。下次调用会自动冷启动（约 2-4 秒）。观察窗正在观看不算活动。"
             },
             {
               "path": [

@@ -78,6 +78,21 @@ declare function require(id: string): any
 			isolateSpacesHint: 'Disabled: use persistent disk profile, logins stay across restarts. Enabled: memory-only sandbox per task.',
 			isolateSpacesOff: 'Disabled (persistent profile, keep logins)',
 			isolateSpacesOn: 'Enabled (isolated memory sandbox)',
+		idleTimeoutMin: 'Idle auto-stop (minutes)',
+		idleTimeoutMinHint: 'Stop the backing browser after N minutes without an ego_* call (0 = off). It cold-starts on the next call (~2-4s). Watching the panel does not count as activity.',
+		minUnit: 'min',
+		loginImportTitle: 'Import logins from system browser',
+		loginImportIntro: 'Copy login cookies from your daily Chrome/Edge/Brave into the agent browser (CDP passthrough — no offline decryption). Probe first, then import with an explicit domain list.',
+		loginImportSource: 'Source',
+		loginImportDomains: 'Domains (comma-separated; empty = ALL)',
+		loginImportDomainsHint: 'e.g. bilibili.com, zhihu.com — subdomains included. Prefer an explicit list over importing everything.',
+		loginImportCloseSource: 'Close the source browser first if it is running (windows restore on next launch)',
+		loginImportProbe: 'Probe',
+		loginImportRun: 'Import',
+		loginImportBusy: 'Working… (a running source browser may need to close first)',
+		loginImportProbeResult: 'Importable: {matched} cookies across {domains} domains (read {total} total) — nothing was written.',
+		loginImportResult: 'Imported {written} cookies across {domains} domains from {source}. They persist across restarts.',
+		loginImportClosed: ' (source browser was closed and can be reopened)',
 			chromePath: 'Browser binary path',
 			chromePathHint: 'Path to the Chrome/Chromium/Edge binary. Empty = auto-detect.',
 			captureBackend: 'Capture backend', streamProfile: 'Quality profile', cdpFps: 'CDP FPS', cdpQuality: 'CDP JPEG quality', cdpMaxWidth: 'CDP max width', cdpBackstopIntervalMs: 'CDP recovery interval', ffmpegFps: 'FFmpeg FPS', ffmpegMaxWidth: 'FFmpeg max width', ffmpegBitrateKbps: 'FFmpeg bitrate', ffmpegEncoder: 'FFmpeg encoder', ffmpegPath: 'FFmpeg binary path', githubMirror: 'GitHub mirror', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
@@ -97,6 +112,21 @@ declare function require(id: string): any
 			isolateSpacesHint: '默认关闭：使用磁盘持久化 Profile，任务中登录的账号跨电脑重启永久保留；开启后使用内存临时沙盒隔离，任务结束不落盘。',
 			isolateSpacesOff: '关闭（持久化登录态，跨电脑重启不丢失）',
 			isolateSpacesOn: '开启（严格沙盒隔离，任务结束不落盘）',
+		idleTimeoutMin: '空闲自动回收（分钟）',
+		idleTimeoutMinHint: 'N 分钟没有任何 ego_* 调用后自动关闭后台浏览器进程（0 = 关闭）。下次调用自动冷启动（约 2-4 秒）。观看观察窗不算活动。',
+		minUnit: '分钟',
+		loginImportTitle: '从系统浏览器导入登录态',
+		loginImportIntro: '把你日常 Chrome/Edge/Brave 里的登录 cookie 复制进 agent 浏览器（CDP 透传，不做离线解密）。建议先「探测」看可导入项，再按域名导入。',
+		loginImportSource: '来源',
+		loginImportDomains: '域名（逗号分隔，留空 = 全部）',
+		loginImportDomainsHint: '例如 bilibili.com, zhihu.com — 含子域名。建议明确列出，不要全量导入。',
+		loginImportCloseSource: '源浏览器运行中则先优雅关闭（窗口下次启动可恢复）',
+		loginImportProbe: '探测',
+		loginImportRun: '导入',
+		loginImportBusy: '正在处理…（运行中的源浏览器可能需要先关闭）',
+		loginImportProbeResult: '可导入 {matched} 条 cookie（{domains} 个域名，共读取 {total} 条）——尚未写入。',
+		loginImportResult: '已从{source}导入 {written} 条 cookie（{domains} 个域名），跨重启保留。',
+		loginImportClosed: '（源浏览器已关闭，可重新打开）',
 			chromePath: '浏览器路径',
 			chromePathHint: 'Chrome/Chromium/Edge 可执行文件路径。留空 = 自动检测。',
 			captureBackend: '捕获后端', streamProfile: '画质档位', cdpFps: 'CDP 帧率', cdpQuality: 'CDP JPEG 质量', cdpMaxWidth: 'CDP 最大宽度', cdpBackstopIntervalMs: 'CDP 恢复截图间隔', ffmpegFps: 'FFmpeg 帧率', ffmpegMaxWidth: 'FFmpeg 最大宽度', ffmpegBitrateKbps: 'FFmpeg 码率', ffmpegEncoder: 'FFmpeg 编码器', ffmpegPath: 'FFmpeg 路径', githubMirror: 'GitHub 镜像源', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
@@ -110,13 +140,113 @@ declare function require(id: string): any
 			expand: '展开设置', collapse: '收起设置',
 		}
 
+		// ── Watch panel locale ────────────────────────────────────────────
+		var _egoLocale = (function () {
+			try { var lang = navigator.language || ''; return lang.startsWith('zh') ? 'zh' : 'en' } catch { return 'en' }
+		})()
+		var watchEn = {
+			title: 'Agent Browser',
+			titleLive: 'Agent Browser · Live',
+			liveView: 'Live view',
+			pinned: 'Pinned',
+			realtime: 'Live',
+			noScreenshot: '(no screenshot — about:blank or browser not rendering)',
+			noActivePages: 'No active browser pages',
+			noActiveHint: 'Pages will appear here as the agent browses with ego_*',
+			openExternal: 'Open real page',
+		raiseWindow: 'Pop out window',
+		raiseWindowHint: 'Raise the agent browser as a real window (a headless instance is replaced by a visible one on the same profile)',
+			noUrl: 'No URL to open',
+			closeTab: 'Close tab',
+			newTab: '(new tab)',
+			history: 'Browsing history',
+			historyHide: 'Hide history',
+			historyShow: 'Show history',
+			noHistory: 'No browsing history',
+			current: 'current',
+			refresh: 'Refresh',
+			backToLive: '← Back to live',
+			dragHint: 'Drag to move panel',
+			loginTitle: 'Log in via the ego-lite agent browser window on your desktop',
+			loginBtn: 'Logged in, save',
+			loginSaving: 'Saving…',
+			loginSaved: 'Saved {n} sessions',
+			loginNotConnected: 'Browser not connected',
+			loginFailed: 'Save failed',
+			loginDismiss: 'Dismiss',
+			captchaTitle: '⚠️ CAPTCHA detected',
+			captchaHint: 'Complete verification in the ego-lite agent browser window; the agent will continue.',
+			captchaDismiss: 'Dismiss',
+			hintReset: 'Reset · scroll to pan · Ctrl+scroll to zoom · double-click to reset',
+			hintPan: 'Ctrl+scroll to zoom · Ctrl+drag to pan · double-click to reset',
+			hintScroll: 'Ctrl+drag to pan · scroll to pan',
+			hintNotCaptured: 'Not captured · operation not delivered · click again to recover',
+			failed: 'failed',
+			stale: '⚠ Not captured',
+			captured: 'Captured',
+			fabTitle: 'Agent Browser live view',
+			settingsTitle: 'Show settings',
+			settingsHide: 'Hide settings',
+		}
+		var watchZh = {
+			title: 'Agent 浏览器',
+			titleLive: 'Agent 浏览器 · 实时',
+			liveView: '只读观察窗',
+			pinned: '已固定查看',
+			realtime: '正在实时浏览',
+			noScreenshot: '（暂无截图 — about:blank 或浏览器未渲染）',
+			noActivePages: '暂无活跃浏览器页',
+			noActiveHint: '当 agent 开始用 ego_* 操作网页时，这里会实时显示',
+			openExternal: '⧉ 打开真实页',
+		raiseWindow: '弹出窗口',
+		raiseWindowHint: '把 agent 浏览器弹出为真实窗口（无头实例会被同 Profile 的有头实例替换，标签页保留）',
+			noUrl: '无可打开的地址',
+			closeTab: '关闭标签',
+			newTab: '(新标签页)',
+			history: '历史浏览轨迹',
+			historyHide: '收起历史轨迹',
+			historyShow: '历史浏览轨迹',
+			noHistory: '暂无浏览记录',
+			current: '当前',
+			refresh: '刷新',
+			backToLive: '← 返回实时',
+			dragHint: '拖动移动面板',
+			loginTitle: '需要账号登录时，请到桌面上那个 「ego lite — agent」 Chrome 窗口完成登录。',
+			loginBtn: '已登录，保存',
+			loginSaving: '保存中…',
+			loginSaved: '已保存 {n} 条会话',
+			loginNotConnected: '未连接浏览器',
+			loginFailed: '保存失败',
+			loginDismiss: '关闭提示',
+			captchaTitle: '⚠️ 检测到人机验证',
+			captchaHint: '请在桌面那个 「ego lite — agent」 浏览器窗口手动完成验证，agent 会继续。',
+			captchaDismiss: '关闭提示',
+			hintReset: '已复位 · 滚轮滚动页面 · Ctrl+滚轮缩放 · 双击复位',
+			hintPan: 'Ctrl+滚轮缩放 · Ctrl+拖动平移 · 双击复位',
+			hintScroll: 'Ctrl+拖动平移 · 滚轮滚动页面',
+			hintNotCaptured: '画面未接管 · 本次操作未送达 · 再点一次即可恢复',
+			failed: '失败',
+			stale: '⚠ 未接管',
+			captured: '已接管',
+			fabTitle: 'Agent 浏览器实时视图',
+			settingsTitle: '展开设置',
+			settingsHide: '收起设置',
+		}
+		var watchDict = { en: watchEn, zh: watchZh }
+		function wt(key, params = undefined) {
+			var dict = watchDict[_egoLocale] || watchEn
+			var text = dict[key] || watchEn[key] || key
+			if (params) { for (var k in params) { text = text.replace(new RegExp('{' + k + '}', 'g'), String(params[k])) } }
+			return text
+		}
+
 		// ── Settings card: store ──────────────────────────────────────────
 		function initialSettingsState() {
 			return {
 				status: 'idle',        // 'idle' | 'loading' | 'ready'
 				available: false,      // true after a successful /ego/api/get
 				writable: false,       // false when settings service is absent
-				draft: { isolateSpaces: false, chromePath: '', captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '960', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
+				draft: { isolateSpaces: false, idleTimeoutMin: '0', chromePath: '', captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '960', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
 				ffmpegStatus: { state: 'checking', canDownload: false, canSelectFfmpeg: false },
 				dirty: false,
 				applyState: { kind: 'idle' }, // 'idle' | 'saving' | 'saved' | 'error'
@@ -164,6 +294,7 @@ declare function require(id: string): any
 					s.writable = true
 			s.draft = {
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
+				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				chromePath: config.chromePath || '',
 				captureBackend: config.captureBackend === 'ffmpeg' && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
 				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
@@ -245,6 +376,7 @@ declare function require(id: string): any
 			var gen = ++this.generation
 			var patch = {}
 			var NUMERIC_FIELDS = {
+				idleTimeoutMin: { min: 0, max: 1440, def: 0 },
 				cdpFps: { min: 5, max: 30, def: 20 }, cdpQuality: { min: 1, max: 100, def: 55 }, cdpMaxWidth: { min: 320, max: 1920, def: 960 }, cdpBackstopIntervalMs: { min: 1000, max: 10000, def: 3000 }, ffmpegFps: { min: 5, max: 30, def: 20 }, ffmpegMaxWidth: { min: 320, max: 1920, def: 1280 }, ffmpegBitrateKbps: { min: 500, max: 20000, def: 4000 },
 			}
 			this.staged.forEach(function (v, k) {
@@ -287,6 +419,7 @@ declare function require(id: string): any
 				s.applyState = { kind: 'saved' }
 			s.draft = {
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
+				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				chromePath: config.chromePath || '',
 				captureBackend: config.captureBackend === 'ffmpeg' && ffmpegStatus && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
 				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
@@ -402,6 +535,79 @@ declare function require(id: string): any
 			)
 		}
 
+		function LoginImportBlock(props) {
+			var t = props.t
+			var useState = React.useState
+			var _source = useState('auto'), source = _source[0], setSource = _source[1]
+			var _domains = useState(''), domains = _domains[0], setDomains = _domains[1]
+			var _close = useState(false), closeSource = _close[0], setCloseSource = _close[1]
+			var _run = useState(false), running = _run[0], setRunning = _run[1]
+			var _res = useState(null), result = _res[0], setResult = _res[1]
+			function run(dryRun) {
+				setRunning(true)
+				setResult(null)
+				fetch('/api/ego/login-import', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({
+						source: source,
+						domains: domains.split(',').map(function (s) { return s.trim() }).filter(Boolean),
+						closeSource: closeSource,
+						dryRun: dryRun,
+					}),
+				})
+					.then(function (r) { return r.json().catch(function () { return null }) })
+					.then(function (j) { setRunning(false); setResult(j || { ok: false, error: 'no response' }) })
+					.catch(function (e) { setRunning(false); setResult({ ok: false, error: String(e) }) })
+			}
+			var resultText = null
+			var resultOk = false
+			if (result) {
+				resultOk = result.ok === true
+				if (resultOk) {
+					var domainCount = (result.domains || []).length
+					var tpl = result.dryRun ? t('loginImportProbeResult') : t('loginImportResult')
+					// Interpolate locally — do not rely on the host locale's
+					// parameter support.
+					resultText = tpl
+						.replace('{matched}', String(result.matched ?? 0))
+						.replace('{written}', String(result.written ?? 0))
+						.replace('{domains}', String(domainCount))
+						.replace('{total}', String(result.totalRead ?? 0))
+						.replace('{source}', String(result.source || ''))
+						+ (result.closedSource ? t('loginImportClosed') : '')
+				} else {
+					resultText = result.error || 'failed'
+				}
+			}
+			return h('div', { className: 'dsh-ego-card__ffmpeg' },
+				h('div', { className: 'dsh-ego-card__ffmpeg-title' }, t('loginImportTitle')),
+				h('div', { className: 'dsh-ego-card__hint' }, t('loginImportIntro')),
+				h('div', { className: 'dsh-ego-card__field-row' },
+					h('select', {
+						className: 'dsh-ego-card__input dsh-ego-card__input--narrow', value: source, disabled: running,
+						onChange: function (e) { setSource(e.target.value) },
+					}, ['auto', 'chrome', 'edge', 'brave'].map(function (v) { return h('option', { key: v, value: v }, v === 'auto' ? t('loginImportSource') + ': auto' : v) })),
+					h('input', {
+						className: 'dsh-ego-card__input', type: 'text', value: domains, disabled: running,
+						placeholder: t('loginImportDomains'),
+						onChange: function (e) { setDomains(e.target.value) },
+					}),
+				),
+				h('div', { className: 'dsh-ego-card__hint' }, t('loginImportDomainsHint')),
+				h('label', { className: 'dsh-ego-card__hint', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer' } },
+					h('input', { type: 'checkbox', checked: closeSource, disabled: running, onChange: function (e) { setCloseSource(e.target.checked) } }),
+					t('loginImportCloseSource'),
+				),
+				h('div', { className: 'dsh-ego-card__ffmpeg-actions' },
+					h('button', { type: 'button', className: 'dsh-ego-card__btn', disabled: running, onClick: function () { run(true) } }, t('loginImportProbe')),
+					h('button', { type: 'button', className: 'dsh-ego-card__btn dsh-ego-card__btn--primary', disabled: running, onClick: function () { run(false) } }, t('loginImportRun')),
+				),
+				running ? h('div', { className: 'dsh-ego-card__ffmpeg-status', role: 'status' }, t('loginImportBusy')) : null,
+				resultText ? h('div', { className: resultOk ? 'dsh-ego-card__saved' : 'dsh-ego-card__failed', role: 'status' }, resultText) : null,
+			)
+		}
+
 		function EgoBrowserCard(props) {
 			var t = props.t
 			var controller = props.controller
@@ -472,6 +678,7 @@ declare function require(id: string): any
 							disabled: busy,
 							onEdit: function (v) { controller.edit('isolateSpaces', v === 'true') },
 						}),
+						h(SettingsField, { id: 'plugin-config-ego-browser-idletimeout', label: t('idleTimeoutMin'), hint: t('idleTimeoutMinHint'), value: state.draft.idleTimeoutMin, numeric: true, narrow: true, unit: t('minUnit'), min: 0, max: 1440, step: 1, disabled: busy, onEdit: function (v) { controller.edit('idleTimeoutMin', v) } }),
 						h(SettingsField, {
 							id: 'plugin-config-ego-browser-chromepath',
 							label: t('chromePath'),
@@ -498,6 +705,7 @@ declare function require(id: string): any
 						h(SettingsField, { id: 'plugin-config-ego-browser-ghmirror', label: t('githubMirror'), value: state.draft.githubMirror, hint: t('githubMirrorHint'), placeholder: 'https://gh-proxy.com/github.com', disabled: busy, onEdit: function (v) { controller.edit('githubMirror', v) } }),
 						h(SettingsField, { id: 'plugin-config-ego-browser-ego-cli-args', label: t('egoCliArgs'), value: state.draft.egoCliArgs, hint: t('egoCliArgsHint'), placeholder: '--sdk-path /path/to/harness.js', disabled: busy, onEdit: function (v) { controller.edit('egoCliArgs', v) } }),
 						h(SettingsField, { id: 'plugin-config-ego-browser-chrome-args', label: t('chromeArgs'), value: state.draft.chromeArgs, hint: t('chromeArgsHint'), placeholder: '--disable-features=Translate --window-size=1024,768', disabled: busy, onEdit: function (v) { controller.edit('chromeArgs', v) } }),
+						h(LoginImportBlock, { t: t }),
 						h('div', { className: 'dsh-ego-card__ffmpeg' },
 							h('div', { className: 'dsh-ego-card__ffmpeg-title' }, t('ffmpegTitle')),
 							h('div', { className: 'dsh-ego-card__ffmpeg-status', role: 'status' }, t(ffmpegLabelKey) + (ffmpegStatus.reason ? ': ' + ffmpegStatus.reason : '') + (progressText ? ' ' + progressText : '')),
@@ -1035,40 +1243,40 @@ declare function require(id: string): any
 				panel.hidden = true
 				panel.innerHTML = `
 					<div id="dsh-ego-head">
-						<span class="dsh-ego-grip" title="拖动移动面板">${ICON_GRIP}</span>
-						<span id="dsh-ego-title">${ICON_GLOBE}<span style="margin-left:6px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Agent 浏览器</span></span>
-						<button id="dsh-ego-refresh" class="dsh-ego-iconbtn" title="刷新">${ICON_REFRESH}</button>
-						<button id="dsh-ego-historybtn" class="dsh-ego-iconbtn off" title="历史浏览轨迹">${ICON_CLOCK}</button>
-						<button id="dsh-ego-close" class="dsh-ego-iconbtn" title="收起">${ICON_CLOSE}</button>
+						<span class="dsh-ego-grip" title="${wt('dragHint')}">${ICON_GRIP}</span>
+						<span id="dsh-ego-title">${ICON_GLOBE}<span style="margin-left:6px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${wt('title')}</span></span>
+						<button id="dsh-ego-refresh" class="dsh-ego-iconbtn" title="${wt('refresh')}">${ICON_REFRESH}</button>
+						<button id="dsh-ego-historybtn" class="dsh-ego-iconbtn off" title="${wt('historyShow')}">${ICON_CLOCK}</button>
+						<button id="dsh-ego-close" class="dsh-ego-iconbtn" title="${wt('settingsHide')}">${ICON_CLOSE}</button>
 					</div>
 					<div id="dsh-ego-tabs"></div>
 					<div id="dsh-ego-login">
-						<span class="dsh-ego-login-txt">需要账号登录时，请到桌面上那个 <b>「ego lite — agent」</b> Chrome 窗口完成登录。</span>
-						<button id="dsh-ego-login-btn" class="dsh-ego-login-btn" type="button">已登录，保存</button>
+						<span class="dsh-ego-login-txt">${wt('loginTitle')}</span>
+						<button id="dsh-ego-login-btn" class="dsh-ego-login-btn" type="button">${wt('loginBtn')}</button>
 						<span class="dsh-ego-login-note" id="dsh-ego-login-note"></span>
-						<button class="dsh-ego-dismiss" type="button" title="关闭提示" data-dismiss="login">×</button>
+						<button class="dsh-ego-dismiss" type="button" title="${wt('loginDismiss')}" data-dismiss="login">×</button>
 					</div>
 					<div id="dsh-ego-captcha">
-						<span class="dsh-ego-captcha-txt"><b>⚠️ 检测到人机验证</b> — 请在桌面那个 <b>「ego lite — agent」</b> 浏览器窗口手动完成验证，agent 会继续。</span>
+						<span class="dsh-ego-captcha-txt"><b>${wt('captchaTitle')}</b> — ${wt('captchaHint')}</span>
 						<span class="dsh-ego-captcha-kind" id="dsh-ego-captcha-kind"></span>
-						<button class="dsh-ego-dismiss" type="button" title="关闭提示" data-dismiss="captcha">×</button>
+						<button class="dsh-ego-dismiss" type="button" title="${wt('captchaDismiss')}" data-dismiss="captcha">×</button>
 					</div>
 					<div id="dsh-ego-cols">
 						<div class="dsh-ego-maincol">
 							<div id="dsh-ego-body"></div>
 						</div>
 						<aside id="dsh-ego-history">
-							<div id="dsh-ego-historyhead">${ICON_CLOCK} 历史浏览轨迹</div>
+							<div id="dsh-ego-historyhead">${ICON_CLOCK} ${wt('history')}</div>
 							<div id="dsh-ego-historylist"></div>
 						</aside>
 					</div>
-					<div class="dsh-ego-off">只读观察窗 · 实时显示 agent 正在浏览的页面 · ${ICON_CLOCK} 查看历史轨迹</div>
+					<div class="dsh-ego-off">${wt('liveView')} · ${wt('realtime')} · ${ICON_CLOCK} ${wt('historyShow')}</div>
 				`
 
 				const fab = document.createElement('button')
 				fab.id = 'dsh-ego-fab'
 				fab.type = 'button'
-				fab.title = 'Agent 浏览器实时视图'
+				fab.title = wt('fabTitle')
 				fab.textContent = ''
 				fab.innerHTML = `${ICON_GLOBE}<span class="dsh-ego-dot"></span>`
 
@@ -1124,7 +1332,7 @@ declare function require(id: string): any
 					historyEl.classList.toggle('open', open)
 					panel.classList.toggle('open-drawer', open)
 					historyBtn.classList.toggle('off', !open)
-					;(historyBtn as HTMLElement).title = open ? '收起历史轨迹' : '历史浏览轨迹'
+					;(historyBtn as HTMLElement).title = open ? wt('historyHide') : wt('historyShow')
 					if (open) renderHistory(lastList)
 				}
 
@@ -1133,14 +1341,12 @@ declare function require(id: string): any
 					historyList.innerHTML = ''
 					const list = Array.isArray(spaces) ? [...spaces].sort((a, b) => (a.lastActive ?? 0) - (b.lastActive ?? 0)) : []
 					if (list.length === 0) {
-						historyList.innerHTML = `<div class="dsh-ego-hnone">暂无浏览记录</div>`
+						historyList.innerHTML = `<div class="dsh-ego-hnone">${wt('noHistory')}</div>`
 						return
 					}
 					for (const s of list) {
 						const item = document.createElement('div')
 						item.className = 'dsh-ego-hitem'
-						// Thumbnails are no longer carried in the spaces payload —
-						// pull the latest cached JPEG from the SSE frame pipeline.
 						const thumbSrc = frameCache.get(s.targetId)
 						const thumb = thumbSrc
 							? `<img class="dsh-ego-hthumb" src="${thumbSrc}" alt="">`
@@ -1148,9 +1354,9 @@ declare function require(id: string): any
 						const active = s.targetId === currentActiveId
 						item.innerHTML = `${thumb}
 							<div class="dsh-ego-hinfo">
-								<div class="dsh-ego-htitle">${escapeHtml(s.title || (s.url || '新标签页'))}</div>
+								<div class="dsh-ego-htitle">${escapeHtml(s.title || (s.url || wt('newTab')))}</div>
 								<div class="dsh-ego-hurl">${escapeHtml(s.url || '(about:blank)')}</div>
-								${active ? '<div class="dsh-ego-hactive">● 当前</div>' : ''}
+								${active ? '<div class="dsh-ego-hactive">● ' + wt('current') + '</div>' : ''}
 							</div>`
 						item.addEventListener('click', () => openPreview(s))
 						historyList.appendChild(item)
@@ -1333,9 +1539,9 @@ declare function require(id: string): any
 					const resetView = () => {
 						zoomState = { scale: 1, tx: 0, ty: 0 }
 						apply()
-						showHint('已复位 · 滚轮滚动页面 · Ctrl+滚轮缩放 · Ctrl+拖动平移 · 点按/拖动操作浏览器 · 双击复位')
+						showHint(wt('hintReset'))
 					}
-					img.title = '滚轮滚动页面 · Ctrl+滚轮缩放 · Ctrl+拖动平移 · 点按/拖动=操作浏览器 · 双击复位'
+					img.title = wt('hintReset')
 
 					// Wheel: plain = scroll the agent page; Ctrl+wheel = view zoom.
 					img.addEventListener('wheel', (e) => {
@@ -1350,7 +1556,7 @@ declare function require(id: string): any
 							zoomState.ty = my - (my - zoomState.ty) * (next / zoomState.scale)
 							zoomState.scale = next
 							apply()
-							showHint('Ctrl+滚轮缩放 · Ctrl+拖动平移 · 双击复位')
+							showHint(wt('hintPan'))
 							return
 						}
 						// Plain wheel → scroll the real page.
@@ -1369,7 +1575,7 @@ declare function require(id: string): any
 							// Ctrl+drag → pan the view (magnifier), no browser input.
 							viewPanning = true
 							img.style.cursor = 'grabbing'
-							showHint('Ctrl+拖动平移 · 滚轮滚动页面')
+							showHint(wt('hintScroll'))
 							return
 						}
 						// Plain press → start a browser interaction (click or drag).
@@ -1440,13 +1646,13 @@ declare function require(id: string): any
 						dot.className = 'dsh-ego-tabdot'
 						const txt = document.createElement('span')
 						txt.className = 'dsh-ego-tabtxt'
-						txt.textContent = s.title || (s.url || '(新标签页)')
+						txt.textContent = s.title || (s.url || wt('newTab'))
 						tab.appendChild(dot)
 						tab.appendChild(txt)
 						// Tab close "×": POST to the host close route, then refresh.
 						const closeBtn = document.createElement('span')
 						closeBtn.className = 'dsh-ego-tabclose'
-						closeBtn.title = '关闭标签'
+						closeBtn.title = wt('closeTab')
 						closeBtn.textContent = '×'
 						closeBtn.addEventListener('click', (e) => {
 							e.stopPropagation()
@@ -1483,20 +1689,20 @@ declare function require(id: string): any
 					const badge = document.createElement('div')
 					badge.className = 'dsh-ego-livebadge'
 					badge.innerHTML = pinned
-						? `<span class="dsh-ego-state-dot pin"></span> 已固定查看`
-						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> 正在实时浏览`
+						? `<span class="dsh-ego-state-dot pin"></span> ${wt('pinned')}`
+						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> ${wt('realtime')}`
 					view.appendChild(badge)
 					if (pinned) {
 						const back = document.createElement('button')
 						back.className = 'dsh-ego-back'
 						back.type = 'button'
-						back.textContent = '← 返回实时'
+						back.textContent = wt('backToLive')
 						back.addEventListener('click', () => { pinned = null; renderSpaces(lastList) })
 						badge.appendChild(back)
 					}
 					const t = document.createElement('div')
 					t.className = 'dsh-ego-livetitle'
-					t.textContent = s.title || (s.url || '(新标签页)')
+					t.textContent = s.title || (s.url || wt('newTab'))
 					// URL line — also the surface the hint is shown on while operating.
 					const u = document.createElement('div')
 					u.className = 'dsh-ego-liveurl'
@@ -1516,7 +1722,7 @@ declare function require(id: string): any
 					} else {
 						const n = document.createElement('div')
 						n.className = 'dsh-ego-liveurl'
-						n.textContent = '（暂无截图 — about:blank 或浏览器未渲染）'
+						n.textContent = wt('noScreenshot')
 						view.appendChild(n)
 					}
 					view.appendChild(t)
@@ -1576,7 +1782,7 @@ declare function require(id: string): any
 					if (pinned) return
 					if (lastList.length === 0) {
 						setTitle('Agent 浏览器')
-						body.innerHTML = `<div class="dsh-ego-empty">暂无活跃浏览器页<br><span style="font-size:11px;">当 agent 开始用 ego_* 操作网页时，这里会实时显示</span></div>`
+						body.innerHTML = `<div class="dsh-ego-empty">${wt('noActivePages')}<br><span style="font-size:11px;">${wt('noActiveHint')}</span></div>`
 						liveCount = 0
 						fab.classList.remove('dsh-ego-live', 'dsh-ego-busy')
 						return
@@ -1599,7 +1805,7 @@ declare function require(id: string): any
 					const current = sel || activeMarked
 					currentActiveId = current.targetId
 					syncWatch(current.targetId)
-					setTitle(sel ? 'Agent 浏览器' : 'Agent 浏览器 · 实时')
+					setTitle(sel ? wt('title') : wt('titleLive'))
 					renderLiveMain(current, sel)
 				}
 
@@ -1619,12 +1825,12 @@ declare function require(id: string): any
 					const badge = document.createElement('div')
 					badge.className = 'dsh-ego-livebadge'
 					badge.innerHTML = isPinned
-						? `<span class="dsh-ego-state-dot pin"></span> 当前标签`
-						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> 正在实时浏览`
+						? `<span class="dsh-ego-state-dot pin"></span> ${wt('pinned')}`
+						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> ${wt('realtime')}`
 					view.appendChild(badge)
 					const t = document.createElement('div')
 					t.className = 'dsh-ego-livetitle'
-					t.textContent = current.title || (current.url || '(新标签页)')
+					t.textContent = current.title || (current.url || wt('newTab'))
 					// URL line — also the surface the hint is shown on while operating.
 					const u = document.createElement('div')
 					u.className = 'dsh-ego-liveurl'
@@ -1632,14 +1838,27 @@ declare function require(id: string): any
 					const openHere = document.createElement('button')
 					openHere.type = 'button'
 					openHere.className = 'dsh-ego-back'
-					openHere.title = '在浏览器新标签打开真实页面'
-					openHere.textContent = '⧉ 打开真实页'
+					openHere.title = wt('openExternal')
+					openHere.textContent = wt('openExternal')
 					openHere.addEventListener('click', () => {
 						const url = current.url
 						if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener')
-						else openHere.textContent = '无可打开的地址'
+						else openHere.textContent = wt('noUrl')
 					})
 					badge.appendChild(openHere)
+					// Raise the real agent window (issue #51): headless instances
+					// get replaced by a headed one on the same profile.
+					const raiseBtn = document.createElement('button')
+					raiseBtn.type = 'button'
+					raiseBtn.className = 'dsh-ego-back'
+					raiseBtn.title = wt('raiseWindowHint')
+					raiseBtn.textContent = wt('raiseWindow')
+					raiseBtn.addEventListener('click', () => {
+						fetch('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+							.then((r) => r.json().catch(() => null))
+							.catch(() => null)
+					})
+					badge.appendChild(raiseBtn)
 					const cached = frameCache.get(current.targetId)
 					if (captureBackend === 'ffmpeg' || cached) {
 						const img = makeZoomImage(u, captureBackend === 'ffmpeg' ? 'video' : 'img')
@@ -1651,7 +1870,7 @@ declare function require(id: string): any
 					} else {
 						const n = document.createElement('div')
 						n.className = 'dsh-ego-liveurl'
-						n.textContent = '（暂无截图 — about:blank 或浏览器未渲染）'
+						n.textContent = wt('noScreenshot')
 						view.appendChild(n)
 					}
 					view.appendChild(t)
@@ -1988,17 +2207,17 @@ clearTimeout((panel as any)._dshHideT)
 				loginBtn.addEventListener('click', () => {
 					void (async () => {
 						loginBtn.classList.add('saving')
-						loginBtn.textContent = '保存中…'
+						loginBtn.textContent = wt('loginSaving')
 						try {
 							const r = await fetch(FLUSH_ROUTE, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
 							const j = await r.json()
-							if (j && j.ok) loginNote.textContent = `已保存 ${j.total ?? ''} 条会话`
-							else loginNote.textContent = (j?.error ? '未连接浏览器' : '保存失败')
+							if (j && j.ok) loginNote.textContent = wt('loginSaved', { n: j.total ?? '' })
+							else loginNote.textContent = (j?.error ? wt('loginNotConnected') : wt('loginFailed'))
 						} catch {
-							loginNote.textContent = '保存失败'
+							loginNote.textContent = wt('loginFailed')
 						} finally {
 							loginBtn.classList.remove('saving')
-							loginBtn.textContent = '已登录，保存'
+							loginBtn.textContent = wt('loginBtn')
 						}
 					})()
 				})
@@ -2737,7 +2956,7 @@ clearTimeout((panel as any)._dshHideT)
 			if (now - this._lastUnwiredAt < 5e3) return
 			this._lastUnwiredAt = now
 			try { console.warn('[ego-browser] live view not wired (liveImgTargetId=' + this.liveImgTargetId + ', current=' + this.currentActiveId + ') — input dropped') } catch (e) {}
-			this._showHint('画面未接管 · 本次操作未送达 · 再点一次即可恢复')
+			this._showHint(wt('hintNotCaptured'))
 		}
 		LivePreviewController.prototype._applyZoom = function () {
 			if (!this.liveImg) return
@@ -2747,7 +2966,7 @@ clearTimeout((panel as any)._dshHideT)
 		LivePreviewController.prototype.resetZoom = function () {
 			this.zoomState = { scale: 1, tx: 0, ty: 0 }
 			this._applyZoom()
-			this._showHint('已复位 · 滚轮滚动页面 · Ctrl+滚轮缩放 · 双击复位')
+			this._showHint(wt('hintReset'))
 		}
 		LivePreviewController.prototype.handleWheel = function (e) {
 			e.preventDefault()
@@ -2762,7 +2981,7 @@ clearTimeout((panel as any)._dshHideT)
 				this.zoomState.ty = my - (my - this.zoomState.ty) * (next / this.zoomState.scale)
 				this.zoomState.scale = next
 				this._applyZoom()
-				this._showHint('Ctrl+滚轮缩放 · Ctrl+拖动平移 · 双击复位')
+				this._showHint(wt('hintPan'))
 				return
 			}
 			var p = this.browserXY(e)
@@ -2788,7 +3007,7 @@ clearTimeout((panel as any)._dshHideT)
 			if (e.ctrlKey || e.metaKey) {
 				this._pointerState.viewPanning = true
 				e.currentTarget.style.cursor = 'grabbing'
-				this._showHint('Ctrl+拖动平移 · 滚轮滚动页面')
+				this._showHint(wt('hintScroll'))
 				return
 			}
 			this._pointerState.browserDrag = true
@@ -2926,18 +3145,18 @@ clearTimeout((panel as any)._dshHideT)
 			var header = h('div', { className: 'dsh-ego-side-head' },
 				h('span', { className: 'dsh-ego-side-title' },
 					h('span', { dangerouslySetInnerHTML: { __html: ICON_GLOBE } }),
-					h('span', { style: { marginLeft: '5px' } }, state.busy ? 'Agent 浏览器 · 实时' : 'Agent 浏览器')
+					h('span', { style: { marginLeft: '5px' } }, state.busy ? wt('titleLive') : wt('title'))
 				),
 				h('button', {
 					className: 'dsh-ego-side-iconbtn' + (state.busy ? ' spinning' : ''),
-					title: '刷新',
+					title: wt('refresh'),
 					onClick: function () {
 						controller.refresh()
 					},
 				}, h('span', { dangerouslySetInnerHTML: { __html: ICON_REFRESH } })),
 				h('button', {
 					className: 'dsh-ego-side-iconbtn' + (state.historyOpen ? '' : ' off'),
-					title: state.historyOpen ? '收起历史轨迹' : '历史浏览轨迹',
+					title: state.historyOpen ? wt('historyHide') : wt('historyShow'),
 					onClick: function () { controller.toggleHistory() },
 				}, h('span', { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }))
 			)
@@ -2950,11 +3169,11 @@ clearTimeout((panel as any)._dshHideT)
 					h('div', { className: 'dsh-ego-side-history' },
 						h('div', { className: 'dsh-ego-side-historyhead' },
 							h('span', { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }),
-							' 历史浏览轨迹'
+							' ' + wt('history')
 						),
 						h('div', { className: 'dsh-ego-side-historylist' },
 							sorted.length === 0
-								? h('div', { className: 'dsh-ego-side-hnone' }, '暂无浏览记录')
+								? h('div', { className: 'dsh-ego-side-hnone' }, wt('noHistory'))
 								: sorted.map(function (s) {
 									return h('div', {
 										key: s.targetId,
@@ -2965,9 +3184,9 @@ clearTimeout((panel as any)._dshHideT)
 											? h('img', { className: 'dsh-ego-side-hthumb', src: s.thumbnail, alt: '' })
 											: h('div', { className: 'dsh-ego-side-hthumb' }),
 										h('div', { className: 'dsh-ego-side-hinfo' },
-											h('div', { className: 'dsh-ego-side-htitle' }, s.title || s.url || '新标签页'),
+											h('div', { className: 'dsh-ego-side-htitle' }, s.title || s.url || wt('newTab')),
 											h('div', { className: 'dsh-ego-side-hurl' }, s.url || '(about:blank)'),
-											s.targetId === state.currentTargetId ? h('div', { className: 'dsh-ego-side-hactive' }, '● 当前') : null
+											s.targetId === state.currentTargetId ? h('div', { className: 'dsh-ego-side-hactive' }, '● ' + wt('current')) : null
 										)
 									)
 								})
@@ -2997,10 +3216,10 @@ clearTimeout((panel as any)._dshHideT)
 							onClick: function () { controller.selectTab(s.targetId) },
 						},
 							h('span', { className: 'dsh-ego-side-tabdot' }),
-							h('span', { className: 'dsh-ego-side-tabtxt' }, s.title || s.url || '(新标签页)'),
+							h('span', { className: 'dsh-ego-side-tabtxt' }, s.title || s.url || wt('newTab')),
 							h('span', {
 								className: 'dsh-ego-side-tabclose',
-								title: '关闭标签',
+								title: wt('closeTab'),
 								onClick: function (e) { e.stopPropagation(); controller.closeTab(s.targetId) },
 							}, '×')
 						)
@@ -3014,8 +3233,8 @@ clearTimeout((panel as any)._dshHideT)
 			if (!currentSpace) {
 				body = h('div', { className: 'dsh-ego-side-body' },
 					h('div', { className: 'dsh-ego-side-empty' },
-						h('div', null, '暂无活跃浏览器页'),
-						h('div', { style: { fontSize: '11px' } }, '当 agent 开始用 ego_* 操作网页时，这里会实时显示')
+						h('div', null, wt('noActivePages')),
+						h('div', { style: { fontSize: '11px' } }, wt('noActiveHint'))
 					)
 				)
 			} else {
@@ -3038,30 +3257,42 @@ clearTimeout((panel as any)._dshHideT)
 						onPointerCancel: function (e) { controller.handlePointerUp(e) },
 						onDoubleClick: function (e) { controller.handleDoubleClick(e) },
 					})
-					: h('div', { className: 'dsh-ego-side-liveurl' }, state.streamMessage || '（暂无截图 — about:blank 或浏览器未渲染）')
+					: h('div', { className: 'dsh-ego-side-liveurl' }, state.streamMessage || wt('noScreenshot'))
 
 				body = h('div', { className: 'dsh-ego-side-body' },
 					h('div', { className: 'dsh-ego-side-liveview' },
 						h('div', { className: 'dsh-ego-side-livebadge' },
 							h('span', { className: 'dsh-ego-side-state-dot' + (state.pinned ? ' pin' : state.busy ? ' busy' : '') }),
-							h('span', { style: { flex: 1 } }, (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · ' + (state.streamState === 'failed' ? (state.streamMessage || '失败') : state.streamState) + (state.currentTargetId ? (state.wiringStale ? ' · ⚠ 未接管' : ' · 已接管') : '')),
+							h('span', { style: { flex: 1 } }, (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · ' + (state.streamState === 'failed' ? (state.streamMessage || wt('failed')) : state.streamState) + (state.currentTargetId ? (state.wiringStale ? ' · ' + wt('stale') : ' · ' + wt('captured')) : '')),
 							state.pinned
 								? h('button', {
 									className: 'dsh-ego-side-back', type: 'button',
 									onClick: function () { controller.unpin() },
-								}, '← 返回实时')
+								}, wt('backToLive'))
 								: null,
 							h('button', {
 								className: 'dsh-ego-side-back', type: 'button',
-								title: '在浏览器新标签打开真实页面',
+								title: wt('openExternal'),
 								onClick: function () {
 									var url = currentSpace.url
 									if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener')
 								},
-							}, '⧉ 打开真实页')
+							}, wt('openExternal')),
+							// Raise the real agent window (issue #51): headless
+							// instances get replaced by a headed one on the same
+							// profile; headed ones just pop to the front.
+							h('button', {
+								className: 'dsh-ego-side-back', type: 'button',
+								title: wt('raiseWindowHint'),
+								onClick: function () {
+									fetch('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+										.then(function (r) { return r.json().catch(function () { return null }) })
+										.catch(function () { return null })
+								},
+							}, wt('raiseWindow'))
 						),
 						liveImg,
-						h('div', { className: 'dsh-ego-side-livetitle' }, currentSpace.title || currentSpace.url || '(新标签页)'),
+						h('div', { className: 'dsh-ego-side-livetitle' }, currentSpace.title || currentSpace.url || wt('newTab')),
 						h('div', { className: 'dsh-ego-side-liveurl' + (state.zoomHint ? ' dsh-ego-side-hint' : '') }, state.zoomHint || currentSpace.url || '')
 					)
 				)
@@ -3079,9 +3310,7 @@ clearTimeout((panel as any)._dshHideT)
 			var saving = savingState[0], setSaving = savingState[1]
 			return h('div', { className: 'dsh-ego-side-login' },
 				h('span', { className: 'dsh-ego-side-login-txt' },
-					'需要账号登录时，请到桌面上那个 ',
-					h('b', null, '「ego lite — agent」'),
-					' Chrome 窗口完成登录。'
+					wt('loginTitle')
 				),
 				h('button', {
 					className: 'dsh-ego-side-login-btn' + (saving ? ' saving' : ''),
@@ -3091,14 +3320,14 @@ clearTimeout((panel as any)._dshHideT)
 						setSaving(true)
 						setNote('')
 						controller.flushLogin().then(function (j) {
-							if (j && j.ok) setNote('已保存 ' + (j.total || '') + ' 条会话')
-							else setNote(j && j.error ? '未连接浏览器' : '保存失败')
-						}).catch(function () { setNote('保存失败') }).finally(function () { setSaving(false) })
+							if (j && j.ok) setNote(wt('loginSaved', { n: j.total || '' }))
+							else setNote(j && j.error ? wt('loginNotConnected') : wt('loginFailed'))
+						}).catch(function () { setNote(wt('loginFailed')) }).finally(function () { setSaving(false) })
 					},
-				}, saving ? '保存中…' : '已登录，保存'),
+				}, saving ? wt('loginSaving') : wt('loginBtn')),
 				note ? h('span', { className: 'dsh-ego-side-login-note' }, note) : null,
 				h('button', {
-					className: 'dsh-ego-side-iconbtn', type: 'button', title: '关闭提示',
+					className: 'dsh-ego-side-iconbtn', type: 'button', title: wt('loginDismiss'),
 					onClick: function () { controller.dismissGuide('login') },
 				}, '×')
 			)
@@ -3110,14 +3339,12 @@ clearTimeout((panel as any)._dshHideT)
 			var h = React.createElement
 			return h('div', { className: 'dsh-ego-side-captcha' },
 				h('span', { className: 'dsh-ego-side-captcha-txt' },
-					h('b', null, '⚠️ 检测到人机验证'),
-					' — 请在桌面那个 ',
-					h('b', null, '「ego lite — agent」'),
-					' 浏览器窗口手动完成验证，agent 会继续。'
+					h('b', null, wt('captchaTitle')),
+					' — ' + wt('captchaHint')
 				),
 				h('span', { className: 'dsh-ego-side-captcha-kind' }, kind),
 				h('button', {
-					className: 'dsh-ego-side-iconbtn', type: 'button', title: '关闭提示',
+					className: 'dsh-ego-side-iconbtn', type: 'button', title: wt('captchaDismiss'),
 					onClick: function () { controller.dismissGuide('captcha') },
 				}, '×')
 			)
@@ -3133,17 +3360,13 @@ clearTimeout((panel as any)._dshHideT)
 
 			var disposeTab = betterSidebar.registerTab({
 				id: 'ego-browser:watch',
-				title: function () { return 'Agent 浏览器' },
+				title: function () { return wt('title') },
 				order: 70,
 				single: true,
-				// Claim external web links so they route into the ego browser
-				// tab (native better-sidebar urlTarget mechanism; url is a
-				// URL object). Scope to http(s) web pages, leaving documents
-				// for the built-in PDF/text/markdown viewers rather than
-				// shadowing them.
-				urlTarget: function (url) {
-					return /^https?:$/.test(url.protocol) && !/\.(pdf|txt|md|docx?|xlsx?|pptx?)$/i.test(url.pathname)
-				},
+				// No urlTarget: this tab is a live screencast of the AGENT
+				// browser, not a renderer for arbitrary URLs. Claiming http(s)
+				// links here stole every chat link from the built-in browser
+				// tab and dead-ended on the empty state (issue #48).
 				component: EgoBrowserTab,
 			})
 
@@ -3158,9 +3381,30 @@ clearTimeout((panel as any)._dshHideT)
 			// baseline is fetched ONCE at mount via a single /api/ego/spaces
 			// request; after that, only a NEW tool call (count goes up)
 			// triggers the open.
+			//
+			// Per-session scope: the event carries the CALLING session id, so the
+			// Tab opens with that session's scope — a background conversation's
+			// tool call lands in ITS OWN sidebar instead of the sidebar the user
+			// happens to be looking at. The one-shot guard is therefore per
+			// session, and the probe stream stays open (a later session must
+			// still be able to auto-open).
 			var probeDisposed = false
 			var baseline = null // null = not yet observed; set on first fetch
-			var autoOpened = false
+			// Sessions whose sidebar already auto-opened this page load. Keyed PER
+			// SESSION: each conversation gets its own one-shot, and the open is scoped to
+			// the CALLING session, so a background conversation's tool call opens the Tab
+			// in ITS OWN sidebar instead of the one the user is looking at.
+			var autoOpened = {}
+			var openWatchTab = function (sessionId) {
+				var key = sessionId || ''
+				if (autoOpened[key] === true) return
+				autoOpened[key] = true
+				try {
+					// The second argument is the session scope; without it the open lands
+					// in whatever sidebar is currently on screen.
+					betterSidebar.openTab({ type: 'ego-browser:watch' }, sessionId ? { sessionId: sessionId } : undefined)
+				} catch (e) {}
+			}
 			// One-shot baseline fetch (NOT a polling loop). After this, the
 			// SSE `tool-call` event is the sole signal.
 			void (async function () {
@@ -3181,10 +3425,11 @@ clearTimeout((panel as any)._dshHideT)
 			try { probeSse = new EventSource('/api/ego/stream') } catch (e) {}
 			if (probeSse) {
 				probeSse.addEventListener('tool-call', function (ev) {
-					if (probeDisposed || autoOpened) return
+					if (probeDisposed) return
 					try {
 						var m = JSON.parse(ev.data)
 						if (!m || typeof m.count !== 'number') return
+						var sid = typeof m.sessionId === 'string' && m.sessionId !== '' ? m.sessionId : undefined
 						if (baseline === null) {
 							// Event arrived before the baseline fetch resolved —
 							// treat this count as the baseline (it's the first
@@ -3192,18 +3437,10 @@ clearTimeout((panel as any)._dshHideT)
 							// is already >0, the agent has called a tool this
 							// session, so open now.
 							baseline = m.count
-							if (m.count > 0) {
-								autoOpened = true
-								try { betterSidebar.openTab({ type: 'ego-browser:watch' }) } catch (e) {}
-							}
+							if (m.count > 0) openWatchTab(sid)
 							return
 						}
-						if (m.count > baseline) {
-							autoOpened = true
-							try { betterSidebar.openTab({ type: 'ego-browser:watch' }) } catch (e) {}
-							// Auto-opened: close the probe stream (no longer needed).
-							try { probeSse.close() } catch (e) {}
-						}
+						if (m.count > baseline) openWatchTab(sid)
 					} catch (e) {}
 				})
 			}

@@ -17,6 +17,7 @@ import { request, type ClientRequest, type IncomingMessage, type ServerResponse 
 import type { EgoContext, RegisterRouteOptions, ResolvedConfig, WebServerLike } from './types.ts'
 import type { SettingsBridge } from './settings.ts'
 import type { FfmpegInstallationManager, FfmpegStatus } from './ffmpeg-installation.ts'
+import type { LoginImportOptions, LoginImportReport } from './login-import.ts'
 
 const WORKER_BIN = fileURLToPath(new URL('../bin/ego-cast-worker.mjs', import.meta.url))
 
@@ -25,6 +26,8 @@ export const EGO_STREAM_ROUTE = '/api/ego/stream'
 export const EGO_HEALTH_ROUTE = '/api/ego/health'
 export const EGO_CLOSE_ROUTE = '/api/ego/close'
 export const EGO_FLUSH_ROUTE = '/api/ego/flush'
+export const EGO_RAISE_ROUTE = '/api/ego/raise'
+export const EGO_LOGIN_IMPORT_ROUTE = '/api/ego/login-import'
 export const EGO_INPUT_ROUTE = '/api/ego/input'
 export const EGO_WATCH_START_ROUTE = '/api/ego/watch/start'
 export const EGO_WATCH_SWITCH_ROUTE = '/api/ego/watch/switch'
@@ -44,12 +47,24 @@ export const EGO_VIDEO_STATUS_ROUTE = '/api/ego/video/status'
 let toolCallCount = 0
 const sseClients = new Set<ServerResponse>()
 
-export function markEgoToolCall(): void {
+/** Timestamp of the last ego_* tool call — the idle reaper's activity signal. */
+let lastEgoActivity = 0
+export function getLastEgoActivity(): number {
+  return lastEgoActivity
+}
+
+export function markEgoToolCall(sessionId?: string): void {
   toolCallCount += 1
+  lastEgoActivity = Date.now()
   // Push the new count to every connected SSE client immediately. The event
-  // payload is tiny (just the counter); frames and spaces events continue
-  // to flow from the worker as before.
-  const frame = `event: tool-call\ndata: ${JSON.stringify({ count: toolCallCount })}\n\n`
+  // payload carries the counter AND the calling session id (when the caller
+  // supplied one): the client scopes its sidebar auto-open to that session, so
+  // a background conversation's tool call lands in ITS OWN sidebar instead of
+  // the one the user happens to be reading.
+  const payload = sessionId === undefined || sessionId === ''
+    ? { count: toolCallCount }
+    : { count: toolCallCount, sessionId }
+  const frame = `event: tool-call\ndata: ${JSON.stringify(payload)}\n\n`
   for (const res of sseClients) {
     try {
       res.write(frame)
@@ -506,6 +521,8 @@ export function initCastServer(
   cfg: ResolvedConfig,
   bridge: SettingsBridge,
   ffmpegManager: FfmpegInstallationManager | null,
+  openAgentWindow: () => Promise<{ ok: boolean; error?: string }> = async () => ({ ok: false, error: 'raise not supported by this host build' }),
+  loginImport: (opts: LoginImportOptions) => Promise<LoginImportReport> = async () => ({ ok: false, error: 'login import not supported by this host build' }),
 ): void {
   const ensureWorker = makeEnsureWorker(ctx, cfg, ffmpegManager)
   const pushConfig = makePushConfig(ensureWorker, ffmpegManager)
@@ -653,6 +670,52 @@ export function initCastServer(
     },
   })
 
+  // POST /api/ego/raise — pop the agent browser out as a REAL visible window
+  // (issue #51): when the backing browser runs headless, the runtime's
+  // `ego-browser --open` replaces it with a headed instance on the SAME
+  // profile (tabs restore); when it is already visible, --open just raises
+  // the window. The actual spawn is injected by the host plugin (it owns
+  // egoBin + the env resolution).
+  const disposeRaise = server.register({
+    kind: 'exact',
+    path: EGO_RAISE_ROUTE,
+    handler: async (_req: unknown, resRaw: unknown) => {
+      const res = resRaw as ServerResponse
+      try {
+        const result = await openAgentWindow()
+        return sendJson(res, result.ok ? 200 : 500, result)
+      } catch (err) {
+        return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) })
+      }
+    },
+  })
+
+  // POST /api/ego/login-import — the settings card's entry point for the
+  // login-cookie importer (issue #46). The heavy lifting (system browser
+  // probe, ABE-safe CDP read, write into the agent browser) is injected by
+  // the host plugin; the body mirrors ego_login_import's arguments.
+  const disposeLoginImport = server.register({
+    kind: 'exact',
+    path: EGO_LOGIN_IMPORT_ROUTE,
+    handler: async (reqRaw: unknown, resRaw: unknown) => {
+      const req = reqRaw as IncomingMessage
+      const res = resRaw as ServerResponse
+      const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>)
+      try {
+        const result = await loginImport({
+          source: (['chrome', 'edge', 'brave', 'auto'].includes(String(body.source)) ? String(body.source) : 'auto') as LoginImportOptions['source'],
+          domains: Array.isArray(body.domains) ? (body.domains as unknown[]).map(String) : undefined,
+          profile: typeof body.profile === 'string' && body.profile !== '' ? body.profile : undefined,
+          closeSource: body.closeSource === true,
+          dryRun: body.dryRun === true,
+        })
+        return sendJson(res, result.ok ? 200 : 400, result)
+      } catch (err) {
+        return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) })
+      }
+    },
+  })
+
   const disposeHealth = server.register({
     kind: 'exact',
     path: EGO_HEALTH_ROUTE,
@@ -718,6 +781,8 @@ export function initCastServer(
     try { disposeInput() } catch { /* ignore */ }
     try { disposeClose() } catch { /* ignore */ }
     try { disposeFlush() } catch { /* ignore */ }
+    try { disposeRaise() } catch { /* ignore */ }
+    try { disposeLoginImport() } catch { /* ignore */ }
     try { disposeHealth() } catch { /* ignore */ }
     for (const dispose of watchRoutes) try { dispose() } catch { /* ignore */ }
     try { disposeWatchStatus() } catch { /* ignore */ }
