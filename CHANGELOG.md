@@ -2,6 +2,28 @@
 
 所有对用户可见的变更集中在各版本号下。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本语义遵循 [SemVer](http://semver.org/)。
 
+## [0.8.6] - 2026-09-28 — 登录态导入安全加固 + DSH 0.1.7 设置适配 + 人机验证误报修复
+
+### 安全
+- **`ego_login_import` 不再可能损坏源浏览器 cookie 库（#61，数据丢失）**：旧流程用 `Browser.close` 优雅关闭无头源实例，其异步 flush（热 Profile 上 10s+）会**晚于**还原逻辑落盘——在 Edge 153 上把还原好的 cookie 库覆盖成空库，且第二次调用抓到的"备份"已是空库，兜底全部失效（报告者靠手工快照救回）。现在：① 拆除时丢弃 CDP 连接并**强杀**实例（被杀进程不会 flush，磁盘保持启动前状态）；② **无条件还原并校验**（重读加密标记计数，失败重试一次），备份文件保留供手工恢复；③ 若源浏览器期间重新出现（用户在用）则跳过还原，不与活写入者竞争。代价是用户下次真开浏览器会看到一次"未正确关闭"气泡——比静默丢数据划算。
+
+### 修复
+- **导入/落盘的返回值不再"假成功"（#60）**：`closedSource`/`restoredFromBackup` 补进输出 schema（严格宿主此前把每次成功导入判为 invalid output，而副作用其实已执行）；读 cookie 的循环改为**计数稳定后退出**（旧逻辑"首次非空即停"在冷启动渐进加载时只读到 0-1 条却报成功）；`ego_auth_flush` 无错误时不再返回 `error: undefined`（undefined 不是合法 JSON，整条结果被拒）。
+- **写入落地改为服务端确认**：`written` 旧值只是批处理算术，`browser.json` 指向陈旧/被替换的实例时会"报成功但什么都没写"。现在每个 jar 写入后**读回逐条比对**；一条都没落地 = 硬失败并给出重启 agent 浏览器的指引。
+- **隔离空间收不到导入的 cookie**：`EGO_ISOLATE_SPACES=1` 时空间上下文是**创建时**从默认 jar 播种的快照（点时间拷贝，非实时共享），导入后已打开的 space 页面仍显示未登录。导入现在写入默认 jar **加** `task-spaces.json` 中所有活跃 space 上下文；某个上下文已消失时降级为警告而非使整体失败。
+- **人机验证误报（#62）**：文本兜底匹配裸 `captcha` 名词，任何**讨论**验证码的页面都会误报——包括渲染了本插件源码注释的本地 dashboard。现在：① **本机地址（loopback）不做文本探测**；② 改为匹配**挑战短语**而非裸名词。选择器命中逻辑不变（真实 reCAPTCHA/hCaptcha/Turnstile/Cloudflare 容器仍立即上报）。worker 内的并行探针同步修改。
+- **DSH 0.1.7 设置保存后不再静默（0.1.7 forms 路径）**：适配后读路径切到了 loader 活配置，但**没有任何变更订阅**，`onChange()` 保存后零次触发——投屏 worker 的热推送只在下次 spawn 才看到新值（worker 常驻时永远看不到）。现订阅宿主 `settings/document-updated`（forms 服务 `describe()` 后发出），**一条订阅覆盖插件页表单与 `/ego/api/set` 网关两条写入路径**，随插件 fiber 卸载。
+- **`--open` 在 Windows 上退出码为 1（#62）**：`process.exit(0)` 在 CDP socket 仍在关闭时执行，触发 libuv `!(handle->flags & UV_HANDLE_CLOSING)` 断言——窗口正常抬起但退出码非 0，按 `$LASTEXITCODE` 判断的调用方视为失败。现改为设置 `process.exitCode` 让事件循环自然退出，加 unref 的 3 秒兜底防句柄泄漏挂起。
+- **登录/验证提示的窗口名对不上（#62）**：Chrome 显示的是网页标题，按「ego lite — agent」在任务栏/Alt+Tab 都找不到。文案改为指引面板里已有的**「弹出窗口」按钮**（会置前，无头实例替换为同 Profile 有头窗口）。
+
+### 新增
+- **DSH 0.1.7 设置页适配（插件页行配置）**：0.1.7 退役了可注册的 settings 命名空间与 `settings.plugin.item` 槽。现于 `plugins.row.config` 注册配置视图（同时按 `@dsh-external/ego-browser` 与包名 `dsh-ego-browser` 两个 bundle 名注册，键为 `<bundle>#<rowId>`），由宿主下发的 `ConfigPageForm` 渲染（保存走 `form.mutate(ops, revision)`），偏好字段标记 `.volatile()` 并用宿主自己的 schemastery fork 构建 schema；≤ 0.1.6 保留旧设置卡片。0.1.7 上实机验证：行页渲染全部 18 个字段，保存即时生效，重启后保留。
+- **「禁用画面回传」开关 `disableFrameRelay`（PR #55，HuanLinOTO）**：可选关闭实时帧回传（含 `/api/ego/stream` 的相应行为）。
+
+### 社区
+- 合并 PR #55（disableFrameRelay 开关，HuanLinOTO）。
+- 审查并关闭 PR #59（0.1.7 设置读写）：其诊断正确，但 master 上的端到端适配已覆盖同一问题且更完整（含插件页写入路径与上面的变更订阅），并在关闭说明中写明其方案未覆盖的两点。
+
 ## [0.8.5] - 2026-09-18 — 登录态导入 + 空闲回收 + 观察窗修复群
 
 ### 新增
@@ -68,6 +90,9 @@
 ## [Unreleased]
 
 观察窗落地双画面管线：修复 CDP 协议根因，并加入可选 FFmpeg H.264/fMP4 后端。
+
+### 修复
+- **`dsh-plugin.json` 的 `version` 与 `package.json` 重新对齐**：0.8.5→0.8.6 的发版只改了 `package.json`，已发布的 0.8.6 tarball 里这个字段仍是 `0.8.5`（0.8.4 时犯过同一个错并单独修过）。DSH 0.1.7 的插件管理器读 `package.json` 的 `dsh` 字段、从不读这个文件，所以对运行没有任何影响，纯清单卫生问题。已加 `tests/manifest-consistency.test.ts` 把两者钉死（连同「CHANGELOG 里必须有当前版本号」和「`id` 与包名一致」）。
 
 ### 新增 / 优化
 - **用户自定义启动参数**：设置卡新增 `ego-browser CLI 附加参数` 与 `Chrome 启动附加参数` 两个字段。前者追加到 `ego-browser nodejs` argv，下一次 `ego_*` 工具调用即生效；后者经 `EGO_LINUX_EXTRA_ARGS` 桥接到 vendored runtime 的 `launch()`，仅浏览器下次冷启动生效（浏览器是单例常驻——需 `ego-browser --stop` 或重启 DSH 才会重新启动）。两边都拉黑会破坏插件自管控制面的标志（`--status`/`--stop`/`--help`/`--user-data-dir`/`--remote-debugging-port`/`--headless`/`--proxy-server` 等）；`--proxy-server` 请走 `EGO_LINUX_PROXY`。`ego_doctor` 报告当前生效参数。
