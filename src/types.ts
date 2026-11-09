@@ -1,3 +1,5 @@
+import type { TuiStatusService, TuiToastService, TuiSettingsSectionsService } from './tui/types.ts'
+
 /**
  * ego-browser — shared host-side types.
  *
@@ -105,6 +107,9 @@ export interface SettingsService {
 
 /** Host context shape the plugin consumes (structural; not imported from cordis). */
 export interface EgoContext {
+  tuiStatus?: TuiStatusService
+  tuiToast?: TuiToastService
+  tuiSettingsSections?: TuiSettingsSectionsService
   tools: ToolRegistrar
   subprocess: SubprocessService
   logger?: LoggerLike
@@ -121,11 +126,23 @@ export interface EgoContext {
 /** Resolved (post-defaults) runtime config — the canonical key set. */
 export interface ResolvedConfig {
   isolateSpaces: boolean
+  /** True = each DSH session gets its own task space; false = one shared space. */
+  sessionScopedSpaces: boolean
   /** Minutes without an ego_* call before the backing browser is auto-stopped. 0 = off. */
   idleTimeoutMin: number
   /** True = the live frame relay (ego-cast worker + cast routes) is turned off entirely. */
   disableFrameRelay: boolean
+  /** Opt in to opening the TUI browser panel on the first browser tool call. */
+  tuiAutoOpenPanel: boolean
+  /** True = reuse a resident `ego-browser --serve` process across ego_* calls (issue #56). */
+  residentExecutor: boolean
+  /** Minutes without an ego_* call before the resident process is stopped. 0 = keep until unmount. */
+  residentIdleMin: number
+  /** Inject the compact browser rules section into the system prompt after the first ego_* call. */
+  rulesPrompt: boolean
   chromePath: string
+  /** macOS only: pass `--use-mock-keychain` to Chrome so cookies flush to disk (issue #93). */
+  useMockKeychain: boolean
   captureBackend: 'auto' | 'cdp' | 'ffmpeg'
   streamProfile: 'low' | 'balanced' | 'high'
   cdpFps: number
@@ -140,6 +157,12 @@ export interface ResolvedConfig {
   githubMirror: string
   egoCliArgs: string
   chromeArgs: string
+  /** Fixed CSS viewport width applied to every agent page via CDP emulation. 0 = off. */
+  viewportWidth: number
+  /** Fixed CSS viewport height applied to every agent page via CDP emulation. 0 = off. */
+  viewportHeight: number
+  /** Device pixel ratio for the fixed viewport. 0 = the browser's own. */
+  deviceScaleFactor: number
 }
 
 /** Raw composition-layer config (may contain legacy / extra keys). */

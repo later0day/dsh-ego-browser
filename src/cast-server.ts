@@ -12,14 +12,23 @@
  * exits cleanly; we surface an empty spaces list so the panel says
  * "no live browser right now" instead of erroring.
  */
-import { fileURLToPath } from 'node:url'
 import { request, type ClientRequest, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { EgoContext, RegisterRouteOptions, ResolvedConfig, WebServerLike } from './types.ts'
 import type { SettingsBridge } from './settings.ts'
-import type { FfmpegInstallationManager, FfmpegStatus } from './ffmpeg-installation.ts'
+import type { FfmpegInstallationManager } from './ffmpeg-installation.ts'
 import type { LoginImportOptions, LoginImportReport } from './login-import.ts'
+import {
+  createLoginExtensionPairingCode,
+  getLoginExtensionHealth,
+  getLoginExtensionJob,
+  startLoginExtensionJob,
+  stopLoginExtensionBridge,
+} from './login-extension.ts'
 
-const WORKER_BIN = fileURLToPath(new URL('../bin/ego-cast-worker.mjs', import.meta.url))
+import { captureConfig, isProcessAlive, knownWorkerState, makeEnsureWorker, proxyFrom, proxyPost, type EnsureWorker } from './worker-client.ts'
+export { proxyPost } from './worker-client.ts'
+
+type PushConfig = (cfg: ResolvedConfig) => Promise<void>
 
 export const EGO_SPACES_ROUTE = '/api/ego/spaces'
 export const EGO_STREAM_ROUTE = '/api/ego/stream'
@@ -29,6 +38,8 @@ export const EGO_FLUSH_ROUTE = '/api/ego/flush'
 export const EGO_RAISE_ROUTE = '/api/ego/raise'
 export const EGO_LOGIN_IMPORT_ROUTE = '/api/ego/login-import'
 export const EGO_INPUT_ROUTE = '/api/ego/input'
+export const EGO_NAVIGATE_ROUTE = '/api/ego/navigate'
+export const EGO_WINDOW_SIZE_ROUTE = '/api/ego/window-size'
 export const EGO_WATCH_START_ROUTE = '/api/ego/watch/start'
 export const EGO_WATCH_SWITCH_ROUTE = '/api/ego/watch/switch'
 export const EGO_WATCH_STOP_ROUTE = '/api/ego/watch/stop'
@@ -74,22 +85,6 @@ export function markEgoToolCall(sessionId?: string): void {
   }
 }
 
-function castStatePath(): string {
-  // Mirror the ego-lite runtime state dir across platforms so we find the
-  // worker's ego-cast.json wherever it ran: Windows uses
-  // %LOCALAPPDATA%\ego-lite-linux; POSIX uses $XDG_STATE_HOME (default
-  // ~/.local/state)/ego-lite-linux. Honors EGO_LINUX_STATE_DIR overrides.
-  const e = process.env
-  const isWin = process.platform === 'win32'
-  const home = e.HOME || e.USERPROFILE || (isWin ? e.LOCALAPPDATA || '' : '/root')
-  const stateHome = e.EGO_LINUX_STATE_DIR || (isWin
-    ? (e.LOCALAPPDATA || `${home}\\AppData\\Local`)
-    : (e.XDG_STATE_HOME || `${home}/.local/state`))
-  return stateHome.endsWith('ego-lite-linux')
-    ? `${stateHome}/ego-cast.json`
-    : `${stateHome}/ego-lite-linux/ego-cast.json`
-}
-
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
   res.writeHead(status, {
@@ -98,37 +93,6 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'cache-control': 'no-store',
   })
   res.end(payload)
-}
-
-/** Proxy a worker loopback endpoint. Returns null when the worker is unreachable. */
-async function proxyFrom(port: number, path: string): Promise<unknown> {
-  try {
-    const r = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(4000) })
-    if (!r.ok) return null
-    return await r.json()
-  } catch {
-    return null
-  }
-}
-
-interface ProxyPostResult {
-  status: number
-  body: unknown
-}
-
-/** Proxy a POST with a JSON body to the worker. Returns status and body, or null when unreachable. */
-export async function proxyPost(port: number, path: string, body: unknown, timeoutMs = 4000): Promise<ProxyPostResult | null> {
-  try {
-    const r = await fetch(`http://127.0.0.1:${port}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    })
-    return { status: r.status, body: await r.json().catch(() => ({ ok: false, error: `worker returned ${r.status}` })) }
-  } catch {
-    return null
-  }
 }
 
 /**
@@ -145,9 +109,17 @@ export async function proxyPost(port: number, path: string, body: unknown, timeo
  * markEgoToolCall() can inject `tool-call` events directly into the live
  * stream (the sidebar auto-open signal), without the client polling.
  */
-export function proxyWorkerStream(port: number, res: ServerResponse, path: string): () => void {
+export function proxyWorkerStream(
+  port: number,
+  res: ServerResponse,
+  path: string,
+  retry?: () => Promise<number | null>,
+  retryDelayMs = 1500,
+): () => void {
   let cancelled = false
   let ended = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let upstream: ClientRequest | null = null
   const endOnce = (): void => {
     if (ended) return
     ended = true
@@ -166,17 +138,52 @@ export function proxyWorkerStream(port: number, res: ServerResponse, path: strin
   })
   res.write(':ok\n\n')
   sseClients.add(res)
-  // No worker to bridge (ensureWorker() returned null and the handler passed
-  // the -1 sentinel): keep the SSE connection open and quiet so
-  // markEgoToolCall() can still push `tool-call` events and EventSource does
-  // not reconnect-loop. request() below would synchronously throw
-  // ERR_SOCKET_BAD_PORT on port -1 and leave the response dangling, which the
-  // webserver's last-resort guard turns into a bare connection destroy —
-  // the browser then reports net::ERR_EMPTY_RESPONSE.
+  // Declared before the retry branch: the late-attach path returns from this
+  // function, so anything defined after it would be in the temporal dead zone
+  // when the retry callback fires.
+  const onClose = (): void => {
+    cancelled = true
+    sseClients.delete(res)
+    try {
+      upstream?.destroy()
+    } catch {
+      /* ignore */
+    }
+  }
+  // No worker to bridge (ensureWorker() returned null): keep the SSE open and
+  // quiet so markEgoToolCall() can still push events, but when a `retry`
+  // provider is supplied also re-check periodically. The browser may be
+  // started AFTER the panel: without this the panel's stream stayed a dead
+  // `:ok` forever, so it never received a single frame/spaces event and the
+  // sidebar showed "未接管 / 暂无截图" even though the worker was streaming.
   if (!Number.isInteger(port) || port <= 0) {
     res.on('close', () => {
+      cancelled = true
+      if (timer !== null) { clearTimeout(timer); timer = null }
       sseClients.delete(res)
     })
+    if (retry) {
+      const attempt = (): void => {
+        if (cancelled || ended) return
+        retry().then((next) => {
+          if (cancelled || ended) return
+          if (typeof next === 'number' && next > 0) {
+            res.on('close', onClose)
+            attach(next)
+          } else {
+            timer = setTimeout(attempt, Math.max(20, retryDelayMs))
+          }
+        }).catch(() => {
+          if (!cancelled && !ended) timer = setTimeout(attempt, Math.max(20, retryDelayMs))
+        })
+      }
+      timer = setTimeout(attempt, Math.max(20, retryDelayMs))
+      return () => {
+        cancelled = true
+        if (timer !== null) { clearTimeout(timer); timer = null }
+        sseClients.delete(res)
+      }
+    }
     return () => {
       sseClients.delete(res)
     }
@@ -185,52 +192,47 @@ export function proxyWorkerStream(port: number, res: ServerResponse, path: strin
   // chunked responses in a way that delays/interleaves the first data chunks
   // under Node's undici, which the real-time frame pipeline cannot tolerate —
   // http.request streams them as they arrive and frames forward immediately.
-  const up: ClientRequest = request(
-    { host: '127.0.0.1', port, path, method: 'GET', headers: { accept: 'text/event-stream' } },
-    (upRes: IncomingMessage) => {
-      upRes.on('data', (chunk: Buffer) => {
-        if (cancelled || ended) return
-        try {
-          if (!res.write(chunk)) {
-            upRes.pause()
-            res.once('drain', () => {
-              if (!cancelled && !ended) upRes.resume()
-            })
+  function attach(workerPort: number): void {
+    upstream = request(
+      { host: '127.0.0.1', port: workerPort, path, method: 'GET', headers: { accept: 'text/event-stream' } },
+      (upRes: IncomingMessage) => {
+        upRes.on('data', (chunk: Buffer) => {
+          if (cancelled || ended) return
+          try {
+            if (!res.write(chunk)) {
+              upRes.pause()
+              res.once('drain', () => {
+                if (!cancelled && !ended) upRes.resume()
+              })
+            }
+          } catch {
+            cancelled = true
+            endOnce()
           }
-        } catch {
-          cancelled = true
-          endOnce()
-        }
-      })
-      upRes.on('end', endOnce)
-      upRes.on('error', endOnce)
-    },
-  )
-  up.on('error', endOnce)
-  up.setTimeout(5000, () => {
-    try {
-      up.destroy()
-    } catch {
-      /* ignore */
-    }
-    endOnce()
-  })
-  up.end()
-  const onClose = (): void => {
-    cancelled = true
-    sseClients.delete(res)
-    try {
-      up.destroy()
-    } catch {
-      /* ignore */
-    }
-  } // don't end res here; let worker stream close it
+        })
+        upRes.on('end', endOnce)
+        upRes.on('error', endOnce)
+      },
+    )
+    upstream.on('error', endOnce)
+    upstream.setTimeout(5000, () => {
+      try {
+        upstream?.destroy()
+      } catch {
+        /* ignore */
+      }
+      endOnce()
+    })
+    upstream.end()
+  }
+  // don't end res here; let worker stream close it
   res.on('close', onClose)
+  attach(port)
   return () => {
     cancelled = true
     sseClients.delete(res)
     try {
-      up.destroy()
+      upstream?.destroy()
     } catch {
       /* ignore */
     }
@@ -311,37 +313,6 @@ async function readJsonBody(req: IncomingMessage, maxBytes = 8192): Promise<Reco
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
 }
 
-interface WorkerState {
-  port: number | null
-  pid: number | null
-}
-
-/** Read the worker's { port, pid } from ego-cast.json, if any. */
-async function knownWorkerState(): Promise<WorkerState> {
-  try {
-    const { readFile } = await import('node:fs/promises')
-    const state = JSON.parse(await readFile(castStatePath(), 'utf8')) as { port?: unknown; pid?: unknown }
-    return {
-      port: typeof state.port === 'number' ? state.port : null,
-      pid: typeof state.pid === 'number' ? state.pid : null,
-    }
-  } catch {
-    return { port: null, pid: null }
-  }
-}
-
-/** Is a process with this pid alive? (false for our own / empty / signals fail) */
-function isProcessAlive(pid: number | null): boolean {
-  if (!pid || pid <= 0) return false
-  try {
-    process.kill(pid, 0) // signal 0 = existence probe, no side effect
-    return true
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException
-    return e && e.code === 'EPERM' // exists but not ours to signal
-  }
-}
-
 /** Reason string every frame-relay route answers with while the relay is off. */
 export const FRAME_RELAY_DISABLED = 'frame relay disabled'
 
@@ -361,147 +332,6 @@ export async function stopCastWorker(): Promise<boolean> {
     return true
   } catch {
     return false
-  }
-}
-
-interface CaptureConfigPayload {
-  captureBackend: ResolvedConfig['captureBackend']
-  ffmpegFallbackReason: string
-  streamProfile: ResolvedConfig['streamProfile']
-  cdpFps: number
-  cdpQuality: number
-  cdpMaxWidth: number
-  cdpBackstopIntervalMs: number
-  ffmpegFps: number
-  ffmpegMaxWidth: number
-  ffmpegBitrateKbps: number
-  ffmpegEncoder: ResolvedConfig['ffmpegEncoder']
-  ffmpegPath: string
-  ffmpegResolvedPath: string
-}
-
-function captureConfig(cfg: ResolvedConfig, ffmpegManager: FfmpegInstallationManager | null): CaptureConfigPayload {
-  const ffmpegStatus: FfmpegStatus | undefined = ffmpegManager?.status()
-  const unavailable = cfg.captureBackend === 'ffmpeg' && !ffmpegStatus?.canSelectFfmpeg
-  return {
-    captureBackend: unavailable ? 'cdp' : cfg.captureBackend,
-    ffmpegFallbackReason: unavailable ? (ffmpegStatus?.reason || 'FFmpeg is unavailable') : '',
-    streamProfile: cfg.streamProfile,
-    cdpFps: cfg.cdpFps,
-    cdpQuality: cfg.cdpQuality,
-    cdpMaxWidth: cfg.cdpMaxWidth,
-    cdpBackstopIntervalMs: cfg.cdpBackstopIntervalMs,
-    ffmpegFps: cfg.ffmpegFps,
-    ffmpegMaxWidth: cfg.ffmpegMaxWidth,
-    ffmpegBitrateKbps: cfg.ffmpegBitrateKbps,
-    ffmpegEncoder: cfg.ffmpegEncoder,
-    ffmpegPath: cfg.ffmpegPath,
-    ffmpegResolvedPath: ffmpegStatus?.canSelectFfmpeg ? (ffmpegStatus.path || '') : '',
-  }
-}
-
-type EnsureWorker = () => Promise<number | null>
-type PushConfig = (cfg: ResolvedConfig) => Promise<void>
-
-/**
- * Environment for the ego-cast worker child.
- *
- * The cast worker is the READ-ONLY observation half of the panel. When the
- * host operator points the panel at an already-running external browser (e.g.
- * a cloak container's CDP), they set `EGO_CAST_CDP_URL` — an `http(s)://host:port`
- * base (preferred; the worker re-resolves the live wsUrl from /json/version so
- * a browser/GUID restart auto-recovers), a bare `host:port`, or a literal
- * `ws://` endpoint.
- *
- * We map it to `EGO_LINUX_CDP_URL` ONLY for this child so the observation
- * worker attaches to that browser. We deliberately do NOT set EGO_LINUX_CDP_URL
- * in the host/automation environment: the vendored automation runtime
- * (runtime/ego-linux/src/chrome.mjs) reads the same var, and hijacking it there
- * would repoint the AGENT's browser too. Scoping to the worker child keeps the
- * observation target independent of the automation target.
- *
- * Return ONLY the one deliberate key. The subprocess service merges spec.env
- * over its own scrubbed parent base (dsh-subprocess scrubbedParentEnv), which
- * strips DSH_* managed facts and credential-shaped names; spreading the full
- * parent process.env here would re-inject those stripped keys (notably the
- * managed DSH_SUBPROCESS_RUNNER selector) and break the spawn.
- */
-function castWorkerEnv(): NodeJS.ProcessEnv | undefined {
-  const target = process.env.EGO_CAST_CDP_URL
-  if (!target || target.trim() === '') return undefined
-  return { EGO_LINUX_CDP_URL: target.trim() }
-}
-
-/**
- * Ensure a single ego-cast worker is running (idempotent). Launches it via
- * ctx.subprocess. Re-spawns whenever the previous worker is found dead (its
- * pid no longer alive or its /api/health does not answer), so a crashed
- * worker is brought back without a host restart. Spawn is rate-limited to
- * avoid hot-looping while a headless container has no browser yet.
- */
-function makeEnsureWorker(ctx: EgoContext, cfg: ResolvedConfig, ffmpegManager: FfmpegInstallationManager | null): EnsureWorker {
-  let lastAttempt = 0
-  async function launchedWorkerPort(): Promise<number | null> {
-    const state = await knownWorkerState()
-    if (state.pid === null || !isProcessAlive(state.pid)) return null
-    const alive = await proxyFrom(state.port!, '/api/health')
-    return alive ? state.port : null
-  }
-  return async function ensureWorker(): Promise<number | null> {
-    const running = await launchedWorkerPort()
-    if (running !== null) return running
-    // Worker is dead or not yet up; spawn one, rate-limited.
-    const now = Date.now()
-    if (now - lastAttempt > 8000) {
-      lastAttempt = now
-      try {
-        // Pass the current cast config to the worker as a JSON argv arg so it
-        // starts with the right screencast parameters without needing an
-        // extra round-trip POST. The worker reads process.argv[2].
-        await ffmpegManager?.check({ configuredPath: cfg.ffmpegPath, requestedEncoder: cfg.ffmpegEncoder }).catch(() => null)
-        const initCfg = JSON.stringify(captureConfig(cfg, ffmpegManager))
-        const handle = ctx.subprocess.spawn({
-          argv: [process.execPath, WORKER_BIN, initCfg],
-          // cwd is required by the dsh-subprocess provider on DSH >= 0.1.5 —
-          // omitting it throws inside spawn() and the catch below swallowed it
-          // silently, making the watch panel never start (issue #34 defect 1).
-          cwd: process.cwd(),
-          // Electron hosts (DSH Desktop): process.execPath is the Electron
-          // binary; children need ELECTRON_RUN_AS_NODE=1 or they boot as a
-          // second Electron app (issue #42). Mirror of resolveEgoEnv's guard —
-          // inlined here because cast-server cannot import from index.ts
-          // (circular import). Only the Electron key is added on top of
-          // castWorkerEnv()'s single key, never a full `...process.env`
-          // spread: the subprocess service merges spec.env over its own
-          // scrubbed parent base, so spreading raw process.env here would
-          // re-inject the credential-shaped/DSH_* keys that base deliberately
-          // strips (see castWorkerEnv()'s doc comment above).
-          env: {
-            ...((process.versions as { electron?: string }).electron
-              ? { ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE ?? '1' }
-              : {}),
-            ...castWorkerEnv(),
-          },
-          stdio: {
-            stdin: { data: '' },
-            stdout: { maxBytes: 8192 },
-            stderr: { maxBytes: 4096 },
-          },
-          graceMs: 12_000,
-        })
-        handle.done.catch(() => null)
-        const deadline = Date.now() + 8000
-        while (Date.now() < deadline) {
-          const ready = await launchedWorkerPort()
-          if (ready !== null) return ready
-          await new Promise((resolve) => setTimeout(resolve, 100))
-        }
-        return null
-      } catch {
-        return null
-      }
-    }
-    return null
   }
 }
 
@@ -545,6 +375,7 @@ export function initCastServer(
   ffmpegManager: FfmpegInstallationManager | null,
   openAgentWindow: () => Promise<{ ok: boolean; error?: string }> = async () => ({ ok: false, error: 'raise not supported by this host build' }),
   loginImport: (opts: LoginImportOptions) => Promise<LoginImportReport> = async () => ({ ok: false, error: 'login import not supported by this host build' }),
+  getExecutorStatus: () => Record<string, unknown> = () => ({}),
 ): void {
   const ensureWorker = makeEnsureWorker(ctx, cfg, ffmpegManager)
   const pushConfig = makePushConfig(ensureWorker, ffmpegManager)
@@ -667,11 +498,10 @@ export function initCastServer(
       // reconnect-loop ambiguity once the client honors it).
       if (relayDisabled()) return refuseFrameRelay(res)
       const port = await ensureWorker()
-      if (port === null) {
-        proxyWorkerStream(-1, res, '/api/stream')
-        return
-      }
-      proxyWorkerStream(port, res, '/api/stream')
+      // Pass ensureWorker as the retry provider: if the panel opens before the
+      // browser/worker exists (typical right after a DSH restart), the stream
+      // must attach once they appear instead of staying a dead `:ok`.
+      proxyWorkerStream(port ?? -1, res, '/api/stream', ensureWorker)
     },
   })
 
@@ -690,6 +520,67 @@ export function initCastServer(
       const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>)
       const result = await proxyPost(port, '/api/input', body)
       if (!result) return sendJson(res, 502, { ok: false, error: 'input worker unavailable' })
+      return sendJson(res, result.status, result.body)
+    },
+  })
+
+  // POST /api/ego/navigate — panel refresh / manual URL. The worker performs
+  // Page.reload or Page.navigate on the selected target without activating a
+  // different tab.
+  const disposeNavigate = server.register({
+    kind: 'exact',
+    path: EGO_NAVIGATE_ROUTE,
+    handler: async (reqRaw: unknown, resRaw: unknown) => {
+      const req = reqRaw as IncomingMessage
+      const res = resRaw as ServerResponse
+      if (relayDisabled()) return refuseFrameRelay(res, { error: FRAME_RELAY_DISABLED })
+      const port = await ensureWorker()
+      if (port === null) return sendJson(res, 400, { ok: false, error: 'no live agent browser' })
+      const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>)
+      if (body.reload !== true && !(typeof body.url === 'string' && body.url.trim())) {
+        return sendJson(res, 400, { ok: false, error: 'url or reload is required' })
+      }
+      const result = await proxyPost(port, '/api/navigate', body)
+      if (!result) return sendJson(res, 502, { ok: false, error: 'navigate worker unavailable' })
+      return sendJson(res, result.status, result.body)
+    },
+  })
+
+  // POST /api/ego/window-size — the watch panel's size-sync toggle drives the
+  // REAL agent browser window. The body carries the desired PAGE viewport in
+  // CSS px; the worker adds Chrome's frame and calls Browser.setWindowBounds.
+  const disposeWindowSize = server.register({
+    kind: 'exact',
+    path: EGO_WINDOW_SIZE_ROUTE,
+    handler: async (reqRaw: unknown, resRaw: unknown) => {
+      const req = reqRaw as IncomingMessage
+      const res = resRaw as ServerResponse
+      if (relayDisabled()) return refuseFrameRelay(res, { error: FRAME_RELAY_DISABLED })
+      const port = await ensureWorker()
+      if (port === null) return sendJson(res, 400, { ok: false, error: 'no live agent browser' })
+      const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>)
+      const width = Number(body.width)
+      const delta = Number(body.delta)
+      const height = Number(body.height)
+      const dy = Number(body.dy)
+      const aspect = Number(body.aspect)
+      const maximize = body.maximize === true
+      if (!Number.isFinite(width) && !Number.isFinite(delta) && !Number.isFinite(height) && !Number.isFinite(dy) && !Number.isFinite(aspect) && !maximize) {
+        return sendJson(res, 400, { ok: false, error: 'width, delta, height, dy, aspect or maximize is required' })
+      }
+      const result = await proxyPost(port, '/api/window-size', {
+        ...(Number.isFinite(width) ? { width } : {}),
+        // The panel's toggle sends drag deltas; the worker applies them to the
+        // page's current viewport.
+        ...(Number.isFinite(delta) ? { delta } : {}),
+        ...(Number.isFinite(height) && height > 0 ? { height } : {}),
+        ...(Number.isFinite(dy) ? { dy } : {}),
+        // Aspect presets keep the current width and derive the height.
+        ...(Number.isFinite(aspect) && aspect > 0 ? { aspect } : {}),
+        ...(maximize ? { maximize: true } : {}),
+        ...(typeof body.targetId === 'string' && body.targetId ? { targetId: body.targetId } : {}),
+      })
+      if (!result) return sendJson(res, 502, { ok: false, error: 'window-size worker unavailable' })
       return sendJson(res, result.status, result.body)
     },
   })
@@ -842,10 +733,79 @@ export function initCastServer(
     },
   })
 
+  // GET /api/ego/executor — resident // one-shot executor diagnostics (#73).
+  // Host-level state only (no worker), so it works even before the browser is up.
+  const disposeExecutor = server.register({
+    kind: 'exact', path: '/api/ego/executor',
+    handler: async (_req: unknown, resRaw: unknown) => {
+      const res = resRaw as ServerResponse
+      let status: Record<string, unknown> = {}
+      try { status = getExecutorStatus() } catch { /* ignore */ }
+      return sendJson(res, 200, { ok: true, ...status })
+    },
+  })
+
+  // #69 v2 — one-click login-state bridge for the panel: pairing code, health
+  // and job status. The extension itself talks to the loopback server in
+  // login-extension.ts; these routes are for the in-panel UI.
+  const disposeLoginBridge = [
+    server.register({
+      kind: 'exact', path: '/api/ego/login-extension/health',
+      handler: async (_req: unknown, resRaw: unknown) => {
+        const res = resRaw as ServerResponse
+        try { return sendJson(res, 200, await getLoginExtensionHealth()) }
+        catch (err) { return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) }) }
+      },
+    }),
+    server.register({
+      kind: 'exact', path: '/api/ego/login-extension/pair-code',
+      handler: async (_req: unknown, resRaw: unknown) => {
+        const res = resRaw as ServerResponse
+        try { return sendJson(res, 200, await createLoginExtensionPairingCode()) }
+        catch (err) { return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) }) }
+      },
+    }),
+    server.register({
+      kind: 'exact', path: '/api/ego/login-extension/import',
+      handler: async (reqRaw: unknown, resRaw: unknown) => {
+        const req = reqRaw as IncomingMessage
+        const res = resRaw as ServerResponse
+        try {
+          const body = (await readJsonBody(req).catch(() => ({}))) as { domains?: unknown }
+          const domains = Array.isArray(body.domains) ? body.domains.map(String).filter(Boolean) : []
+          if (domains.length === 0) return sendJson(res, 400, { ok: false, error: 'domains is required' })
+          const job = await startLoginExtensionJob({ domains })
+          return sendJson(res, 200, { ok: true, jobId: job.jobId })
+        } catch (err) {
+          return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) })
+        }
+      },
+    }),
+    server.register({
+      kind: 'exact', path: '/api/ego/login-extension/status',
+      handler: async (reqRaw: unknown, resRaw: unknown) => {
+        const req = reqRaw as IncomingMessage
+        const res = resRaw as ServerResponse
+        try {
+          const id = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('id') ?? ''
+          if (!id) return sendJson(res, 400, { ok: false, error: 'id is required' })
+          return sendJson(res, 200, await getLoginExtensionJob(id))
+        } catch (err) {
+          return sendJson(res, 500, { ok: false, error: String((err as Error)?.message || err) })
+        }
+      },
+    }),
+  ]
+
   ctx.effect?.(() => () => {
     try { disposeSpaces() } catch { /* ignore */ }
     try { disposeStream() } catch { /* ignore */ }
     try { disposeInput() } catch { /* ignore */ }
+    try { disposeNavigate() } catch { /* ignore */ }
+    try { disposeWindowSize() } catch { /* ignore */ }
+    try { disposeExecutor() } catch { /* ignore */ }
+    try { disposeLoginBridge.forEach((dispose) => dispose()) } catch { /* ignore */ }
+    try { stopLoginExtensionBridge() } catch { /* ignore */ }
     try { disposeClose() } catch { /* ignore */ }
     try { disposeFlush() } catch { /* ignore */ }
     try { disposeRaise() } catch { /* ignore */ }

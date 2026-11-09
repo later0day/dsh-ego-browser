@@ -5,9 +5,12 @@ describe("dual capture config", () => {
   it("returns canonical defaults", () => {
     expect(resolveConfig({})).toEqual({
       chromePath: "", captureBackend: "auto", streamProfile: "balanced",
-      cdpFps: 20, cdpQuality: 55, cdpMaxWidth: 960, cdpBackstopIntervalMs: 3000,
+      cdpFps: 20, cdpQuality: 55, cdpMaxWidth: 1280, cdpBackstopIntervalMs: 3000,
       ffmpegFps: 20, ffmpegMaxWidth: 1280, ffmpegBitrateKbps: 4000, ffmpegEncoder: "auto", ffmpegPath: "", githubMirror: "",
-      egoCliArgs: "", chromeArgs: "", isolateSpaces: false, idleTimeoutMin: 0, disableFrameRelay: false,
+      egoCliArgs: "", chromeArgs: "", isolateSpaces: false, sessionScopedSpaces: true, idleTimeoutMin: 0, disableFrameRelay: false,
+      residentExecutor: false, residentIdleMin: 30, tuiAutoOpenPanel: false, rulesPrompt: true,
+      viewportWidth: 0, viewportHeight: 0, deviceScaleFactor: 0,
+      useMockKeychain: false,
     });
   });
 
@@ -16,9 +19,20 @@ describe("dual capture config", () => {
       chromePath: "", captureBackend: "auto", streamProfile: "balanced",
       cdpFps: 30, cdpQuality: 70, cdpMaxWidth: 1200, cdpBackstopIntervalMs: 5000,
       ffmpegFps: 20, ffmpegMaxWidth: 1280, ffmpegBitrateKbps: 4000, ffmpegEncoder: "auto", ffmpegPath: "", githubMirror: "",
-      egoCliArgs: "", chromeArgs: "", isolateSpaces: false, idleTimeoutMin: 0, disableFrameRelay: false,
+      egoCliArgs: "", chromeArgs: "", isolateSpaces: false, sessionScopedSpaces: true, idleTimeoutMin: 0, disableFrameRelay: false,
+      residentExecutor: false, residentIdleMin: 30, tuiAutoOpenPanel: false, rulesPrompt: true,
+      viewportWidth: 0, viewportHeight: 0, deviceScaleFactor: 0,
+      useMockKeychain: false,
     });
     expect(resolveConfig({ cdpFps: 15, castFpsCap: 30 }).cdpFps).toBe(15);
+  });
+
+  it("parses useMockKeychain as an opt-in boolean (#93)", () => {
+    expect(resolveConfig({}).useMockKeychain).toBe(false);
+    expect(resolveConfig({ useMockKeychain: true }).useMockKeychain).toBe(true);
+    expect(resolveConfig({ useMockKeychain: "true" as any }).useMockKeychain).toBe(true);
+    expect(resolveConfig({ useMockKeychain: 1 as any }).useMockKeychain).toBe(true);
+    expect(resolveConfig({ useMockKeychain: "false" as any }).useMockKeychain).toBe(false);
   });
 
   it("falls back for invalid enums and numbers", () => {
@@ -53,6 +67,33 @@ describe("disableFrameRelay", () => {
     expect(resolveConfig({ disableFrameRelay: 1 } as any).disableFrameRelay).toBe(true);
     expect(resolveConfig({ disableFrameRelay: "false" } as any).disableFrameRelay).toBe(false);
     expect(resolveConfig({ disableFrameRelay: "nonsense" } as any).disableFrameRelay).toBe(false);
+  });
+});
+
+// ── resident executor (issue #56) ──────────
+
+describe("resident executor (#56)", () => {
+  it("defaults to off with a 30-minute idle window", () => {
+    const config = resolveConfig({});
+    expect(config.residentExecutor).toBe(false);
+    expect(config.residentIdleMin).toBe(30);
+  });
+
+  it("parses rulesPrompt as a default-on switch", () => {
+    expect(resolveConfig({}).rulesPrompt).toBe(true);
+    expect(resolveConfig({ rulesPrompt: false }).rulesPrompt).toBe(false);
+    expect(resolveConfig({ rulesPrompt: "0" } as any).rulesPrompt).toBe(false);
+    expect(resolveConfig({ rulesPrompt: "true" } as any).rulesPrompt).toBe(true);
+  });
+
+  it("accepts the stored forms and clamps the idle window", () => {
+    expect(resolveConfig({ residentExecutor: true } as any).residentExecutor).toBe(true);
+    expect(resolveConfig({ residentExecutor: "1" } as any).residentExecutor).toBe(true);
+    expect(resolveConfig({ residentExecutor: "true" } as any).residentExecutor).toBe(true);
+    expect(resolveConfig({ residentExecutor: "0" } as any).residentExecutor).toBe(false);
+    expect(resolveConfig({ residentIdleMin: 5 }).residentIdleMin).toBe(5);
+    expect(resolveConfig({ residentIdleMin: 0 }).residentIdleMin).toBe(0);
+    expect(resolveConfig({ residentIdleMin: 9999 } as any).residentIdleMin).toBe(30);
   });
 });
 
@@ -143,5 +184,14 @@ describe("filterArgs", () => {
 
   it("returns [] when all args are blocked", () => {
     expect(filterArgs("--status --stop --help", EGO_CLI_BLOCKED)).toEqual([]);
+  });
+});
+
+
+describe("TUI panel preference", () => {
+  it("is opt-in and accepts stored boolean forms", () => {
+    expect(resolveConfig({}).tuiAutoOpenPanel).toBe(false);
+    expect(resolveConfig({ tuiAutoOpenPanel: true }).tuiAutoOpenPanel).toBe(true);
+    expect(resolveConfig({ tuiAutoOpenPanel: "1" } as any).tuiAutoOpenPanel).toBe(true);
   });
 });

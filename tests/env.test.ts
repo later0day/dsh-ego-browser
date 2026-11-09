@@ -8,7 +8,7 @@
 import { describe, it, beforeEach, afterEach, expect } from "vitest";
 import { existsSync } from "node:fs";
 
-import { resolveEgoEnv, findChromeBinary } from "../src/index.ts";
+import { resolveEgoEnv, findChromeBinary, loginImportPolicy, loginImportForced } from "../src/index.ts";
 
 // ─── resolveEgoEnv: Windows ────────────────────────────────────────────────
 
@@ -259,6 +259,95 @@ describe("resolveEgoEnv (headless detection)", () => {
   });
 });
 
+// ─── resolveEgoEnv: macOS (#65 / #68) ──────────────────────────────────────
+// These run on any host: the platform is injected, so the darwin branches are
+// exercised from a Linux/Windows CI too. The one assertion that needs real
+// `.app` bundles is skipped elsewhere.
+
+describe("resolveEgoEnv (macOS)", () => {
+  it("never marks macOS headless, even without DISPLAY (#16)", () => {
+    const env = resolveEgoEnv(
+      {},
+      { platform: "darwin", baseEnv: { HOME: "/Users/test" } },
+    );
+    // macOS GUI is Aqua/Quartz and never exports $DISPLAY; treating that as
+    // headless would re-introduce #16 (no real window for scan-code login).
+    expect(env.EGO_LINUX_HEADLESS).toBe(undefined);
+  });
+
+  it("injects the detected Chrome binary into EGO_LINUX_CHROME (#68)", () => {
+    // Needs a real macOS host with Chrome/Chromium/Edge/Brave installed.
+    if (process.platform !== "darwin") return;
+    const env = resolveEgoEnv(
+      {},
+      { platform: "darwin", baseEnv: { HOME: process.env.HOME } },
+    );
+    expect(env.EGO_LINUX_CHROME).toBeTruthy();
+    expect(env.EGO_LINUX_CHROME?.includes(".app/Contents/MacOS/")).toBeTruthy();
+    // The wrapper only exists to add --no-sandbox for root on Linux.
+    expect(env.EGO_LINUX_CHROME?.includes("ego-chrome-wrapper")).toBe(false);
+  });
+
+  it("never overrides a user-set EGO_LINUX_CHROME on macOS", () => {
+    const userSet = "/opt/custom/Google Chrome";
+    const env = resolveEgoEnv(
+      {},
+      { platform: "darwin", baseEnv: { EGO_LINUX_CHROME: userSet, HOME: "/Users/test" } },
+    );
+    expect(env.EGO_LINUX_CHROME).toBe(userSet);
+  });
+
+  it("honours cfg.chromePath over auto-detection on macOS", () => {
+    const configured = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    const env = resolveEgoEnv(
+      { chromePath: configured },
+      { platform: "darwin", baseEnv: { HOME: "/Users/test" } },
+    );
+    expect(env.EGO_LINUX_CHROME).toBe(configured);
+  });
+});
+
+// ─── resolveEgoEnv: macOS cookie fix → EGO_LINUX_USE_MOCK_KEYCHAIN (#93) ────
+
+describe("resolveEgoEnv (useMockKeychain bridge)", () => {
+  it("bridges cfg.useMockKeychain to EGO_LINUX_USE_MOCK_KEYCHAIN on macOS (#93)", () => {
+    const env = resolveEgoEnv(
+      { useMockKeychain: true },
+      { platform: "darwin", baseEnv: { HOME: "/Users/test" } },
+    );
+    expect(env.EGO_LINUX_USE_MOCK_KEYCHAIN).toBe("1");
+  });
+
+  it("does not set EGO_LINUX_USE_MOCK_KEYCHAIN when the setting is off", () => {
+    const env = resolveEgoEnv(
+      { useMockKeychain: false },
+      { platform: "darwin", baseEnv: { HOME: "/Users/test" } },
+    );
+    expect(env.EGO_LINUX_USE_MOCK_KEYCHAIN).toBe(undefined);
+  });
+
+  it("never sets the darwin-only flag on Windows or Linux", () => {
+    const win = resolveEgoEnv(
+      { useMockKeychain: true },
+      { platform: "win32", baseEnv: { LOCALAPPDATA: "C:/Users/test/AppData/Local" } },
+    );
+    expect(win.EGO_LINUX_USE_MOCK_KEYCHAIN).toBe(undefined);
+    const linux = resolveEgoEnv(
+      { useMockKeychain: true },
+      { platform: "linux", baseEnv: { HOME: "/root" } },
+    );
+    expect(linux.EGO_LINUX_USE_MOCK_KEYCHAIN).toBe(undefined);
+  });
+
+  it("never overrides a user-set EGO_LINUX_USE_MOCK_KEYCHAIN (escape hatch)", () => {
+    const env = resolveEgoEnv(
+      { useMockKeychain: true },
+      { platform: "darwin", baseEnv: { EGO_LINUX_USE_MOCK_KEYCHAIN: "0", HOME: "/Users/test" } },
+    );
+    expect(env.EGO_LINUX_USE_MOCK_KEYCHAIN).toBe("0");
+  });
+});
+
 // ─── resolveEgoEnv: chromeArgs → EGO_LINUX_EXTRA_ARGS bridge ────────────────
 
 describe("resolveEgoEnv (chromeArgs bridge)", () => {
@@ -335,6 +424,41 @@ describe("runtime chrome.mjs (EGO_LINUX_EXTRA_ARGS spread)", () => {
   });
 });
 
+// ─── ego_login_import scoped guard (#69) ────────────────────────────────
+
+describe("loginImportPolicy (#69)", () => {
+  it("refuses Windows + Chrome/Edge 127+ (App-Bound Encryption range)", () => {
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 127, force: false }).allowed).toBe(false);
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 155, force: false }).allowed).toBe(false);
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 160, force: false }).allowed).toBe(false);
+  });
+
+  it("allows Windows + pre-ABE Chrome", () => {
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 126, force: false }).allowed).toBe(true);
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 120, force: false }).allowed).toBe(true);
+  });
+
+  it("refuses Windows when the version cannot be determined", () => {
+    const verdict = loginImportPolicy({ platform: "win32", chromeMajor: null, force: false });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toContain("could not determine");
+  });
+
+  it("allows Linux and macOS regardless of the version", () => {
+    expect(loginImportPolicy({ platform: "linux", chromeMajor: 160, force: false }).allowed).toBe(true);
+    expect(loginImportPolicy({ platform: "darwin", chromeMajor: 160, force: false }).allowed).toBe(true);
+    expect(loginImportPolicy({ platform: "linux", chromeMajor: null, force: false }).allowed).toBe(true);
+  });
+
+  it("the env override wins everywhere", () => {
+    expect(loginImportPolicy({ platform: "win32", chromeMajor: 160, force: true }).allowed).toBe(true);
+    expect(loginImportForced({ EGO_LINUX_LOGIN_IMPORT_FORCE: "1" })).toBe(true);
+    expect(loginImportForced({ EGO_LINUX_LOGIN_IMPORT_FORCE: "true" })).toBe(true);
+    expect(loginImportForced({ EGO_LINUX_LOGIN_IMPORT_FORCE: "yes" })).toBe(true);
+    expect(loginImportForced({ EGO_LINUX_LOGIN_IMPORT_FORCE: "0" })).toBe(false);
+    expect(loginImportForced({})).toBe(false);
+  });
+});
 // ─── findChromeBinary ──────────────────────────────────────────────────────
 
 describe("findChromeBinary", () => {
@@ -439,5 +563,41 @@ describe("runtime chrome.mjs (single-window launch)", () => {
     expect(
       !/^\s*"about:blank",\s*$/m.test(src),
     ).toBeTruthy();
+  });
+});
+
+// ─── runtime/ego-linux/src/chrome.mjs (macOS X display) ────────────────────
+
+describe("runtime chrome.mjs (macOS X display)", () => {
+  it("returns a pseudo display on darwin instead of requiring Xvfb (#65)", async () => {
+    // Xvfb is an X11 tool; it simply does not exist on macOS. Must not throw
+    // "no X display ... no Xvfb binary on PATH" on a desktop macOS session.
+    if (process.platform !== "darwin") return;
+    // @ts-ignore — runtime .mjs is excluded from tsconfig
+    const mod = await import("../runtime/ego-linux/src/chrome.mjs");
+    const saved = process.env.DISPLAY;
+    delete process.env.DISPLAY;
+    try {
+      expect(await mod.ensureXDisplay()).toEqual({
+        display: "darwin-desktop",
+        pid: null,
+        launched: false,
+      });
+    } finally {
+      if (saved !== undefined) process.env.DISPLAY = saved;
+    }
+  });
+});
+
+// ─── runtime/ego-linux/src/chrome.mjs (headless UA version) ────────────────
+
+describe("runtime chrome.mjs (headless UA version, #79)", () => {
+  it("parses the major version from chrome/chromium --version output", async () => {
+    // @ts-ignore — runtime .mjs is excluded from tsconfig
+    const mod = await import("../runtime/ego-linux/src/chrome.mjs");
+    expect(mod.parseChromeVersionMajor("Google Chrome 154.0.1.2")).toBe(154);
+    expect(mod.parseChromeVersionMajor("Chromium 155.0.8059.79")).toBe(155);
+    expect(mod.parseChromeVersionMajor("HeadlessChrome/155.0.0.0")).toBe(155);
+    expect(mod.parseChromeVersionMajor("not a browser")).toBe(null);
   });
 });

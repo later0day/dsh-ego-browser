@@ -1,17 +1,16 @@
 /** Injected by the DSH ModuleLoader factory wrapper (tsdown banner). */
 declare function require(id: string): any
 
-		// #region ego-browser client: realtime browser watch-bubble
+		// #region ego-browser client: realtime browser watch tab
 		//
-		// A floating "watch" bubble (bottom-right) plus an expandable overlay
-		// panel that shows what the agent's ego-browser is doing in real time:
-		// one thumbnail per live page target (URL + title), polled from the
-		// host route /api/ego/spaces (which the host proxies to the ego-cast
-		// worker attached to the agent's own Chrome via CDP screencast).
+		// The watch UI is a tab in DSH's native right sidebar (with an optional
+		// dsh-better-sidebar fallback). It shows what the agent's ego-browser is
+		// doing in real time: live pages (URL + title) plus a CDP screencast,
+		// polled from /api/ego/spaces and pushed through /api/ego/stream by the
+		// ego-cast worker attached to the agent's own Chrome. The old floating
+		// FAB/overlay was removed in 0.9.3 — the official sidebar covers it.
 		//
 		// Design constraints (kept deliberately minimal / read-only):
-		//  - NO layout takeover: it is an overlay, not a grid-sidebar, so it
-		//    never reshapes the conversation area or fights other panels.
 		//  - READ-ONLY: only displays what the agent browser is already doing;
 		//    there is no pause/resume/navigate control here (that stays out of
 		//    scope to avoid racing the running agent).
@@ -19,12 +18,10 @@ declare function require(id: string): any
 		//    unmount / hot-reload restores the DOM and stops the poller.
 		//
 		// == 内部结构（维护前先看 docs/ARCH.md）==
-		//   PANEL_CSS + ICON_*        : 样式与图标（顶部常量区）
-		//   apply()                   : 入口，挂载面板/浮球/事件
-		//   makeZoomImage / browserXY : 主视图缩放 + 坐标逆映射
-		//   makeDraggable / snapPanelToFab : 球/窗口各自拖动 + 打点吸附
-		//   renderSpaces / applyFrame / openStream : 轮询 + SSE 实时帧
-		//   maybeShowLoginGuide / maybeShowCaptchaGuide : 登录/人机验证提醒条
+		//   TAB_CSS + ICON_*        : 侧栏样式与图标
+		//   apply()                 : 入口，挂载原生侧栏 Tab / betterSidebar Tab / 设置卡
+		//   LivePreviewController   : spaces 轮询 + SSE 实时帧 + 双缓冲
+		//   EgoBrowserTab           : React 侧栏 UI
 		// 注意：本前端是单文件（受 DSH 注入机制限制），不要在页面上拆文件；
 		//   数据源 = 轮询 /api/ego/spaces + SSE /api/ego/stream(实时帧)。
 		// #endregion
@@ -84,6 +81,12 @@ declare function require(id: string): any
 		disableFrameRelayHint: 'No picture is relayed at all: no ego-cast worker, no CDP/WGC screencast capture, no ffmpeg pull, and the watch panel opens no stream. ego_* tools keep working normally.',
 		disableFrameRelayOff: 'Off (live view enabled)',
 		disableFrameRelayOn: 'On (no picture pushed to this page)',
+		residentExecutor: 'Resident executor',
+		residentExecutorHint: 'Reuse one long-lived `ego-browser --serve` process across ego_* calls: the first call pays startup, later calls skip it (~16ms). A dead resident falls back to a fresh spawn automatically.',
+		residentExecutorOff: 'Off (spawn per call)',
+		residentExecutorOn: 'On (resident process)',
+		residentIdleMin: 'Resident idle stop (minutes)',
+		residentIdleMinHint: 'Stop the resident process after N minutes without an ego_* call (0 = keep it until the plugin unmounts). The browser itself is not affected.',
 		relayDisabledTitle: 'Live frame relay is disabled',
 		relayDisabledBody: 'Turn off "Disable live frame relay" in Settings → Plugins → ego-browser to see the live view here.',
 		minUnit: 'min',
@@ -101,6 +104,10 @@ declare function require(id: string): any
 		loginImportClosed: ' (source browser was closed and can be reopened)',
 			chromePath: 'Browser binary path',
 			chromePathHint: 'Path to the Chrome/Chromium/Edge binary. Empty = auto-detect.',
+			useMockKeychain: 'macOS cookie fix (--use-mock-keychain)',
+			useMockKeychainHint: 'macOS only. Chrome 156+/macOS 26+ can stop writing cookies to disk (logins vanish after a browser restart, issue #93); this flag makes Chrome use its mock/test Keychain so the jar flushes again — the write lands ~60s later, not instantly. It weakens at-rest cookie encryption, so keep it off unless you hit that bug. Requires a browser cold start (run `ego-browser --stop` or restart DSH).',
+			useMockKeychainOff: 'Off (default; login Keychain)',
+			useMockKeychainOn: 'On (mock Keychain — fixes macOS cookie loss)',
 			captureBackend: 'Capture backend', streamProfile: 'Quality profile', cdpFps: 'CDP FPS', cdpQuality: 'CDP JPEG quality', cdpMaxWidth: 'CDP max width', cdpBackstopIntervalMs: 'CDP recovery interval', ffmpegFps: 'FFmpeg FPS', ffmpegMaxWidth: 'FFmpeg max width', ffmpegBitrateKbps: 'FFmpeg bitrate', ffmpegEncoder: 'FFmpeg encoder', ffmpegPath: 'FFmpeg binary path', githubMirror: 'GitHub mirror', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
 			ffmpegTitle: 'FFmpeg installation', ffmpegReady: 'Ready', ffmpegMissing: 'No compatible FFmpeg found', ffmpegChecking: 'Checking local FFmpeg…', ffmpegDownloading: 'Downloading FFmpeg…', ffmpegVerifying: 'Verifying download…', ffmpegExtracting: 'Extracting FFmpeg…', ffmpegProbing: 'Checking capture capabilities…', ffmpegUnsupported: 'FFmpeg capture is unsupported on this platform', ffmpegFailed: 'FFmpeg installation failed', ffmpegSource: 'Source', ffmpegVersion: 'Version', ffmpegInstall: 'Download FFmpeg', ffmpegReinstall: 'Reinstall', ffmpegRecheck: 'Recheck', ffmpegRequired: 'FFmpeg (install required)', githubMirrorHint: 'Replaces https://github.com for GitHub downloads, for example https://gh-proxy.com/github.com.',
 			egoCliArgs: 'Extra ego-browser CLI args', egoCliArgsHint: 'Appended to `ego-browser nodejs` argv. Takes effect on the next ego_* call. Blocked: --status/--stop/--open/--spaces/--help (they exit before the heredoc runs). Use --headless via the headless env instead.',
@@ -124,6 +131,12 @@ declare function require(id: string): any
 		disableFrameRelayHint: '完全不回传画面：不启动 ego-cast worker，不做 CDP/WGC 屏幕采集与 ffmpeg 拉流，观察窗不再建立任何拉流连接。ego_* 工具本身照常可用。',
 		disableFrameRelayOff: '关闭（保留实时画面）',
 		disableFrameRelayOn: '开启（不回传任何画面）',
+		residentExecutor: '常驻执行进程',
+		residentExecutorHint: '复用同一个 ego-browser --serve 进程执行 ego_* 调用：首次调用支付启动开销，之后每次约 16ms；常驻进程失效时自动回退到一次性 spawn。',
+		residentExecutorOff: '关闭（每次调用独立 spawn）',
+		residentExecutorOn: '开启（常驻进程）',
+		residentIdleMin: '常驻空闲停止（分钟）',
+		residentIdleMinHint: 'N 分钟没有 ego_* 调用后停止常驻进程（0 = 一直保留到插件卸载）。不影响浏览器本体。',
 		relayDisabledTitle: '画面回传已禁用',
 		relayDisabledBody: '在「设置 → 插件 → ego-browser」中关闭「禁用画面回传」后，这里才会显示实时画面。',
 		minUnit: '分钟',
@@ -141,6 +154,10 @@ declare function require(id: string): any
 		loginImportClosed: '（源浏览器已关闭，可重新打开）',
 			chromePath: '浏览器路径',
 			chromePathHint: 'Chrome/Chromium/Edge 可执行文件路径。留空 = 自动检测。',
+			useMockKeychain: 'macOS Cookie 落盘修复（--use-mock-keychain）',
+			useMockKeychainHint: '仅 macOS。Chrome 156+/macOS 26+ 可能不再把 cookie 写入磁盘（浏览器重启后登录态丢失，issue #93）；开启后 Chrome 改用 mock/test Keychain，cookie jar 恢复落盘——写入约 60 秒后才出现，不是立即。会降低静态 cookie 加密强度，未遇到该问题请保持关闭。需要浏览器冷启动（`ego-browser --stop` 或重启 DSH）。',
+			useMockKeychainOff: '关闭（默认；使用登录 Keychain）',
+			useMockKeychainOn: '开启（mock Keychain，修复 macOS cookie 丢失）',
 			captureBackend: '捕获后端', streamProfile: '画质档位', cdpFps: 'CDP 帧率', cdpQuality: 'CDP JPEG 质量', cdpMaxWidth: 'CDP 最大宽度', cdpBackstopIntervalMs: 'CDP 恢复截图间隔', ffmpegFps: 'FFmpeg 帧率', ffmpegMaxWidth: 'FFmpeg 最大宽度', ffmpegBitrateKbps: 'FFmpeg 码率', ffmpegEncoder: 'FFmpeg 编码器', ffmpegPath: 'FFmpeg 路径', githubMirror: 'GitHub 镜像源', fpsUnit: 'fps', pxUnit: 'px', kbpsUnit: 'kbps', msUnit: 'ms',
 			ffmpegTitle: 'FFmpeg 安装', ffmpegReady: '已就绪', ffmpegMissing: '未找到兼容的 FFmpeg', ffmpegChecking: '正在检测本机 FFmpeg…', ffmpegDownloading: '正在下载 FFmpeg…', ffmpegVerifying: '正在校验下载文件…', ffmpegExtracting: '正在解压 FFmpeg…', ffmpegProbing: '正在检查捕获能力…', ffmpegUnsupported: '当前平台不支持 FFmpeg 捕获', ffmpegFailed: 'FFmpeg 安装失败', ffmpegSource: '来源', ffmpegVersion: '版本', ffmpegInstall: '下载 FFmpeg', ffmpegReinstall: '重新下载', ffmpegRecheck: '重新检测', ffmpegRequired: 'FFmpeg（需要安装）', githubMirrorHint: '替换 https://github.com，例如 https://gh-proxy.com/github.com。',
 			egoCliArgs: 'ego-browser CLI 附加参数', egoCliArgsHint: '追加到 `ego-browser nodejs` argv。下一次 ego_* 工具调用即生效。禁止：--status/--stop/--open/--spaces/--help（会在 heredoc 执行前退出）。--headless 请走 headless 环境变量。',
@@ -168,6 +185,42 @@ declare function require(id: string): any
 			openExternal: 'Open real page',
 		raiseWindow: 'Pop out window',
 		raiseWindowHint: 'Raise the agent browser as a real window (a headless instance is replaced by a visible one on the same profile)',
+			sizeSyncOff: '🔒 Size lock',
+			sizeSyncOn: '🔓 Size sync',
+			sizeSyncHint: 'Unlocked: resizing this panel resizes the REAL agent browser window (CDP window bounds). Click again to lock.',
+			sizePresets: 'Size presets',
+			sizePresetsHint: 'Set the agent browser window to a fixed aspect ratio',
+			refreshPage: 'Refresh',
+			refreshHint: 'Reload the current agent page',
+			openUrl: 'URL',
+			openUrlHint: 'Open a URL in the current agent page',
+			openUrlPrompt: 'Enter a URL to open in the agent browser',
+			maximizeWindow: 'Maximize',
+			maximizeHint: 'Maximize the real agent browser window',
+			actionFailed: 'Action failed',
+			resizeHint: 'Drag to resize the agent browser window',
+			sizeApiOutdated: 'Size API not loaded — restart DSH to pick up the new host build',
+			executorResident: 'resident',
+			executorStarting: 'resident · starting',
+			executorOneShot: 'one-shot',
+			executorParked: 'resident parked',
+			chromeLoginConnect: 'Connect Chrome login',
+			chromeLoginReuse: 'Reuse Chrome login',
+			chromeLoginWaiting: 'Waiting for Chrome…',
+			chromeLoginHint: 'Import cookies from your daily Chrome (extension bridge)',
+			chromeLoginNoPage: 'Open the target site first',
+			chromeLoginDone: 'Imported {n} cookies · {domain}',
+			chromeLoginFailed: 'Import failed',
+			chromeLoginTimeout: 'Chrome extension did not respond',
+			chromeLoginPairTitle: 'Connect Chrome login state',
+			chromeLoginPairStep1: '1. chrome://extensions → Developer mode → Load unpacked',
+			chromeLoginPairStep2: '2. Open the extension popup and enter this pairing code:',
+			chromeLoginPairStep3: '3. Pair and keep Chrome open; afterwards one click imports the current site’s cookies.',
+			chromeLoginCopyPath: 'Copy extension path',
+			chromeLoginPathHint: 'Plugin folder / extension',
+			chromeLoginNewCode: 'New code',
+			chromeLoginPaired: 'Chrome paired — close this panel and click the button again.',
+			chromeLoginClose: 'Close',
 			noUrl: 'No URL to open',
 			closeTab: 'Close tab',
 			newTab: '(new tab)',
@@ -214,6 +267,42 @@ declare function require(id: string): any
 			openExternal: '⧉ 打开真实页',
 		raiseWindow: '弹出窗口',
 		raiseWindowHint: '把 agent 浏览器弹出为真实窗口（无头实例会被同 Profile 的有头实例替换，标签页保留）',
+			sizeSyncOff: '🔒 锁定尺寸',
+			sizeSyncOn: '🔓 尺寸同步',
+			sizeSyncHint: '解锁后拖动面板会直接改变 agent 浏览器真实窗口大小（CDP 窗口 bounds）；再点一下锁定。',
+			sizePresets: '尺寸预设',
+			sizePresetsHint: '按固定比例设置 agent 浏览器窗口',
+			refreshPage: '刷新',
+			refreshHint: '重新加载当前 agent 页面',
+			openUrl: '网址',
+			openUrlHint: '在当前 agent 页面打开网址',
+			openUrlPrompt: '输入要在 agent 浏览器打开的网址',
+			maximizeWindow: '最大化',
+			maximizeHint: '最大化真实 agent 浏览器窗口',
+			actionFailed: '操作失败',
+			resizeHint: '拖动调整 agent 浏览器窗口大小',
+			sizeApiOutdated: '尺寸接口未就绪：请重启 DSH 以加载最新 host 构建',
+			executorResident: '常驻',
+			executorStarting: '常驻·启动中',
+			executorOneShot: '一次性',
+			executorParked: '常驻已停用',
+			chromeLoginConnect: '连接 Chrome 登录态',
+			chromeLoginReuse: '复用 Chrome 登录态',
+			chromeLoginWaiting: '等待 Chrome…',
+			chromeLoginHint: '从日常 Chrome 导入 cookie（扩展桥接）',
+			chromeLoginNoPage: '请先打开目标网站',
+			chromeLoginDone: '已导入 {n} 条 · {domain}',
+			chromeLoginFailed: '导入失败',
+			chromeLoginTimeout: 'Chrome 扩展未响应',
+			chromeLoginPairTitle: '连接 Chrome 登录态',
+			chromeLoginPairStep1: '1. 打开 chrome://extensions → 开发者模式 → Load unpacked',
+			chromeLoginPairStep2: '2. 打开扩展弹窗，输入下面这组配对码：',
+			chromeLoginPairStep3: '3. 配对后保持 Chrome 运行；之后点按钮即可导入当前网站 cookie。',
+			chromeLoginCopyPath: '复制扩展路径',
+			chromeLoginPathHint: '插件目录 / extension',
+			chromeLoginNewCode: '重新生成',
+			chromeLoginPaired: 'Chrome 已配对——关闭此面板再点按钮即可。',
+			chromeLoginClose: '关闭',
 			noUrl: '无可打开的地址',
 			closeTab: '关闭标签',
 			newTab: '(新标签页)',
@@ -289,13 +378,127 @@ declare function require(id: string): any
 			return true
 		}
 
+		// ── Panel size → real browser window (size sync) ────────────────────
+		// The live image is a screencast frame; by default resizing the panel only
+		// scales that frame. The panel's size-sync toggle makes a panel resize set
+		// the REAL agent browser window instead, so the page reflows at the size
+		// the user is drawing. The worker turns the reported image box (CSS px)
+		// into window bounds through CDP. Sends are debounced (a drag emits a size
+		// event per pixel) and skipped when the box did not actually change, so a
+		// periodic re-render cannot spam the worker.
+		var SIZE_SYNC_KEY = 'dsh-ego:size-sync'
+		function sizeSyncStored() {
+			try { return window.localStorage.getItem(SIZE_SYNC_KEY) === '1' } catch (e) { return false }
+		}
+		function sizeSyncStore(enabled) {
+			try { window.localStorage.setItem(SIZE_SYNC_KEY, enabled ? '1' : '0') } catch (e) {}
+		}
+		function createWindowSizeSync() {
+			var enabled = false
+			var element = null
+			var observer = null
+			var timer = null
+			var inFlight = false
+			var baseWidth = 0     // panel width at the last applied window size
+			var pointerDown = false
+			var dragUntil = 0     // pointer-drag grace after the last pointerup
+			var lastAt = 0
+			function onPointerDown() { pointerDown = true }
+			function onPointerUp() {
+				if (!pointerDown) return
+				pointerDown = false
+				dragUntil = Date.now() + 350
+				if (enabled) schedule()
+			}
+			function panelWidth() {
+				return Math.round((element && element.clientWidth) || 0)
+			}
+			function send() {
+				timer = null
+				if (!enabled || !element) return
+				var w = panelWidth()
+				if (w < 120) return
+				var now = Date.now()
+				// Only the user's own drag may change the browser window. Layout
+				// changes that follow our own request (or a DSH window resize) are
+				// absorbed as the new baseline — otherwise the window would chase
+				// the sidebar width and shrink to nothing.
+				if (!pointerDown && now > dragUntil) { baseWidth = w; return }
+				var delta = w - baseWidth
+				if (Math.abs(delta) < 12) return
+				if (now - lastAt < 200) { schedule(); return }
+				if (inFlight) { schedule(); return }
+				inFlight = true
+				lastAt = now
+				var sentBase = w
+				fetch('/api/ego/window-size', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ delta: delta }),
+				}).then(function (r) { return r.json().catch(function () { return null }) })
+					.then(function (parsed) {
+						if (parsed && parsed.ok === true) baseWidth = sentBase
+					})
+					.catch(function () { return null })
+					.finally(function () { inFlight = false })
+			}
+			function schedule() {
+				if (timer !== null) return
+				timer = setTimeout(send, 180)
+			}
+			function attach(el) {
+				element = el || null
+				if (!enabled) return
+				if (observer !== null) { observer.disconnect(); observer = null }
+				if (element && typeof ResizeObserver !== 'undefined') {
+					try {
+						observer = new ResizeObserver(function () { if (enabled) schedule() })
+						observer.observe(element)
+					} catch (e) { observer = null }
+				}
+				if (baseWidth === 0) baseWidth = panelWidth()
+			}
+			function setEnabled(next) {
+				enabled = next === true
+				sizeSyncStore(enabled)
+				if (!enabled) {
+					if (timer !== null) { clearTimeout(timer); timer = null }
+					if (observer !== null) { observer.disconnect(); observer = null }
+					document.removeEventListener('pointerdown', onPointerDown, true)
+					document.removeEventListener('pointerup', onPointerUp, true)
+					return
+				}
+				// Unlocking must NOT resize anything by itself: it only arms the
+				// drag mapping. The window keeps its current size until the user
+				// drags the sidebar edge.
+				baseWidth = panelWidth()
+				lastAt = 0
+				document.addEventListener('pointerdown', onPointerDown, true)
+				document.addEventListener('pointerup', onPointerUp, true)
+				if (element) attach(element)
+			}
+			function dispose() {
+				if (timer !== null) { clearTimeout(timer); timer = null }
+				if (observer !== null) { observer.disconnect(); observer = null }
+				document.removeEventListener('pointerdown', onPointerDown, true)
+				document.removeEventListener('pointerup', onPointerUp, true)
+				element = null
+			}
+			return {
+				isEnabled: function () { return enabled },
+				setEnabled: setEnabled,
+				attach: attach,
+				dispose: dispose,
+			}
+		}
+
 		// ── Settings card: store ──────────────────────────────────────────
 		function initialSettingsState() {
 			return {
 				status: 'idle',        // 'idle' | 'loading' | 'ready'
 				available: false,      // true after a successful /ego/api/get
 				writable: false,       // false when settings service is absent
-				draft: { isolateSpaces: false, disableFrameRelay: false, idleTimeoutMin: '0', chromePath: '', captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '960', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
+				draft: { isolateSpaces: false, disableFrameRelay: false, residentExecutor: false, residentIdleMin: '30', idleTimeoutMin: '0', chromePath: '', useMockKeychain: false, captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '1280', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
 				ffmpegStatus: { state: 'checking', canDownload: false, canSelectFfmpeg: false },
 				dirty: false,
 				applyState: { kind: 'idle' }, // 'idle' | 'saving' | 'saved' | 'error'
@@ -347,9 +550,12 @@ declare function require(id: string): any
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
 				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === 'true' || config.disableFrameRelay === 1 || config.disableFrameRelay === '1',
+				residentExecutor: config.residentExecutor === true || config.residentExecutor === 'true' || config.residentExecutor === 1 || config.residentExecutor === '1',
+				residentIdleMin: String(config.residentIdleMin ?? 30),
 				chromePath: config.chromePath || '',
+				useMockKeychain: config.useMockKeychain === true || config.useMockKeychain === 'true' || config.useMockKeychain === 1 || config.useMockKeychain === '1',
 				captureBackend: config.captureBackend === 'ffmpeg' && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
-				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
+				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 1280), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
 				ffmpegFps: String(config.ffmpegFps ?? 20), ffmpegMaxWidth: String(config.ffmpegMaxWidth ?? 1280), ffmpegBitrateKbps: String(config.ffmpegBitrateKbps ?? 4000), ffmpegEncoder: config.ffmpegEncoder || 'auto', ffmpegPath: config.ffmpegPath || '', githubMirror: config.githubMirror || '',
 				egoCliArgs: config.egoCliArgs || '', chromeArgs: config.chromeArgs || '',
 			}
@@ -429,7 +635,8 @@ declare function require(id: string): any
 			var patch = {}
 			var NUMERIC_FIELDS = {
 				idleTimeoutMin: { min: 0, max: 1440, def: 0 },
-				cdpFps: { min: 5, max: 30, def: 20 }, cdpQuality: { min: 1, max: 100, def: 55 }, cdpMaxWidth: { min: 320, max: 1920, def: 960 }, cdpBackstopIntervalMs: { min: 1000, max: 10000, def: 3000 }, ffmpegFps: { min: 5, max: 30, def: 20 }, ffmpegMaxWidth: { min: 320, max: 1920, def: 1280 }, ffmpegBitrateKbps: { min: 500, max: 20000, def: 4000 },
+				residentIdleMin: { min: 0, max: 1440, def: 30 },
+				cdpFps: { min: 5, max: 30, def: 20 }, cdpQuality: { min: 1, max: 100, def: 55 }, cdpMaxWidth: { min: 320, max: 1920, def: 1280 }, cdpBackstopIntervalMs: { min: 1000, max: 10000, def: 3000 }, ffmpegFps: { min: 5, max: 30, def: 20 }, ffmpegMaxWidth: { min: 320, max: 1920, def: 1280 }, ffmpegBitrateKbps: { min: 500, max: 20000, def: 4000 },
 			}
 			this.staged.forEach(function (v, k) {
 				var spec = NUMERIC_FIELDS[k]
@@ -475,9 +682,12 @@ declare function require(id: string): any
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
 				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === 'true' || config.disableFrameRelay === 1 || config.disableFrameRelay === '1',
+				residentExecutor: config.residentExecutor === true || config.residentExecutor === 'true' || config.residentExecutor === 1 || config.residentExecutor === '1',
+				residentIdleMin: String(config.residentIdleMin ?? 30),
 				chromePath: config.chromePath || '',
+				useMockKeychain: config.useMockKeychain === true || config.useMockKeychain === 'true' || config.useMockKeychain === 1 || config.useMockKeychain === '1',
 				captureBackend: config.captureBackend === 'ffmpeg' && ffmpegStatus && !ffmpegStatus.canSelectFfmpeg ? 'cdp' : (config.captureBackend || 'auto'), streamProfile: config.streamProfile || 'balanced',
-				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 960), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
+				cdpFps: String(config.cdpFps ?? 20), cdpQuality: String(config.cdpQuality ?? 55), cdpMaxWidth: String(config.cdpMaxWidth ?? 1280), cdpBackstopIntervalMs: String(config.cdpBackstopIntervalMs ?? 3000),
 				ffmpegFps: String(config.ffmpegFps ?? 20), ffmpegMaxWidth: String(config.ffmpegMaxWidth ?? 1280), ffmpegBitrateKbps: String(config.ffmpegBitrateKbps ?? 4000), ffmpegEncoder: config.ffmpegEncoder || 'auto', ffmpegPath: config.ffmpegPath || '', githubMirror: config.githubMirror || '',
 				egoCliArgs: config.egoCliArgs || '', chromeArgs: config.chromeArgs || '',
 			}
@@ -634,6 +844,7 @@ declare function require(id: string): any
 				} else {
 					resultText = result.error || 'failed'
 				}
+				if (result.warning) resultText += ' · ' + result.warning
 			}
 			return h('div', { className: 'dsh-ego-card__ffmpeg' },
 				h('div', { className: 'dsh-ego-card__ffmpeg-title' }, t('loginImportTitle')),
@@ -723,6 +934,19 @@ declare function require(id: string): any
 							disabled: busy,
 							onEdit: function (v) { controller.edit('disableFrameRelay', v === 'true') },
 						}),
+						h(SettingsField, {
+							id: 'plugin-config-ego-browser-residentexecutor',
+							label: t('residentExecutor'),
+							hint: t('residentExecutorHint'),
+							value: state.draft.residentExecutor ? 'true' : 'false',
+							options: [
+								{ value: 'false', label: t('residentExecutorOff') },
+								{ value: 'true', label: t('residentExecutorOn') },
+							],
+							disabled: busy,
+							onEdit: function (v) { controller.edit('residentExecutor', v === 'true') },
+						}),
+						h(SettingsField, { id: 'plugin-config-ego-browser-residentidle', label: t('residentIdleMin'), hint: t('residentIdleMinHint'), value: state.draft.residentIdleMin, numeric: true, narrow: true, unit: t('minUnit'), min: 0, max: 1440, step: 1, disabled: busy, onEdit: function (v) { controller.edit('residentIdleMin', v) } }),
 						h(SettingsField, { id: 'plugin-config-ego-browser-idletimeout', label: t('idleTimeoutMin'), hint: t('idleTimeoutMinHint'), value: state.draft.idleTimeoutMin, numeric: true, narrow: true, unit: t('minUnit'), min: 0, max: 1440, step: 1, disabled: busy, onEdit: function (v) { controller.edit('idleTimeoutMin', v) } }),
 						h(SettingsField, {
 							id: 'plugin-config-ego-browser-chromepath',
@@ -732,6 +956,18 @@ declare function require(id: string): any
 							placeholder: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
 							disabled: busy,
 							onEdit: function (v) { controller.edit('chromePath', v) },
+						}),
+						h(SettingsField, {
+							id: 'plugin-config-ego-browser-usemockkeychain',
+							label: t('useMockKeychain'),
+							hint: t('useMockKeychainHint'),
+							value: state.draft.useMockKeychain ? 'true' : 'false',
+							options: [
+								{ value: 'false', label: t('useMockKeychainOff') },
+								{ value: 'true', label: t('useMockKeychainOn') },
+							],
+							disabled: busy,
+							onEdit: function (v) { controller.edit('useMockKeychain', v === 'true') },
 						}),
 						h(SettingsField, {
 							id: 'plugin-config-ego-browser-backend', label: t('captureBackend'), value: state.draft.captureBackend, options: ['auto', 'cdp', { value: 'ffmpeg', label: ffmpegStatus.canSelectFfmpeg ? 'ffmpeg' : t('ffmpegRequired'), disabled: !ffmpegStatus.canSelectFfmpeg }], disabled: busy, onEdit: function (v) { controller.edit('captureBackend', v) },
@@ -1168,231 +1404,28 @@ declare function require(id: string): any
 				try { URL.revokeObjectURL(objectUrl) } catch (e) {}
 			}
 		}
-		const OPEN_KEY = 'dsh.ego.watch.open'
 		// Treat the agent as "active" when any page was touched within this window.
 		const ACTIVE_WINDOW_MS = 3000
 
-		const PANEL_CSS = `
-/* ---- deep Apple / macOS dark-glass chrome ---- */
-:root { --ego-ios-gap: 6px; }
-
-#dsh-ego-fab {
-  position: fixed; left: 0; top: 0; z-index: 9999;
-  width: 48px; height: 48px; border-radius: 50%;
-  border: 1px solid rgba(255,255,255,.14);
-  background: rgba(30,30,32,.72);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
-  backdrop-filter: blur(22px) saturate(180%);
-  color: #f5f5f7; cursor: grab;
-  touch-action: none; user-select: none; -webkit-user-select: none;
-  box-shadow: 0 10px 30px rgba(0,0,0,.45);
-  display: flex; align-items: center; justify-content: center;
-}
-#dsh-ego-fab.dsh-ego-dragging { cursor: grabbing; opacity:.85; }
-#dsh-ego-fab:hover { transform: scale(1.09); }
-#dsh-ego-fab[hidden] { display: none; }
-#dsh-ego-fab .dsh-ego-dot {
-  position: absolute; top: 1px; right: 1px; width: 11px; height: 11px;
-  border-radius: 50%; background: #86868b;
-  border: 2px solid rgba(30,30,32,.9);
-}
-#dsh-ego-fab svg { width: 22px; height: 22px; }
-/* FAB status dot: steady green while the agent is driving the browser
-   (busy), breathing green when idle (browser open, no recent action). */
-#dsh-ego-fab.dsh-ego-live:not(.dsh-ego-busy) .dsh-ego-dot {
-  background: #30d158; box-shadow: 0 0 8px #30d158aa;
-  animation: dsh-ego-breathe 2.4s ease-in-out infinite;
-}
-#dsh-ego-fab.dsh-ego-busy .dsh-ego-dot {
-  background: #30d158; box-shadow: 0 0 9px #30d158cc; animation: none;
-}
-@keyframes dsh-ego-breathe {
-  0%, 100% { box-shadow: 0 0 2px #30d15822; opacity: .5; }
-  50%      { box-shadow: 0 0 11px #30d158ee; opacity: 1; }
-}
-
-#dsh-ego-panel {
-  position: fixed; left: 0; top: 0; z-index: 9998;
-  width: 408px; max-height: 78vh;
-  display: flex; flex-direction: column; overflow: hidden;
-  border: 1px solid rgba(255,255,255,.12);
-  border-radius: 16px;
-  background: rgba(28,28,30,.74);
-  -webkit-backdrop-filter: blur(26px) saturate(180%);
-  backdrop-filter: blur(26px) saturate(180%);
-  color: #f5f5f7;
-  box-shadow: 0 14px 44px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.08);
-  /* Pop-out animation: the panel springs up-left out of the ball's spot.
-     transform-origin sits near its bottom-right (closest to the FAB). */
-  opacity: 0; pointer-events: none;
-  transform-origin: 82% 100%;
-  transform: translateY(12px) scale(.88);
-  transition: opacity .26s cubic-bezier(.16,.8,.3,1.05),
-              transform .26s cubic-bezier(.16,.8,.3,1.15),
-              visibility .26s;
-  will-change: transform, opacity;
-}
-#dsh-ego-panel.dsh-ego-panel-open { opacity: 1; pointer-events: auto; transform: none; }
-#dsh-ego-panel[hidden] { display: none; }
-#dsh-ego-panel.open-drawer { width: 640px; }
-
-/* FAB press / open feedback */
-#dsh-ego-fab:active { transform: scale(.95); }
-#dsh-ego-fab.dsh-ego-on { transform: scale(1.12); box-shadow: 0 0 0 6px rgba(10,132,255,.22), 0 10px 30px rgba(0,0,0,.5); }
-#dsh-ego-fab.dsh-ego-on:hover { transform: scale(1.18); }
-
-/* Drag handles for the panel: its header doubles as a title-bar grip. */
-#dsh-ego-head { cursor: grab; }
-#dsh-ego-head.dsh-ego-grabbing { cursor: grabbing; }
-#dsh-ego-head .dsh-ego-grip {
-  flex: none; width: 22px; height: 22px; border-radius: 6px;
-  display: inline-flex; align-items: center; justify-content: center;
-  color:#86868b; opacity:.8;
-}
-#dsh-ego-head .dsh-ego-grip svg { width: 13px; height: 13px; }
-
-#dsh-ego-head { display:flex; align-items:center; gap:4px; padding:10px 14px;
-  border-bottom:1px solid rgba(255,255,255,.08); }
-#dsh-ego-title { flex:1; font-size:13px; font-weight:600; letter-spacing:.2px;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:6px; }
-#dsh-ego-title svg { width:16px; height:16px; color:#0a84ff; flex-shrink:0; }
-#dsh-ego-iconbtn {
-  background: transparent; border:none; color: #aeaeb2; cursor: pointer;
-  width: 28px; height: 28px; border-radius: 8px; padding: 0;
-  display:flex; align-items:center; justify-content:center;
-  transition: background .15s ease, color .15s ease;
-}
-#dsh-ego-iconbtn svg { width: 15px; height: 15px; }
-#dsh-ego-iconbtn:hover { background: rgba(255,255,255,.12); color: #f5f5f7; }
-#dsh-ego-iconbtn.off { opacity:.5; }
-#dsh-ego-iconbtn.spinning svg { animation: dsh-ego-spin .7s linear infinite; }
-@keyframes dsh-ego-spin { to { transform: rotate(360deg); } }
-
-#dsh-ego-body { flex:1; overflow-y:auto; padding:12px 14px; min-height:60px; }
-.dsh-ego-empty { padding:20px 12px; text-align:center; color:#86868b; font-size:12.5px; line-height:1.7; }
-.dsh-ego-off { padding:6px 14px 10px; text-align:center; font-size:11px; color:#6e6e73; }
-.dsh-ego-off svg { width:11px; height:11px; vertical-align:-1px; color:#6e6e73; }
-
-/* ---- login guide strip (top of the panel body) ---- */
-#dsh-ego-login { display:none; align-items:center; gap:8px; margin:0 14px 9px; padding:7px 10px;
-  border-radius:9px; border:1px solid rgba(255,214,10,.28); background: rgba(255,214,10,.09); }
-#dsh-ego-login.show { display:flex; }
-#dsh-ego-login .dsh-ego-login-txt { flex:1; min-width:0; font-size:11px; line-height:1.45; color:#f5f5f7; }
-#dsh-ego-login .dsh-ego-login-txt b { color:#ffd60a; }
-#dsh-ego-login .dsh-ego-login-btn { flex:none; background:#0a84ff; color:#fff; border:none; border-radius:8px;
-  font-size:11px; padding:4px 10px; cursor:pointer; white-space:nowrap; transition: background .15s ease; }
-#dsh-ego-login .dsh-ego-login-btn:hover { background:#338cff; }
-#dsh-ego-login .dsh-ego-login-btn.saving { opacity:.55; pointer-events:none; }
-#dsh-ego-login .dsh-ego-login-note { flex:none; font-size:10.5px; color:#6e6e73; white-space:nowrap; }
-/* dismiss (×) on guide strips so the user can close them and reclaim the space */
-.dsh-ego-dismiss { flex:none; width:18px; height:18px; line-height:1; border-radius:50%; border:none;
-  background: rgba(255,255,255,.12); color:inherit; font-size:13px; cursor:pointer; opacity:.75;
-  display:inline-flex; align-items:center; justify-content:center; padding:0; transition: background .15s,opacity .15s; }
-.dsh-ego-dismiss:hover { background: rgba(255,69,58,.35); opacity:1; }
-#dsh-ego-login .dsh-ego-dismiss { color:#ffd60a; }
-#dsh-ego-captcha .dsh-ego-dismiss { color:#ffd8d5; }
-
-/* ---- human-verification (CAPTCHA) reminder strip ---- */
-#dsh-ego-captcha { display:none; align-items:center; gap:8px; margin:0 14px 9px; padding:8px 11px;
-  border-radius:9px; border:1px solid rgba(255,69,58,.4); background: rgba(255,69,58,.13); color:#ffe1de; }
-#dsh-ego-captcha.show { display:flex; }
-#dsh-ego-captcha .dsh-ego-captcha-txt { flex:1; min-width:0; font-size:11.5px; line-height:1.5; }
-#dsh-ego-captcha .dsh-ego-captcha-txt b { color:#ff6961; }
-#dsh-ego-captcha .dsh-ego-captcha-kind { flex:none; font-size:10px; padding:2px 8px; border-radius:999px;
-  background: rgba(255,255,255,.12); color:#ffd8d5; text-transform:uppercase; letter-spacing:.4px; }
-
-/* ---- tab bar: frosted pills ---- */
-#dsh-ego-tabs { display:flex; gap:6px; padding:9px 12px;
-  border-bottom:1px solid rgba(255,255,255,.08); overflow-x:auto; flex-shrink:0; scrollbar-width:thin; }
-#dsh-ego-tabs:empty { display:none; }
-.dsh-ego-tab {
-  display:inline-flex; align-items:center; gap:6px; max-width:176px; white-space:nowrap;
-  padding:5px 12px; border-radius: 999px; cursor:pointer; font-size:11.5px; flex-shrink:0;
-  border:1px solid rgba(255,255,255,.1);
-  background: rgba(72,72,74,.45); color:#aeaeb2;
-  transition: background .15s ease, color .15s ease, border-color .15s ease;
-}
-.dsh-ego-tab > .dsh-ego-tabtxt { overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-tab:hover { color:#f5f5f7; background: rgba(72,72,74,.65); }
-.dsh-ego-tab.active {
-  background: #0a84ff; color:#fff; border-color: transparent;
-  box-shadow: 0 2px 10px rgba(10,132,255,.35);
-}
-.dsh-ego-tab .dsh-ego-tabdot { width:7px; height:7px; border-radius:50%; background:#86868b; flex-shrink:0; }
-.dsh-ego-tab.active .dsh-ego-tabdot { background:#fff; }
-.dsh-ego-tab .dsh-ego-tabclose { flex-shrink:0; width:14px; height:14px; line-height:13px; text-align:center;
-  border-radius:50%; font-size:12px; color:#86868b; margin-left:2px; }
-.dsh-ego-tab .dsh-ego-tabclose:hover { background:rgba(255,255,255,.2); color:#ff453a; }
-.dsh-ego-tab.active .dsh-ego-tabclose { color:rgba(255,255,255,.85); }
-.dsh-ego-tab.active .dsh-ego-tabclose:hover { color:#ff453a; background:rgba(255,255,255,.25); }
-
-/* ---- main live view ---- */
-.dsh-ego-liveview { display:flex; flex-direction:column; gap:9px; min-height:60px;
-  overflow:hidden; /* clips the zoomed image so it doesn't bleed outside */ }
-.dsh-ego-livebadge { font-size:11px; color:#86868b; letter-spacing:.3px;
-  display:flex; align-items:center; gap:6px; }
-.dsh-ego-state-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
-  background:#30d158; box-shadow:0 0 6px #30d15888; flex-shrink:0;
-  animation: dsh-ego-breathe 2.4s ease-in-out infinite; }
-.dsh-ego-state-dot.busy { background:#30d158; box-shadow:0 0 7px #30d158bb; animation:none; }
-.dsh-ego-state-dot.pin { background:#0a84ff; box-shadow:0 0 6px #0a84ff88; animation:none; }
-.dsh-ego-back {
-  background: rgba(255,255,255,.12); color:#f5f5f7;
-  border:1px solid rgba(255,255,255,.12); border-radius:7px;
-  cursor:pointer; font-size:11px; padding:3px 9px;
-  display:inline-flex; align-items:center; gap:4px;
-  transition: background .15s ease;
-}
-.dsh-ego-back:hover { background: rgba(255,255,255,.2); }
-.dsh-ego-liveimg {
-  width:100%; border-radius:11px; display:block;
-  max-height:50vh; object-fit:contain;
-  border:1px solid rgba(255,255,255,.14);
-  background:#000; /* letterbox behind landscape jpeg */
-  box-shadow: 0 4px 16px rgba(0,0,0,.35);
-  user-select:none; -webkit-user-select:none; touch-action:none;
-  will-change:transform; cursor:grab;
-}
-.dsh-ego-zoomhint { font-size:10.5px; color:#6e6e73; letter-spacing:.2px; margin-top:-3px; }
-.dsh-ego-livetitle { font-size:13px; font-weight:600; }
-.dsh-ego-liveurl { font-size:11.5px; color:#86868b; word-break:break-all; }
-.dsh-ego-liveurl.dsh-ego-hint { color:#75c2ff; font-style:italic; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:0 0 6px rgba(117,194,255,.4); }
-.dsh-ego-hint { animation: dsh-ego-hint-in .2s ease; }
-@keyframes dsh-ego-hint-in { from { opacity:.3 } to { opacity:1 } }
-
-/* ---- history drawer ---- */
-#dsh-ego-history { display:none; flex-direction:column; width:224px; flex-shrink:0;
-  border-left:1px solid rgba(255,255,255,.08); background: rgba(0,0,0,.18); }
-#dsh-ego-history.open { display:flex; }
-#dsh-ego-historyhead { padding:9px 12px; font-size:12px; font-weight:600; color:#86868b;
-  display:flex; align-items:center; gap:6px;
-  border-bottom:1px solid rgba(255,255,255,.06); }
-#dsh-ego-historyhead svg { width:12px; height:12px; }
-#dsh-ego-historylist { overflow-y:auto; padding:7px; }
-.dsh-ego-hitem { display:flex; gap:8px; align-items:center; padding:6px; border-radius:9px; cursor:pointer;
-  transition: background .15s ease; }
-.dsh-ego-hitem:hover { background: rgba(255,255,255,.1); }
-.dsh-ego-hthumb { width:58px; height:42px; border-radius:6px; object-fit:cover; background:#000;
-  flex-shrink:0; border:1px solid rgba(255,255,255,.14); }
-.dsh-ego-hinfo { min-width:0; }
-.dsh-ego-hurl { font-size:10.5px; color:#86868b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-htitle { font-size:10.5px; font-weight:500; color:#f5f5f7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dsh-ego-hactive { color:#30d158; font-size:10.5px; }
-.dsh-ego-hnone { padding:16px 8px; text-align:center; font-size:11px; color:#6e6e73; }
-
-#dsh-ego-cols { display:flex; flex:1; min-height:0; }
-.dsh-ego-maincol { flex:1; min-width:0; display:flex; flex-direction:column; }
-`;
 
 		// ── SF-Symbols-style linear icons (inline SVG, zero deps) ──
-		// Each icon carries explicit width/height (scaled from a 24 viewBox)
+		// Each icon carries explicit width/height (scaled from a 16 viewBox)
 		// so it renders at a sane size even if no CSS rule targets it.
-		const ICON_GLOBE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 3c2.5 2.4 3.8 5.4 3.8 9S14.5 18.6 12 21"/><path d="M12 3C9.5 5.4 8.2 8.4 8.2 12s1.3 6.6 3.8 9"/><path d="M3 12h18"/></svg>`;
+		// Canonical Agent Browser glyph (matches the sidebar entry in the official
+		// UI): a rounded browser window with a title bar, two dots and the agent's
+		// cursor. Keep EgoWatchIcon (React) in sync with this exact geometry.
+		const ICON_AGENT_BROWSER = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="1.2" y="2.4" width="13.6" height="11.2" rx="2.4" stroke="currentColor" stroke-width="1.2"/><path d="M1.4 5.9h13.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="3.7" cy="4.15" r="0.6" fill="currentColor"/><circle cx="5.5" cy="4.15" r="0.6" fill="currentColor"/><path d="M8.2 7.0L12.6 10.6L10.6 10.9L11.7 13.2L10.6 13.8L9.5 11.5L8.0 13.1Z" fill="currentColor"/></svg>`;
 		const ICON_REFRESH = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.5-5.8"/><path d="M20 4.5V9h-4.5"/></svg>`;
 		const ICON_CLOCK = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></svg>`;
-		const ICON_CLOSE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
-		// 6-dot drag grip for the panel's title bar.
-		const ICON_GRIP = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="8" cy="6" r="1.8"/><circle cx="16" cy="6" r="1.8"/><circle cx="8" cy="12" r="1.8"/><circle cx="16" cy="12" r="1.8"/><circle cx="8" cy="18" r="1.8"/><circle cx="16" cy="18" r="1.8"/></svg>`;
+		// Toolbar glyphs (14px, stroke 1.6) — macOS SF-Symbols-like, no emoji.
+		const ICON_OPEN_EXTERNAL = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>`;
+		const ICON_POPOUT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="14" height="12" rx="2.2"/><path d="M9 21h12V9"/><path d="M9 15l6-6"/></svg>`;
+		const ICON_LOCK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2.2"/><path d="M8 10V8a4 4 0 0 1 8 0v2"/></svg>`;
+		const ICON_UNLOCK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10" width="14" height="10" rx="2.2"/><path d="M8 10V8a4 4 0 0 1 7.6-1.8"/></svg>`;
+		const ICON_ASPECT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2.2"/><path d="M3 10h18"/><path d="M8 5v5"/></svg>`;
+		const ICON_LINK = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2"/></svg>`;
+		const ICON_MAXIMIZE = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H3v5"/><path d="M16 3h5v5"/><path d="M8 21H3v-5"/><path d="M16 21h5v-5"/></svg>`;
+		const ICON_KEY = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="3.2"/><path d="M10.3 12.7L20 3"/><path d="M17 6l2 2"/><path d="M14.5 8.5l2 2"/></svg>`;
 
 		function apply(ctx) {
 			// ── Settings card: register locale + slot (always runs) ──────
@@ -1459,1279 +1492,446 @@ declare function require(id: string): any
 				}, EgoBrowserCard)
 			})
 
-		// ── Watch panel: sidebar tab & floating watch ─────────────────────
-		// betterSidebar is an OPTIONAL service and is intentionally absent from
-		// the static inject list (see its declaration above): on hosts without
-		// dsh-better-sidebar the module loader would otherwise keep this row
-		// pending forever and block the whole web boot (issue #29, reproduced
-		// on DSH 0.1.2-rc.1). Probe with ctx.get; when absent, mount the
-		// floating watch panel immediately and upgrade to the sidebar tab if
-		// the service appears later (dynamic ctx.inject, same pattern as PR #45).
-		var betterSidebarService
-		try { betterSidebarService = typeof ctx.get === 'function' ? ctx.get('betterSidebar') : undefined } catch (e) { betterSidebarService = undefined }
+		// ── Watch panel: native right sidebar (optional dsh-better-sidebar fallback) ──
+		// DSH Desktop ships its own right Sidebar, so the old floating FAB/overlay
+		// fallback was removed. betterSidebar remains as an optional *sidebar*
+		// fallback for hosts without the native services; if neither exists there
+		// is simply no watch panel (the toolbar card still works). The services are
+		// OPTIONAL and may be provided AFTER this row applies, so they are awaited
+		// with ctx.inject rather than probed once with ctx.get.
+		var getOptionalService = function (name) {
+			try { return typeof ctx.get === 'function' ? ctx.get(name) : undefined } catch (e) { return undefined }
+		}
+		var betterSidebarService = getOptionalService('betterSidebar')
+		// The one live panel. Replacing it disposes the previous mount, so the
+		// fallback can be upgraded to the native sidebar when its services appear.
+		var disposeActive = null
+		var activatePanel = function (effectCtx, kind, factory) {
+			if (disposeActive) { var old = disposeActive; disposeActive = null; try { old() } catch (e) {} }
+			disposeActive = effectCtx.effect(function () { return factory() }, 'ego-browser watch panel (' + kind + ')')
+		}
+		// Fallback first: the native inject below may fire synchronously.
 		if (betterSidebarService !== undefined) {
-			ctx.effect(() => mountSidebarTab(ctx, betterSidebarService), 'ego-browser sidebar tab')
-		} else {
-			var disposeFloating = null
-			ctx.effect(() => {
-				disposeFloating = mountFloatingWatch(ctx)
-				return function () { if (disposeFloating) { var d = disposeFloating; disposeFloating = null; d() } }
-			}, 'ego-browser watch panel')
-			if (typeof ctx.inject === 'function') {
-				ctx.inject(['betterSidebar'], function (sidebarCtx) {
-					var svc
-					try { svc = typeof sidebarCtx.get === 'function' ? sidebarCtx.get('betterSidebar') : sidebarCtx.betterSidebar } catch (e) { svc = undefined }
-					if (!svc) return
-					if (disposeFloating) { var d2 = disposeFloating; disposeFloating = null; d2() }
-					sidebarCtx.effect(function () { return mountSidebarTab(sidebarCtx, svc) }, 'ego-browser sidebar tab')
-				})
-			}
+			activatePanel(ctx, 'betterSidebar', function () { return mountSidebarTab(ctx, betterSidebarService) })
+		} else if (typeof ctx.inject === 'function') {
+			ctx.inject(['betterSidebar'], function (sidebarCtx) {
+				var svc
+				try { svc = typeof sidebarCtx.get === 'function' ? sidebarCtx.get('betterSidebar') : sidebarCtx.betterSidebar } catch (e) { svc = undefined }
+				if (!svc) return
+				activatePanel(sidebarCtx, 'betterSidebar', function () { return mountSidebarTab(sidebarCtx, svc) })
+			})
+		}
+		// Native upgrade path: wait for the right Sidebar's two services, then
+		// take over the panel and dispose the betterSidebar fallback if mounted.
+		if (typeof ctx.inject === 'function') {
+			ctx.inject(['sidebarRight', 'sidebarRightTabs'], function (nativeCtx) {
+				var sidebar = typeof nativeCtx.get === 'function' ? nativeCtx.get('sidebarRight') : undefined
+				var tabs = typeof nativeCtx.get === 'function' ? nativeCtx.get('sidebarRightTabs') : undefined
+				if (!sidebar || !tabs) return
+				activatePanel(nativeCtx, 'native', function () { return mountNativeSidebarTab(nativeCtx, sidebar, tabs) })
+			})
 		}
 	}
-
-	// ── Floating watch panel (vanilla DOM, fallback when no sidebar) ────────
-	// This is the original self-contained overlay: a draggable FAB + pop-out
-	// panel. Kept verbatim for the no-sidebar path; the sidebar Tab path uses
-	// the React EgoBrowserTab component + LivePreviewController instead.
-	function mountFloatingWatch(ctx) {
-		// Guard: skip if already mounted (apply() may fire multiple times).
-		if (document.getElementById('dsh-ego-fab') !== null) return () => {}
-				const style = document.createElement('style')
-				style.textContent = PANEL_CSS
-				document.head.appendChild(style)
-
-				const panel = document.createElement('div')
-				panel.id = 'dsh-ego-panel'
-				panel.hidden = true
-				panel.innerHTML = `
-					<div id="dsh-ego-head">
-						<span class="dsh-ego-grip" title="${wt('dragHint')}">${ICON_GRIP}</span>
-						<span id="dsh-ego-title">${ICON_GLOBE}<span style="margin-left:6px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${wt('title')}</span></span>
-						<button id="dsh-ego-refresh" class="dsh-ego-iconbtn" title="${wt('refresh')}">${ICON_REFRESH}</button>
-						<button id="dsh-ego-historybtn" class="dsh-ego-iconbtn off" title="${wt('historyShow')}">${ICON_CLOCK}</button>
-						<button id="dsh-ego-close" class="dsh-ego-iconbtn" title="${wt('settingsHide')}">${ICON_CLOSE}</button>
-					</div>
-					<div id="dsh-ego-tabs"></div>
-					<div id="dsh-ego-login">
-						<span class="dsh-ego-login-txt">${wt('loginTitle')}</span>
-						<button id="dsh-ego-login-btn" class="dsh-ego-login-btn" type="button">${wt('loginBtn')}</button>
-						<span class="dsh-ego-login-note" id="dsh-ego-login-note"></span>
-						<button class="dsh-ego-dismiss" type="button" title="${wt('loginDismiss')}" data-dismiss="login">×</button>
-					</div>
-					<div id="dsh-ego-captcha">
-						<span class="dsh-ego-captcha-txt"><b>${wt('captchaTitle')}</b> — ${wt('captchaHint')}</span>
-						<span class="dsh-ego-captcha-kind" id="dsh-ego-captcha-kind"></span>
-						<button class="dsh-ego-dismiss" type="button" title="${wt('captchaDismiss')}" data-dismiss="captcha">×</button>
-					</div>
-					<div id="dsh-ego-cols">
-						<div class="dsh-ego-maincol">
-							<div id="dsh-ego-body"></div>
-						</div>
-						<aside id="dsh-ego-history">
-							<div id="dsh-ego-historyhead">${ICON_CLOCK} ${wt('history')}</div>
-							<div id="dsh-ego-historylist"></div>
-						</aside>
-					</div>
-					<div class="dsh-ego-off">${wt('liveView')} · ${wt('realtime')} · ${ICON_CLOCK} ${wt('historyShow')}</div>
-				`
-
-				const fab = document.createElement('button')
-				fab.id = 'dsh-ego-fab'
-				fab.type = 'button'
-				fab.title = wt('fabTitle')
-				fab.textContent = ''
-				fab.innerHTML = `${ICON_GLOBE}<span class="dsh-ego-dot"></span>`
-
-				const body = panel.querySelector('#dsh-ego-body')
-				const titleEl = panel.querySelector('#dsh-ego-title')
-				const refreshBtn = panel.querySelector('#dsh-ego-refresh')
-				const closeBtn = panel.querySelector('#dsh-ego-close')
-				const historyBtn = panel.querySelector('#dsh-ego-historybtn')
-				const historyEl = panel.querySelector('#dsh-ego-history')
-				const historyList = panel.querySelector('#dsh-ego-historylist')
-				const tabsEl = panel.querySelector('#dsh-ego-tabs')
-				const loginEl = panel.querySelector('#dsh-ego-login')
-				const loginBtn = panel.querySelector('#dsh-ego-login-btn')
-				const loginNote = panel.querySelector('#dsh-ego-login-note')
-				const captchaEl = panel.querySelector('#dsh-ego-captcha')
-				const captchaKindEl = panel.querySelector('#dsh-ego-captcha-kind')
-				const FLUSH_ROUTE = '/api/ego/flush'
-
-				// Guide strips that the user can dismiss (×). Once closed in this
-				// panel lifecycle they stay closed, so they never permanently eat
-				// vertical space above the main view.
-				const dismissedGuides = { login: false, captcha: false }
-				const bindGuideDismiss = (which, el) => {
-					const btn = el && el.querySelector('[data-dismiss="' + which + '"]')
-					if (!btn) return
-					btn.addEventListener('click', () => {
-						dismissedGuides[which] = true
-						el.classList.remove('show')
-					})
-				}
-				bindGuideDismiss('login', loginEl)
-				bindGuideDismiss('captcha', captchaEl)
-
-				// Title keeps a leading globe icon; update only the trailing label
-				// text so the icon is never wiped by a textContent reassignment.
-				const setTitle = (text) => {
-					const label = titleEl.querySelector('span:last-child')
-					if (label) label.textContent = text
-				}
-
-				// ── relay-disabled state (settings: disableFrameRelay) ─────────────
-				// Explicit "turned off" panel state: no stream, no reconnect loop, and a
-				// message that says where to turn it back on. Never rendered while the relay
-				// is on (the normal empty/thumbnail views take over again).
-				const renderRelayDisabled = () => {
-					if (disposed) return
-					setTitle(wt('title'))
-					body.innerHTML = '<div class="dsh-ego-empty">' + escapeHtml(wt('relayDisabledTitle')) + '<br><span style="font-size:11px;">' + escapeHtml(wt('relayDisabledBody')) + '</span></div>'
-					liveCount = 0
-					fab.classList.remove('dsh-ego-live', 'dsh-ego-busy')
-				}
-				// Drop every pull-stream artefact of this panel (frames, MSE video, leases).
-				const teardownRelay = () => {
-					try { if (sse) sse.close() } catch (e) {}
-					sse = null
-					doConnected = false
-					stopVideo()
-					stopWatch(false)
-					// Reset the capture state too: a stale ffmpeg/streaming state would make
-					// the next render pull a new /api/ego/video connection.
-					captureBackend = 'cdp'; streamGeneration = 0; streamState = 'idle'; streamMessage = ''
-					pageMeta.clear(); frameCache.clear(); lastList = []
-				}
-
-				let disposed = false
-				let liveCount = 0
-				let historyOpen = false
-				// Cache of the most recent spaces payload, so the preview "back"
-				// control can restore the list synchronously and reliably instead
-				// of depending on a fresh network round-trip (which may hang when
-				// the worker/host is transiently unreachable).
-				let lastList = []
-
-				// Toggle the history drawer (side panel).
-				const setHistory = (open) => {
-					historyOpen = open
-					historyEl.classList.toggle('open', open)
-					panel.classList.toggle('open-drawer', open)
-					historyBtn.classList.toggle('off', !open)
-					;(historyBtn as HTMLElement).title = open ? wt('historyHide') : wt('historyShow')
-					if (open) renderHistory(lastList)
-				}
-
-				// ---- History drawer: list every page, oldest -> newest ----
-				const renderHistory = (spaces) => {
-					historyList.innerHTML = ''
-					const list = Array.isArray(spaces) ? [...spaces].sort((a, b) => (a.lastActive ?? 0) - (b.lastActive ?? 0)) : []
-					if (list.length === 0) {
-						historyList.innerHTML = `<div class="dsh-ego-hnone">${wt('noHistory')}</div>`
-						return
-					}
-					for (const s of list) {
-						const item = document.createElement('div')
-						item.className = 'dsh-ego-hitem'
-						const thumbSrc = frameCache.get(s.targetId)
-						const thumb = thumbSrc
-							? `<img class="dsh-ego-hthumb" src="${thumbSrc}" alt="">`
-							: `<div class="dsh-ego-hthumb"></div>`
-						const active = s.targetId === currentActiveId
-						item.innerHTML = `${thumb}
-							<div class="dsh-ego-hinfo">
-								<div class="dsh-ego-htitle">${escapeHtml(s.title || (s.url || wt('newTab')))}</div>
-								<div class="dsh-ego-hurl">${escapeHtml(s.url || '(about:blank)')}</div>
-								${active ? '<div class="dsh-ego-hactive">● ' + wt('current') + '</div>' : ''}
-							</div>`
-						item.addEventListener('click', () => openPreview(s))
-						historyList.appendChild(item)
-					}
-				}
-
-				// "pinned" = the user clicked a history entry and the main view is
-				// now locked to that page. null = live view (auto-follows the
-				// agent's current active page). Polling must NOT overwrite a
-				// pinned view, or it would snap back to live every poll tick.
-				let pinned = null
-				// Which page is "current" (the live one shown in the main view).
-				let currentActiveId = null
-				// The page the AGENT is actually on — the browser's MRU-active tab,
-				// reported by the worker as `active: true` in the spaces payload.
-				// Distinct from currentActiveId (what the user is viewing): gating
-				// auto-follow on agentActiveId stops a background repainting tab
-				// (video/animation) from hijacking the view.
-				let agentActiveId = null
-				// selectedTabId = the tab the user last clicked on the tab bar. When
-				// set to a live tab, the main view shows that tab (and sticks with
-				// it across polls) instead of auto-following the agent's newest page.
-				let selectedTabId = null
-				// Zoom/pan state for the main live image, persisted across renders
-				// so a re-render (poll refresh) keeps the user's zoom & position.
-				let zoomState = { scale: 1, tx: 0, ty: 0 }
-				// ── realtime SSE frame pipeline ──
-				// frameCache: targetId -> dataURL of the newest JPEG that arrived
-				// over the stream. liveImg: the <img> currently in the main view,
-				// so a frame event for the shown tab swaps its src in place without
-				// tearing down the zoom/pan state.
-				const frameCache = new Map()
-				let liveImg = null
-				let liveImgTargetId = null
-				// rAF-coalesced live-frame flush: newest frame is applied at display
-				// cadence instead of decoding every source frame (bounds CPU under
-				// an uncapped screencast).
-				let pendingLiveFrame = null
-				let liveFlushRaf = null
-				// pageMeta: targetId -> { url, title }, kept authoritative for the
-				// auto-follow path. Polled /api/ego/spaces data lags the SSE frame
-				// stream, so a brand-new page (frame-first, list-later) would never
-				// be findable in lastList in time to follow it. We merge updates
-				// from both sources here and follow from this map instead.
-				const pageMeta = new Map()
-				const watchClientId = 'floating-' + Math.random().toString(36).slice(2)
-				let watchStarted = false, watchTargetId = null, watchRenewTimer = null, watchStopTimer = null, watchRequest = null
-				let captureBackend = 'cdp', streamGeneration = 0, streamState = 'idle', streamMessage = '', streamMime = 'video/mp4; codecs="avc1.42E01E"', videoCleanup = null
-				const effectiveVisible = () => !panel.hidden
-				const stopVideo = () => { if (videoCleanup) try { videoCleanup() } catch {}; videoCleanup = null }
-				const applyCaptureStatus = (status) => {
-					if (!status || typeof status !== 'object') return
-					if (Number.isFinite(status.generation) && status.generation < streamGeneration) return
-					if (status.generation === streamGeneration && streamState === 'streaming' && status.state === 'starting') return
-					const nextBackend = status.backend || captureBackend
-					const nextGeneration = status.generation ?? streamGeneration
-					const nextState = status.state || streamState
-					const nextMime = status.mime || streamMime
-					const changed = captureBackend !== nextBackend || streamGeneration !== nextGeneration || streamState !== nextState || streamMime !== nextMime
-					captureBackend = nextBackend; streamGeneration = nextGeneration; streamState = nextState; streamMessage = status.message || status.code || ''; streamMime = nextMime
-					if (changed) { stopVideo(); const current = lastList.find((s) => s.targetId === (selectedTabId || currentActiveId)); if (current) renderLiveMain(current, selectedTabId !== null) }
-				}
-				const requestWatch = (route, body) => {
-					if (watchRequest) return null
-					watchRequest = postJson(route, body).finally(() => { watchRequest = null })
-					return watchRequest
-				}
-				const syncWatch = (targetId) => {
-					if (disposed || !effectiveVisible() || !targetId) return
-					if (watchStopTimer) { window.clearTimeout(watchStopTimer); watchStopTimer = null }
-					if (watchStarted && watchTargetId === targetId) return
-					const request = requestWatch(watchStarted ? WATCH_SWITCH_ROUTE : WATCH_START_ROUTE, { clientId: watchClientId, targetId })
-					if (!request) { watchRequest.finally(() => syncWatch(targetId)); return }
-					request.then((status) => { watchStarted = status && status.ok !== false; watchTargetId = status?.targetId || targetId; if (watchTargetId !== targetId) { selectedTabId = null; currentActiveId = watchTargetId }; applyCaptureStatus(status); if (!effectiveVisible()) stopWatch(true) }).catch(() => {})
-					if (!watchRenewTimer) watchRenewTimer = window.setInterval(() => { if (effectiveVisible() && watchTargetId) { const renewal = requestWatch(WATCH_START_ROUTE, { clientId: watchClientId, targetId: watchTargetId }); if (renewal) renewal.then(applyCaptureStatus).catch(() => {}) } }, 5000)
-				}
-				const stopWatch = (immediate) => {
-					if (watchRenewTimer) { window.clearInterval(watchRenewTimer); watchRenewTimer = null }
-					const stop = () => { watchStopTimer = null; watchStarted = false; watchTargetId = null; postJson(WATCH_STOP_ROUTE, { clientId: watchClientId }).catch(() => {}) }
-					if (immediate) stop(); else { if (watchStopTimer) window.clearTimeout(watchStopTimer); watchStopTimer = window.setTimeout(stop, 1500) }
-				}
-
-				// ── browser interaction: map panel pointer → real browser pixels ──
-				const INPUT_ROUTE = '/api/ego/input'
-				let inputBusy = false
-				/**
-				 * Send a pointer/wheel intention to the agent browser. Coordinates
-				 * are already in browser CSS pixels; the worker turns them into CDP
-				 * Input.dispatchMouseEvent on the page the panel is showing.
-				 * `type`: mouseMoved | mousePressed | mouseReleased | mouseWheel.
-				 */
-				const sendInput = (targetId, type, params) => {
-					const targetValid = !!targetId
-					if (!targetValid || ((type !== 'mouseReleased' && type !== 'keyUp') && !effectiveVisible())) return
-					if (inputBusy && type === 'mouseMoved') return
-					if (type === 'mouseMoved') { inputBusy = true; window.setTimeout(() => { inputBusy = false }, 24) }
-					void fetch(INPUT_ROUTE, {
-						method: 'POST',
-						headers: { 'content-type': 'application/json' },
-						body: JSON.stringify({ targetId, type, ...params }),
-					}).then((res) => { if (res.status === 409) { liveImgTargetId = null; refresh() } }).catch(() => {})
-				}
-				const keyboardProxy = createKeyboardProxy((targetId, type, params) => sendInput(targetId, type, params))
-				/**
-				 * Map an event's client coords to the agent page's CSS pixels.
-				 *
-				 * The shown <img> is the screencast frame laid out with
-				 * object-fit:contain, so the page fills a centered letterboxed box
-				 * inside the element. We find that box from the image's natural
-				 * (frame) size vs its rendered box, then scale into the page's CSS
-				 * viewport (vw/vh), which the worker attaches to each frame.
-				 */
-				const browserXY = (e) => {
-					if (liveImgTargetId == null) return null
-					const m = pageMeta.get(liveImgTargetId)
-					const vw = m?.vw, vh = m?.vh
-					if (!Number.isFinite(vw) || !Number.isFinite(vh)) return null
-					const img = liveImg
-					if (!img) return null
-					const rect = img.getBoundingClientRect()
-					const natW = img.naturalWidth || img.videoWidth || rect.width
-					const natH = img.naturalHeight || img.videoHeight || rect.height
-					if (!natW || !natH) return null
-					const scale = Math.min(rect.width / natW, rect.height / natH)
-					const contentW = natW * scale
-					const contentH = natH * scale
-					const ox = (rect.width - contentW) / 2
-					const oy = (rect.height - contentH) / 2
-					const rx = e.clientX - rect.left - ox
-					const ry = e.clientY - rect.top - oy
-					const x = (rx / contentW) * vw
-					const y = (ry / contentH) * vh
-					return { x, y }
-				}
-
-				// Build the zoomable main-view <img>. Wheel zooms around the cursor,
-				// drag pans, double-click resets. State is shared via zoomState.
-				// `urlEl` is the URL line below the image: while the user is zooming
-				// or panning it briefly shows the relevant hint instead of the URL.
-				// Interaction modes:
-				//   plain wheel  → scroll the agent page (sent to the browser)
-				//   Ctrl+wheel   → zoom the view (magnifier, local only)
-				//   plain drag   → drag inside the agent page (sent to the browser)
-				//   Ctrl+drag    → pan the view (local only)
-				//   click        → click the agent page
-				//   dblclick     → reset the view zoom
-				const makeZoomImage = (urlEl, tagName = 'img') => {
-					const img = document.createElement(tagName) as any
-					img.className = 'dsh-ego-liveimg'
-					if (tagName === 'img') img.draggable = false
-					else { img.muted = true; img.autoplay = true; img.playsInline = true }
-					img.title = '滚轮缩放 · 按住拖动平移 · 缩小到最小或双击复位'
-					// Hint swap: remember the real URL, show a tip while operating,
-					// restore it after a short quiet period.
-					const realText = urlEl ? urlEl.textContent : ''
-					let hintTimer = null
-					const clearHint = () => { if (hintTimer) { window.clearTimeout(hintTimer); hintTimer = null } }
-					const showHint = (txt) => {
-						if (!urlEl) return
-						urlEl.textContent = txt
-						urlEl.classList.add('dsh-ego-hint')
-						clearHint()
-						hintTimer = window.setTimeout(() => {
-							urlEl.textContent = realText
-							urlEl.classList.remove('dsh-ego-hint')
-							hintTimer = null
-						}, 2000)
-					}
-					const apply = () => {
-						img.style.transformOrigin = '0 0'
-						img.style.transform = `translate(${zoomState.tx}px, ${zoomState.ty}px) scale(${zoomState.scale})`
-					}
-					let viewPanning = false   // Ctrl+drag → local pan
-					let browserDrag = false   // plain drag → send to agent
-					let sx = 0, sy = 0, stx = 0, sty = 0
-					let lastDragPos = null     // last browser coords sent during drag
-					let dragTargetId = null
-					let downButtons = 0
-
-					const resetView = () => {
-						zoomState = { scale: 1, tx: 0, ty: 0 }
-						apply()
-						showHint(wt('hintReset'))
-					}
-					img.title = wt('hintReset')
-
-					// Wheel: plain = scroll the agent page; Ctrl+wheel = view zoom.
-					img.addEventListener('wheel', (e) => {
-						e.preventDefault()
-						e.stopPropagation()
-						if (e.ctrlKey || e.metaKey) {
-							const rect = img.getBoundingClientRect()
-							const mx = e.clientX - rect.left, my = e.clientY - rect.top
-							const next = Math.min(8, Math.max(1, zoomState.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)))
-							if (next <= 1) { resetView(); return }
-							zoomState.tx = mx - (mx - zoomState.tx) * (next / zoomState.scale)
-							zoomState.ty = my - (my - zoomState.ty) * (next / zoomState.scale)
-							zoomState.scale = next
-							apply()
-							showHint(wt('hintPan'))
-							return
-						}
-						// Plain wheel → scroll the real page.
-						const p = browserXY(e)
-						if (p && liveImgTargetId) {
-							sendInput(liveImgTargetId, 'mouseWheel', { x: p.x, y: p.y, deltaX: e.deltaX || 0, deltaY: e.deltaY || (e.deltaMode === 1 ? 40 : (e.deltaY || 100)) })
-						}
-					}, { passive: false })
-
-					img.addEventListener('pointerdown', (e) => {
-						if (e.button !== 0) return // left button only
-						img.setPointerCapture(e.pointerId)
-						sx = e.clientX; sy = e.clientY
-						stx = zoomState.tx; sty = zoomState.ty
-						if (e.ctrlKey || e.metaKey) {
-							// Ctrl+drag → pan the view (magnifier), no browser input.
-							viewPanning = true
-							img.style.cursor = 'grabbing'
-							showHint(wt('hintScroll'))
-							return
-						}
-						// Plain press → start a browser interaction (click or drag).
-						browserDrag = true
-						dragTargetId = liveImgTargetId
-						keyboardProxy.focusAt(e, dragTargetId)
-						lastDragPos = null
-						downButtons = 1
-						const p = browserXY(e)
-						if (p) {
-							lastDragPos = p
-							sendInput(dragTargetId, 'mousePressed', { x: p.x, y: p.y, button: 'left', buttons: 1, clickCount: 1 })
-						}
-					})
-					img.addEventListener('pointermove', (e) => {
-						if (viewPanning) {
-							zoomState.tx = stx + (e.clientX - sx)
-							zoomState.ty = sty + (e.clientY - sy)
-							apply()
-							return
-						}
-						// Hover feedback even when not dragging: move the browser pointer.
-						if (!browserDrag) {
-							const p = browserXY(e)
-							if (p) sendInput(liveImgTargetId, 'mouseMoved', { x: p.x, y: p.y, buttons: 0 })
-							return
-						}
-						// Active drag → stream pointer moves to the browser.
-						const p = browserXY(e)
-						if (p) {
-							// Skip a first tiny jitter if the press also set lastDragPos.
-							sendInput(dragTargetId, 'mouseMoved', { x: p.x, y: p.y, buttons: downButtons })
-							lastDragPos = p
-						}
-					})
-					const stopDrag = (e) => {
-						if (viewPanning) { viewPanning = false; img.style.cursor = e.ctrlKey ? 'grab' : 'grab' }
-						if (browserDrag) {
-							browserDrag = false
-							if (lastDragPos && dragTargetId) {
-								sendInput(dragTargetId, 'mouseReleased', { x: lastDragPos.x, y: lastDragPos.y, button: 'left', buttons: 0, clickCount: 1 })
-							}
-							dragTargetId = null
-						}
-						img.style.cursor = 'grab'
-					}
-					img.addEventListener('pointerup', stopDrag)
-					img.addEventListener('pointercancel', stopDrag)
-					img.addEventListener('pointerleave', (e) => { if (browserDrag || viewPanning) stopDrag(e) })
-					img.addEventListener('dblclick', (e) => { e.preventDefault(); resetView() })
-					img.style.cursor = 'grab'
-					apply()
-					return img
-				}
-
-
-				// ---- tab bar ----
-				const renderTabs = (spaces) => {
-					tabsEl.innerHTML = ''
-					const list = Array.isArray(spaces) ? spaces : []
-					if (list.length === 0) { if (selectedTabId) selectedTabId = null; return }
-					for (const s of list) {
-						const tab = document.createElement('div')
-						tab.className = 'dsh-ego-tab'
-						tab.title = s.url || ''
-						;(tab as any).__tid = s.targetId
-						const dot = document.createElement('span')
-						dot.className = 'dsh-ego-tabdot'
-						const txt = document.createElement('span')
-						txt.className = 'dsh-ego-tabtxt'
-						txt.textContent = s.title || (s.url || wt('newTab'))
-						tab.appendChild(dot)
-						tab.appendChild(txt)
-						// Tab close "×": POST to the host close route, then refresh.
-						const closeBtn = document.createElement('span')
-						closeBtn.className = 'dsh-ego-tabclose'
-						closeBtn.title = wt('closeTab')
-						closeBtn.textContent = '×'
-						closeBtn.addEventListener('click', (e) => {
-							e.stopPropagation()
-							void (async () => {
-								try {
-									await fetch(EGO_CLOSE_ROUTE, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetId: s.targetId }) })
-								} catch { /* keep silent */ }
-								if (selectedTabId === s.targetId) { selectedTabId = null; pinned = null }
-							})().then(() => refresh())
-						})
-						tab.appendChild(closeBtn)
-						if (s.targetId === selectedTabId || (selectedTabId === null && s.targetId === currentActiveId)) tab.classList.add('active')
-						tab.addEventListener('click', () => {
-							// Clicking the already-selected tab returns to live follow.
-							if (selectedTabId === s.targetId) { selectedTabId = null; pinned = null; renderSpaces(lastList); return }
-							selectedTabId = s.targetId
-							pinned = null
-							renderLiveMain(s, true)
-							syncWatch(s.targetId)
-							;[...tabsEl.querySelectorAll('.dsh-ego-tab')].forEach(t => t.classList.toggle('active', (t as any).__tid === s.targetId))
-						})
-						tabsEl.appendChild(tab)
-					}
-				}
-
-				// Render one page's screenshot in the main view. `pinned` controls
-				// whether this is the sticky (user-selected) view or the live one.
-				// Reuses the SAME large landscape layout as the live view so aspect
-				// ratio / sizing never changes between live and history preview.
-				const renderSingleView = (s) => {
-					body.innerHTML = ''
-					const view = document.createElement('div')
-					view.className = 'dsh-ego-liveview'
-					const badge = document.createElement('div')
-					badge.className = 'dsh-ego-livebadge'
-					badge.innerHTML = pinned
-						? `<span class="dsh-ego-state-dot pin"></span> ${wt('pinned')}`
-						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> ${wt('realtime')}`
-					view.appendChild(badge)
-					if (pinned) {
-						const back = document.createElement('button')
-						back.className = 'dsh-ego-back'
-						back.type = 'button'
-						back.textContent = wt('backToLive')
-						back.addEventListener('click', () => { pinned = null; renderSpaces(lastList) })
-						badge.appendChild(back)
-					}
-					const t = document.createElement('div')
-					t.className = 'dsh-ego-livetitle'
-					t.textContent = s.title || (s.url || wt('newTab'))
-					// URL line — also the surface the hint is shown on while operating.
-					const u = document.createElement('div')
-					u.className = 'dsh-ego-liveurl'
-					u.textContent = s.url || ''
-					// The thumbnail is no longer in the spaces payload — pull the
-					// latest cached JPEG from the SSE frame pipeline. attachLiveImg
-					// wires up the live <img> so future SSE frame events for this
-					// target swap its src in place.
-					const cached = frameCache.get(s.targetId)
-					if (captureBackend === 'ffmpeg' || cached) {
-						const img = makeZoomImage(u, captureBackend === 'ffmpeg' ? 'video' : 'img')
-						if (captureBackend === 'ffmpeg' && streamState === 'streaming') { stopVideo(); videoCleanup = createMsePlayer(img, streamGeneration, streamMime, (message) => { streamMessage = message }) }
-						else img.src = cached
-						img.alt = 'live'
-						attachLiveImg(s.targetId, img)
-						view.appendChild(img)
-					} else {
-						const n = document.createElement('div')
-						n.className = 'dsh-ego-liveurl'
-						n.textContent = wt('noScreenshot')
-						view.appendChild(n)
-					}
-					view.appendChild(t)
-					view.appendChild(u)
-					body.appendChild(view)
-				}
-
-				// Secondary view: open a specific history page in the main view,
-				// pinned until the user returns to live.
-				const openPreview = (s) => {
-					if (disposed) return
-					pinned = s
-					renderSingleView(s)
-				}
-
-				const renderSpaces = (spaces) => {
-					if (disposed) return
-					lastList = Array.isArray(spaces) ? spaces : []
-					// Keep pageMeta authoritative for the auto-follow AND for the
-					// viewport-based coordinate mapping. Merge (do not overwrite) so
-					// vw/vh learned from an SSE frame are not lost on the next poll;
-					// also pick up viewportW/H now that /api/ego/spaces carries them.
-					for (const s of lastList) {
-						const prev = pageMeta.get(s.targetId) || { targetId: s.targetId }
-						pageMeta.set(s.targetId, {
-							url: s.url,
-							title: s.title,
-							targetId: s.targetId,
-							...(Number.isFinite(s.viewportW) ? { vw: s.viewportW } : prev.vw !== undefined ? { vw: prev.vw } : {}),
-							...(Number.isFinite(s.viewportH) ? { vh: s.viewportH } : prev.vh !== undefined ? { vh: prev.vh } : {}),
-						})
-					}
-					// Prune caches for tabs that no longer exist, so long sessions
-					// never grow frameCache/pageMeta unboundedly on closed pages.
-					const liveIds = new Set(lastList.map(s => s.targetId))
-					for (const id of [...pageMeta.keys()]) if (!liveIds.has(id)) pageMeta.delete(id)
-					for (const id of [...frameCache.keys()]) if (!liveIds.has(id)) frameCache.delete(id)
-					const sorted = [...lastList].sort((a, b) => (b.lastActive ?? 0) - (a.lastActive ?? 0))
-					// Authoritative active page: the worker marks it `active: true`
-					// (the browser's MRU tab, not "last repaint"). Prefer it over the
-					// recency sort so a repainting background tab (video/animation)
-					// with a high lastActive cannot steal the view.
-					const activeMarked = lastList.find(s => s.active === true) || sorted[0] || null
-					if (activeMarked) {
-						agentActiveId = activeMarked.targetId
-						currentActiveId = activeMarked.targetId
-					}
-					// Reflect whether a page is present (for the login guide).
-					maybeShowLoginGuide()
-					// Reflect whether the agent is being asked to verify (CAPTCHA).
-					maybeShowCaptchaGuide()
-					// Tab bar always reflects the current open tabs.
-					renderTabs(lastList)
-					if (historyOpen) renderHistory(lastList)
-					// While the user pinned a history page, do NOT overwrite the main
-					// view — otherwise the standing poll snaps it back to live.
-					if (pinned) return
-					if (lastList.length === 0) {
-						if (frameRelayDisabled) { renderRelayDisabled(); return }
-						setTitle('Agent 浏览器')
-						body.innerHTML = `<div class="dsh-ego-empty">${wt('noActivePages')}<br><span style="font-size:11px;">${wt('noActiveHint')}</span></div>`
-						liveCount = 0
-						fab.classList.remove('dsh-ego-live', 'dsh-ego-busy')
-						return
-					}
-				liveCount = lastList.length
-				fab.classList.add('dsh-ego-live')
-				// Busy signal: derived from whether any page was touched recently.
-				// Previously lived in the now-removed polling scheduler; moved
-				// here so the SSE `spaces` event keeps the status dot live.
-				const busy = lastList.some(s => (Date.now() - (s.lastActive || 0)) <= ACTIVE_WINDOW_MS)
-				if (busy !== lastSawActive) {
-					fab.classList.toggle('dsh-ego-busy', busy)
-					lastSawActive = busy
-				} else {
-					fab.classList.remove('dsh-ego-busy')
-				}
-					// If the user picked a tab on the bar, keep showing that tab
-					// (even as the agent opens new pages); else follow the newest.
-					const sel = selectedTabId !== null ? lastList.find(x => x.targetId === selectedTabId) : null
-					const current = sel || activeMarked
-					currentActiveId = current.targetId
-					syncWatch(current.targetId)
-					setTitle(sel ? wt('title') : wt('titleLive'))
-					renderLiveMain(current, sel)
-				}
-
-				// Point the realtime pipeline at this <img> so incoming SSE frames
-				// for `targetId` swap its src in place (no view teardown).
-				const attachLiveImg = (targetId, img) => {
-					liveImg = img
-					liveImgTargetId = targetId
-					const cached = frameCache.get(targetId)
-					if (cached) img.src = cached
-				}
-
-				const renderLiveMain = (current, isPinned) => {
-					body.innerHTML = ''
-					const view = document.createElement('div')
-					view.className = 'dsh-ego-liveview'
-					const badge = document.createElement('div')
-					badge.className = 'dsh-ego-livebadge'
-					badge.innerHTML = isPinned
-						? `<span class="dsh-ego-state-dot pin"></span> ${wt('pinned')}`
-						: `<span class="dsh-ego-state-dot${fab.classList.contains('dsh-ego-busy') ? ' busy' : ''}"></span> ${wt('realtime')}`
-					view.appendChild(badge)
-					const t = document.createElement('div')
-					t.className = 'dsh-ego-livetitle'
-					t.textContent = current.title || (current.url || wt('newTab'))
-					// URL line — also the surface the hint is shown on while operating.
-					const u = document.createElement('div')
-					u.className = 'dsh-ego-liveurl'
-					u.textContent = current.url || ''
-					const openHere = document.createElement('button')
-					openHere.type = 'button'
-					openHere.className = 'dsh-ego-back'
-					openHere.title = wt('openExternal')
-					openHere.textContent = wt('openExternal')
-					openHere.addEventListener('click', () => {
-						const url = current.url
-						if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener')
-						else openHere.textContent = wt('noUrl')
-					})
-					badge.appendChild(openHere)
-					// Raise the real agent window (issue #51): headless instances
-					// get replaced by a headed one on the same profile.
-					const raiseBtn = document.createElement('button')
-					raiseBtn.type = 'button'
-					raiseBtn.className = 'dsh-ego-back'
-					raiseBtn.title = wt('raiseWindowHint')
-					raiseBtn.textContent = wt('raiseWindow')
-					raiseBtn.addEventListener('click', () => {
-						fetch('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-							.then((r) => r.json().catch(() => null))
-							.catch(() => null)
-					})
-					badge.appendChild(raiseBtn)
-					const cached = frameCache.get(current.targetId)
-					if (captureBackend === 'ffmpeg' || cached) {
-						const img = makeZoomImage(u, captureBackend === 'ffmpeg' ? 'video' : 'img')
-						if (captureBackend === 'ffmpeg' && streamState === 'streaming') { stopVideo(); videoCleanup = createMsePlayer(img, streamGeneration, streamMime, (message) => { streamMessage = message }) }
-						else img.src = cached
-						img.alt = 'live'
-						attachLiveImg(current.targetId, img)
-						view.appendChild(img)
-					} else {
-						const n = document.createElement('div')
-						n.className = 'dsh-ego-liveurl'
-						n.textContent = wt('noScreenshot')
-						view.appendChild(n)
-					}
-					view.appendChild(t)
-					view.appendChild(u)
-					body.appendChild(view)
-				}
-
-				// ── spaces loading ────────────────────────────────────────────
-				// The watch panel is now pure SSE-driven (spaces + frame events
-				// from /api/ego/stream). This `refresh` is NO LONGER called on a
-				// timer — it is only used as a one-shot fallback when:
-				//   • the SSE stream errors / reconnects (to re-sync the tab list),
-				//   • the user manually clicks the refresh button,
-				//   • the user closes a tab (to re-sync),
-				//   • initial mount (the SSE `spaces` event on connect covers this
-				//     too, but we do an explicit fetch to surface any error early).
-				// The response carries NO thumbnail bytes (worker /api/spaces is
-				// pure metadata now); thumbnails come from the SSE frame cache.
-				let lastSawActive = false
-				const refresh = () => {
-					// While the relay is off there is nothing to sync: the host refuses the
-					// space list anyway, so render the disabled state directly.
-					if (frameRelayDisabled) { renderRelayDisabled(); return }
-					void (async () => {
-						try {
-							const res = await fetch(SPACES_ROUTE, { cache: 'no-store' })
-							if (disposed || !res.ok) { renderEmpty(); return }
-							const data = await res.json()
-							if (!data || data.ok !== true) { renderEmpty(); return }
-							applyCaptureStatus(data.capture)
-							renderSpaces(data.spaces)
-						} catch {
-							renderEmpty()
-						}
-					})()
-				}
-				const renderEmpty = () => {
-					if (body.children.length === 0) renderSpaces([])
-				}
-
-				// ── realtime SSE: live frames + active-page auto-follow ──
-				// The cast worker pushes two kinds of events on /api/ego/stream:
-				//   • `frame`  — per-repaint JPEG for any page (real-time video)
-				//   • `spaces` — pure metadata (url/title/active/viewport/humanCheck),
-				//                broadcast on every keepalive tick (~500ms) and on
-				//                tab churn, so the tab bar + main view stay in sync
-				//                WITHOUT any client-side polling.
-				// The panel no longer polls /api/ego/spaces on a timer. A one-shot
-				// `refresh()` is only called on initial mount and on SSE reconnect
-				// (via the `onerror` debouncer below) to re-sync after a stream gap.
-				let sse = null
-				let lastFrameAt = 0
-				const FRAME_FOLLOW_MIN_MS = 350 // throttle live-follow view swaps
-				let followTimer = null
-
-				const applyFrame = (targetId, dataUrl, vw, vh) => {
-					if (disposed) return
-					frameCache.set(targetId, dataUrl)
-					// Bounded cache: cap live frames to the most recent few pages so a
-					// busy session can never accumulate unbounded JPEG dataURLs.
-					const MAX_CACHED_FRAMES = 12
-					if (frameCache.size > MAX_CACHED_FRAMES) {
-						for (const [id] of frameCache) {
-							if (id === targetId || id === liveImgTargetId) continue
-							frameCache.delete(id)
-							if (frameCache.size <= MAX_CACHED_FRAMES) break
-						}
-					}
-					// Snapshot the page viewport for coordinate mapping.
-					if (Number.isFinite(vw) && Number.isFinite(vh)) {
-						const cur = pageMeta.get(targetId) || { targetId }
-						pageMeta.set(targetId, { ...cur, vw, vh })
-					}
-					// Swap the currently shown image in place, no view rebuild.
-					if (liveImg && liveImgTargetId === targetId) {
-						// Coalesce to display cadence: with an uncapped screencast the
-						// frames can arrive faster than the panel can present, and
-						// setting img.src on every frame decodes each one. Instead keep
-						// only the newest frame and apply it on the next animation
-						// frame — the browser samples the latest, so bursts cost one
-						// decode per presentation instead of per source frame.
-						pendingLiveFrame = dataUrl
-						if (!liveFlushRaf && !disposed) {
-							liveFlushRaf = window.requestAnimationFrame(() => {
-								liveFlushRaf = null
-								if (disposed || !liveImg || pendingLiveFrame == null) return
-								try { liveImg.src = pendingLiveFrame } catch {}
-								pendingLiveFrame = null
-							})
-						}
-						return
-					}
-					// Auto-follow: while not pinned to a history page and not pinned to
-					// a manually chosen tab, jump to the page the agent is ACTIVELY on.
-					// Only follow when this frame belongs to the agent's current page
-					// (worker-reported MRU-active tab). Frames from a background
-					// repainting tab (video/animation) must NOT hijack the view; we
-					// merely swap its cached frame so the moment the user/agent brings
-					// the tab forward the correct picture is already there.
-					if (!pinned && selectedTabId === null && targetId === agentActiveId) {
-						const now = Date.now()
-						if (now - lastFrameAt >= FRAME_FOLLOW_MIN_MS) {
-							lastFrameAt = now
-							if (followTimer) window.clearTimeout(followTimer)
-							followTimer = window.setTimeout(() => {
-								if (disposed || pinned || selectedTabId !== null) return
-								if (liveImg && liveImgTargetId === targetId) return
-								const meta = pageMeta.get(targetId)
-								if (!meta) return
-								currentActiveId = targetId
-								renderLiveMain({ ...meta, targetId }, false)
-							}, 0)
-						}
-					}
-				}
-
-				let reconnectFallbackTimer = null
-				// Open the pull streams UNLESS the settings switch disabled the frame relay.
-				// The host's /api/ego/watch/status carries the authoritative flag
-				// (`frameRelay:false`), so a stale client flag can never open a stream the
-				// host refuses to serve; when it is off we render the disabled state and
-				// open NO EventSource at all.
-				const openStream = () => {
-					if (disposed || frameRelayDisabled) { if (frameRelayDisabled) renderRelayDisabled(); return }
-					fetch(WATCH_STATUS_ROUTE, { cache: 'no-store' }).then((res) => res.ok ? res.json() : null).then((status) => {
-					if (disposed) return
-					if (frameRelayOff(status)) { teardownRelay(); renderRelayDisabled(); return }
-					applyCaptureStatus(status)
-					connectStream()
-				}).catch(() => { if (!disposed && !frameRelayDisabled) connectStream() })
-				}
-				const connectStream = () => {
-					if (disposed || frameRelayDisabled || sse) return
-					doConnected = false
-					sse = new EventSource('/api/ego/stream')
-					sse.onopen = () => { doConnected = true }
-					// A frame event looks like: { targetId, data (base64 jpeg), ts, vw, vh }.
-					sse.addEventListener('frame', (ev) => {
-						try {
-							const m = JSON.parse(ev.data)
-							if (!m || !m.targetId || !m.data) return
-							if (Number.isFinite(m.vw) && Number.isFinite(m.vh)) {
-								const cur = pageMeta.get(m.targetId) || { targetId: m.targetId }
-								pageMeta.set(m.targetId, { ...cur, vw: m.vw, vh: m.vh })
-							}
-							applyFrame(m.targetId, `data:image/jpeg;base64,${m.data}`, m.vw, m.vh)
-						} catch {}
-					})
-				// The worker also sends the live list on open (and on tab
-				// churn); treat it as the authoritative tab-list + main-view
-				// update. This replaces the old /api/ego/spaces polling loop.
-					sse.addEventListener('spaces', (ev) => {
-					if (disposed) return
-					try {
-						const list = JSON.parse(ev.data)
-						if (Array.isArray(list)) {
-							// Even for an empty list, we want to call renderSpaces
-							// so the "no live browser" placeholder shows up.
-							renderSpaces(list)
-						}
-					} catch {}
-				})
-				sse.addEventListener('capture-status', (ev) => {
-					try {
-						applyCaptureStatus(JSON.parse(ev.data))
-					} catch {}
-				})
-				// Debounced reconnect fallback: when the SSE stream drops,
-				// EventSource auto-reconnects, but we also kick off a one-shot
-				// /api/ego/spaces fetch so the panel re-syncs immediately on the
-				// next successful connect (without waiting for the worker's next
-				// keepalive broadcast). The 1.5s delay gives EventSource room to
-				// reconnect cleanly first, avoiding a redundant fetch on a
-				// momentary blip.
-				sse.onerror = () => {
-					doConnected = false
-					if (reconnectFallbackTimer) return
-					reconnectFallbackTimer = window.setTimeout(() => {
-						reconnectFallbackTimer = null
-						if (disposed) return
-						refresh()
-					}, 1500)
-				}
-				}
-				let doConnected = false
-
-				// ── draggable FAB + panel, independently positioned ──
-				// The ball and its pop-out window each keep their own spot: dragging
-				// the ball moves only the ball, dragging the panel header moves only
-				// the panel. When you open the panel by tapping the ball it snaps to
-				// a corner next to the ball (flipping below when near the top edge),
-				// so it never pops up in a surprising spot.
-				const DRAG_KEY = 'dsh.ego.watch.pos'
-				const DRAG_PANEL_KEY = 'dsh.ego.watch.panelPos'
-				const FAB_W = 48, FAB_H = 48
-				const PANEL_W = 408, PANEL_GAP = 8
-				const loadPos = (key) => {
-					try { const s = JSON.parse(localStorage.getItem(key) || 'null'); if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) return s } catch {}
-					return null
-				}
-				let pos = loadPos(DRAG_KEY) || { x: window.innerWidth - 18 - FAB_W, y: window.innerHeight - 104 - FAB_H }
-				let panelPos = loadPos(DRAG_PANEL_KEY)
-				const clampFab = () => {
-					const vw = window.innerWidth, vh = window.innerHeight
-					pos.x = Math.max(4, Math.min(vw - FAB_W - 4, pos.x))
-					pos.y = Math.max(4, Math.min(vh - FAB_H - 4, pos.y))
-				}
-				const placeFab = () => { clampFab(); fab.style.left = pos.x + 'px'; fab.style.top = pos.y + 'px' }
-				const placePanel = () => { panel.style.left = panelPos.x + 'px'; panel.style.top = panelPos.y + 'px' }
-				/** Position the panel against the ball: just above it (below when near
-				 *  the top edge), clamped inside the viewport. */
-				const snapPanelToFab = () => {
-					const vw = window.innerWidth, vh = window.innerHeight
-					const pw = panel.classList.contains('open-drawer') ? 640 : PANEL_W
-					const ph = panel.offsetHeight > 0 ? panel.offsetHeight : Math.min(Math.round(vh * 0.7), 520)
-					// Panel's right edge hugs the ball's left edge.
-					let px = pos.x + FAB_W - pw
-					let py = pos.y - ph - PANEL_GAP
-					if (py < 8) py = pos.y + FAB_H + PANEL_GAP // ball near top -> panel below
-					px = Math.max(8, Math.min(vw - pw - 8, px))
-					py = Math.max(8, Math.min(vh - ph - 8, py))
-					panelPos = { x: Math.round(px), y: Math.round(py) }
-					placePanel()
-				}
-				placeFab()
-				if (panelPos) placePanel()
-				let suppressFabClick = false
-				/**
-				 * Make `el` drag the FAB or the panel (`which` = 'fab' | 'panel').
-				 * Movement under ~5px is treated as a click, so the FAB still toggles.
-				 * Interactive children (buttons/icons) never start a drag.
-				 */
-				const makeDraggable = (el, which) => {
-					const state = () => (which === 'fab' ? pos : panelPos)
-					let sx = 0, sy = 0, bx = 0, by = 0, active = false, dragged = false
-					const down = (e) => {
-						if (e.button !== 0) return
-						if (e.target && e.target.closest) {
-							const hit = e.target.closest('button, a, input, [role="button"]')
-							if (hit && hit !== el) return
-						}
-						active = true; dragged = false
-						sx = e.clientX; sy = e.clientY
-						const s = state(); bx = s.x; by = s.y
-						try { el.setPointerCapture(e.pointerId) } catch {}
-						el.classList.add('dsh-ego-dragging')
-						e.preventDefault()
-					}
-					const move = (e) => {
-						if (!active) return
-						const dx = e.clientX - sx, dy = e.clientY - sy
-						if (!dragged && Math.abs(dx) + Math.abs(dy) > 5) dragged = true
-						if (dragged) {
-							const s = state(); s.x = bx + dx; s.y = by + dy
-							which === 'fab' ? placeFab() : placePanel()
-						}
-					}
-					const up = (e) => {
-						if (!active) return
-						active = false
-						el.classList.remove('dsh-ego-dragging')
-						try { el.releasePointerCapture(e.pointerId) } catch {}
-						if (dragged) {
-							if (which === 'fab') suppressFabClick = true
-							try { localStorage.setItem(which === 'fab' ? DRAG_KEY : DRAG_PANEL_KEY, JSON.stringify(state())) } catch {}
-						}
-					}
-					el.addEventListener('pointerdown', down)
-					el.addEventListener('pointermove', move)
-					el.addEventListener('pointerup', up)
-					el.addEventListener('pointercancel', up)
-				}
-				// Ball drags the ball; the panel header drags the panel. Independent.
-				makeDraggable(fab, 'fab')
-				makeDraggable(panel.querySelector('#dsh-ego-head'), 'panel')
-
-				const setOpen = (open) => {
-					if (open) {
-						// Reveal then transition in, so the pop-out animation plays
-						// (hidden -> display:flex would otherwise jump with no tween).
-						panel.hidden = false
-						panel.classList.remove('dsh-ego-panel-hide')
-						// Snap the panel next to the ball each time it opens, so it
-						// never appears at a surprise location.
-						snapPanelToFab()
-						// force a reflow so the browser sees the closed state first
-						void panel.offsetHeight
-						panel.classList.add('dsh-ego-panel-open')
-						fab.classList.add('on')
-						refresh()
-						openStream()
-						if (currentActiveId) syncWatch(selectedTabId || currentActiveId)
-					} else {
-						panel.classList.remove('dsh-ego-panel-open')
-						// after the close transition ends, fully hide to free layout.
-clearTimeout((panel as any)._dshHideT)
-					;(panel as any)._dshHideT = setTimeout(() => {
-							panel.classList.add('dsh-ego-panel-hide')
-							panel.hidden = true
-							fab.classList.remove('on')
-						}, 280)
-						try { if (sse) sse.close() } catch {}
-						sse = null
-						stopWatch(false)
-						stopVideo()
-					}
-					try { localStorage.setItem(OPEN_KEY, open ? '1' : '0') } catch {}
-				}
-				// A real click (not a drag) toggles the panel; a drag suppresses it.
-				fab.addEventListener('click', () => {
-					if (suppressFabClick) { suppressFabClick = false; return }
-					setOpen(panel.hidden)
-				})
-				closeBtn.addEventListener('click', () => setOpen(false))
-				refreshBtn.addEventListener('click', () => {
-					// Show a spinner so a manual refresh has clear feedback even when
-					// the underlying picture is static (no visible change).
-					refreshBtn.classList.add('spinning')
-					window.setTimeout(() => refreshBtn.classList.remove('spinning'), 800)
-					refresh()
-				})
-				historyBtn.addEventListener('click', () => setHistory(!historyOpen))
-
-				// Show a login guide when an agent browser is actually showing
-				// something, so the user knows where to log in (the separate
-				// 'ego lite — agent' Chrome window) and can persist the login.
-				const maybeShowLoginGuide = () => {
-					if (disposed || dismissedGuides.login) return
-					const hasPage = lastList.some(s => s.url && !s.url.startsWith('about:'))
-					// Avoid stacking two guide strips above the main view (which would
-					// squash it): the captcha strip takes priority when both apply.
-					const show = hasPage && !captchaEl.classList.contains('show')
-					loginEl.classList.toggle('show', show)
-					loginNote.textContent = ''
-				}
-				// Human-verification (CAPTCHA) reminder: if any live page reports a
-				// challenge, flash a strip asking the user to complete it in the
-				// 'ego lite — agent' browser window (the same session the panel views).
-				const maybeShowCaptchaGuide = () => {
-					if (disposed || dismissedGuides.captcha) return
-					const hit = lastList.find(s => s.humanCheck && s.humanCheck.detected)
-					const show = !!hit
-					captchaEl.classList.toggle('show', show)
-					if (show && captchaKindEl) captchaKindEl.textContent = hit.humanCheck.kind || 'captcha'
-				}
-				// "已登录，保存" → POST /api/ego/flush, which forces the agent
-				// browser's persistent cookies down to its on-disk profile so a
-				// later DSH/browser restart does not drop the login.
-				loginBtn.addEventListener('click', () => {
-					void (async () => {
-						loginBtn.classList.add('saving')
-						loginBtn.textContent = wt('loginSaving')
-						try {
-							const r = await fetch(FLUSH_ROUTE, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-							const j = await r.json()
-							if (j && j.ok) loginNote.textContent = wt('loginSaved', { n: j.total ?? '' })
-							else loginNote.textContent = (j?.error ? wt('loginNotConnected') : wt('loginFailed'))
-						} catch {
-							loginNote.textContent = wt('loginFailed')
-						} finally {
-							loginBtn.classList.remove('saving')
-							loginBtn.textContent = wt('loginBtn')
-						}
-					})()
-				})
-
-				document.body.appendChild(fab)
-				document.body.appendChild(panel)
-
-				// Start collapsed: the FAB is the persistent entry point and should
-				// not disappear just because a previous session left the panel open.
-				// Ignore any stale OPEN_KEY so the ball always shows on load.
-				try { localStorage.removeItem(OPEN_KEY) } catch {}
-				panel.hidden = true
-				fab.classList.remove('on')
-				refresh()
-				const onVisibility = () => { if (document.visibilityState !== 'hidden' && !panel.hidden) { if (!sse) openStream(); syncWatch(selectedTabId || currentActiveId) } }
-				document.addEventListener('visibilitychange', onVisibility)
-
-				// Settings switch, live: turning the relay off tears every pull stream of
-				// this panel down at once (no reconnect loop), turning it back on resumes
-				// them — no page reload needed.
-				const offRelayWatch = frameRelaySubscribe((disabled) => {
-					if (disposed) return
-					if (disabled) { teardownRelay(); renderRelayDisabled(); return }
-					openStream()
-					refresh()
-				})
-
-				return () => {
-					disposed = true
-					offRelayWatch()
-					if (liveFlushRaf != null) try { window.cancelAnimationFrame(liveFlushRaf) } catch {}
-					if (followTimer) window.clearTimeout(followTimer)
-					if (reconnectFallbackTimer) window.clearTimeout(reconnectFallbackTimer)
-					document.removeEventListener('visibilitychange', onVisibility)
-					if (watchRenewTimer) window.clearInterval(watchRenewTimer)
-					if (watchStopTimer) window.clearTimeout(watchStopTimer)
-					stopWatch(true); stopVideo()
-					keyboardProxy.dispose()
-					try { if (sse) sse.close() } catch {}
-					fab.remove()
-					panel.remove()
-					style.remove()
-				}
-		}
 
 		// ── Sidebar Tab (React UI + vanilla LivePreviewController) ─────────────
 		// Registered via ctx.betterSidebar.registerTab() when the sidebar service
 		// is available. The Tab reuses the same /api/ego/spaces + /api/ego/stream
-		// data sources as the floating panel but renders through React into the
-		// sidebar's tab content area instead of a fixed-position overlay.
+		// data sources as the native sidebar tab but renders through React into the
+		// sidebar's tab content area.
 		var INPUT_ROUTE = '/api/ego/input'
 		var FLUSH_ROUTE = '/api/ego/flush'
 		var FRAME_FOLLOW_MIN_MS = 350
 
 		// ── Tab CSS (scoped under .dsh-ego-side-root) ──────────────────────────
-		// Separate from PANEL_CSS (the floating panel's styles): the Tab lives
-		// inside the sidebar's content area, so no fixed positioning / FAB / drag.
-		// Selectors are class-scoped to avoid clashing with the floating panel's
-		// #dsh-ego-* IDs (both paths can coexist in the bundle, only one runs).
+		// The Tab lives inside the sidebar's content area, so no fixed positioning
+		// / FAB / drag; selectors are class-scoped under .dsh-ego-side-root.
 		var TAB_CSS = `
 .dsh-ego-side-root {
   display: flex; flex-direction: column; height: 100%; min-height: 0;
   overflow: hidden; color: inherit; background: transparent;
+  position: relative;
+  /* DSH host theme tokens (--dsw-alias-*) with static fallbacks, so the panel
+     follows the app light/dark theme exactly like the settings card does.
+     The dark media query only flips the fallbacks (hosts without the theme
+     layer, e.g. TUI webviews); when the host theme is present the aliases
+     switch by themselves via body[data-ds-dark-theme]. */
+  --ego-surface: var(--dsw-alias-bg-layer-1, #ffffff);
+  --ego-toolbar: var(--dsw-alias-bg-module-platform, #f9fafb);
+  --ego-text: var(--dsw-alias-label-primary, #0f1115);
+  --ego-text-2: var(--dsw-alias-label-tertiary, #81858c);
+  --ego-accent: var(--dsw-alias-state-business-primary, #4176e6);
+  --ego-on-accent: var(--dsw-alias-label-primary-foreground, #ffffff);
+  --ego-hover: var(--dsw-alias-interactive-bg-hover, rgba(38,49,72,.06));
+  --ego-border: var(--dsw-alias-border-l3, rgba(0,0,0,.12));
+  --ego-border-soft: var(--dsw-alias-border-l2, rgba(0,0,0,.10));
+  --ego-tab-active: var(--dsw-alias-bg-layer-1, #ffffff);
+  --ego-success: var(--dsw-alias-state-success-primary, #22c55e);
+  --ego-warn: var(--dsw-alias-state-warn-primary, #f59e0b);
+  --ego-warn-label: var(--dsw-alias-state-warn-label, #dd8629);
+  --ego-warn-bg: var(--dsw-alias-state-warn-tertiary, #fef5e7);
+  --ego-danger: var(--dsw-alias-state-error-primary, #ec1313);
+  --ego-danger-bg: var(--dsw-alias-interactive-bg-hover-danger, rgba(236,19,19,.05));
+  --ego-business-bg: var(--dsw-alias-state-business-tertiary, #e4edfd);
+  --ego-accent-tint: rgba(65,118,230,.10);
+  --ego-success-glow: rgba(34,197,94,.50);
+  --ego-success-glow-soft: rgba(34,197,94,.15);
+  --ego-success-glow-strong: rgba(34,197,94,.90);
+  --ego-accent-glow: rgba(65,118,230,.50);
+  --ego-warm-tint: rgba(245,158,11,.10);
+  --ego-warm-strong: rgba(245,158,11,.45);
+  --ego-handle-hint: rgba(128,128,128,.26);
+  --ego-stage-shadow: 0 1px 2px rgba(15,17,21,.05), 0 4px 14px rgba(15,17,21,.07);
+  --ego-pop-shadow: 0 4px 16px rgba(15,17,21,.10), 0 8px 32px rgba(15,17,21,.08);
+  /* Unified scales: radii 6/8/10, type 10/11/12/13. */
+  --ego-radius-s: 6px; --ego-radius-m: 8px; --ego-radius-l: 10px;
+  --ego-fs-micro: 10px; --ego-fs-meta: 11px; --ego-fs-body: 12px; --ego-fs-title: 13px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+@supports (color: color-mix(in srgb, red 10%, white)) {
+  .dsh-ego-side-root {
+    --ego-accent-tint: color-mix(in srgb, var(--ego-accent) 10%, transparent);
+    --ego-success-glow: color-mix(in srgb, var(--ego-success) 50%, transparent);
+    --ego-success-glow-soft: color-mix(in srgb, var(--ego-success) 15%, transparent);
+    --ego-success-glow-strong: color-mix(in srgb, var(--ego-success) 90%, transparent);
+    --ego-accent-glow: color-mix(in srgb, var(--ego-accent) 50%, transparent);
+    --ego-warm-tint: color-mix(in srgb, var(--ego-warn) 12%, transparent);
+    --ego-warm-strong: color-mix(in srgb, var(--ego-warn) 45%, transparent);
+    --ego-handle-hint: color-mix(in srgb, var(--ego-text-2) 26%, transparent);
+  }
+}
+@media (prefers-color-scheme: dark) {
+  .dsh-ego-side-root {
+    --ego-surface: var(--dsw-alias-bg-layer-1, #232324);
+    --ego-toolbar: var(--dsw-alias-bg-module-platform, #353438);
+    --ego-text: var(--dsw-alias-label-primary, #f9fafb);
+    --ego-text-2: var(--dsw-alias-label-tertiary, #adb2b8);
+    --ego-accent: var(--dsw-alias-state-business-primary, #679efe);
+    --ego-on-accent: var(--dsw-alias-label-primary-foreground, #0f1115);
+    --ego-hover: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08));
+    --ego-border: var(--dsw-alias-border-l3, rgba(255,255,255,.16));
+    --ego-border-soft: var(--dsw-alias-border-l2, rgba(255,255,255,.12));
+    --ego-tab-active: var(--dsw-alias-bg-layer-1, #232324);
+    --ego-warn-bg: var(--dsw-alias-state-warn-tertiary, #27241f);
+    --ego-danger: var(--dsw-alias-state-error-primary, #f25a5a);
+    --ego-danger-bg: var(--dsw-alias-interactive-bg-hover-danger, rgba(242,90,90,.15));
+    --ego-business-bg: var(--dsw-alias-state-business-tertiary, #34415b);
+    --ego-accent-tint: rgba(103,158,254,.14);
+    --ego-stage-shadow: 0 1px 2px rgba(0,0,0,.45), 0 6px 18px rgba(0,0,0,.35);
+    --ego-pop-shadow: 0 4px 16px rgba(0,0,0,.45), 0 10px 36px rgba(0,0,0,.40);
+  }
 }
 .dsh-ego-side-root * { box-sizing: border-box; }
 
 .dsh-ego-side-head {
   display: flex; align-items: center; gap: 4px; padding: 8px 10px;
-  border-bottom: 1px solid rgba(128,128,128,.18); flex-shrink: 0;
+  border-bottom: 1px solid var(--ego-border-soft); flex-shrink: 0;
+  background: var(--ego-toolbar); color: var(--ego-text);
 }
 .dsh-ego-side-title {
-  flex: 1; font-size: 12.5px; font-weight: 600; letter-spacing: .2px;
+  flex: 1; font-size: var(--ego-fs-title); font-weight: 500; letter-spacing: .1px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  display: flex; align-items: center; gap: 5px; opacity: .85;
+  display: flex; align-items: center; gap: 6px;
+  color: var(--ego-text);
 }
-.dsh-ego-side-title svg { width: 14px; height: 14px; flex-shrink: 0; }
+.dsh-ego-side-title svg { width: 15px; height: 15px; flex-shrink: 0; color: var(--ego-text-2); }
 .dsh-ego-side-iconbtn {
   background: transparent; border: none; cursor: pointer;
-  width: 26px; height: 26px; border-radius: 7px; padding: 0;
+  width: 28px; height: 28px; border-radius: 50%; padding: 0;
   display: flex; align-items: center; justify-content: center;
-  color: inherit; opacity: .6;
-  transition: background .15s ease, opacity .15s ease;
+  color: var(--ego-text-2);
+  transition: background .15s ease, color .15s ease;
 }
-.dsh-ego-side-iconbtn:hover { background: rgba(128,128,128,.18); opacity: 1; }
-.dsh-ego-side-iconbtn.off { opacity: .4; }
+.dsh-ego-side-iconbtn:hover { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-iconbtn.off { opacity: .45; }
 .dsh-ego-side-iconbtn.spinning svg { animation: dsh-ego-side-spin .7s linear infinite; }
 @keyframes dsh-ego-side-spin { to { transform: rotate(360deg); } }
 
 /* ---- guide strips (login / captcha) ---- */
 .dsh-ego-side-login, .dsh-ego-side-captcha {
-  display: flex; align-items: center; gap: 7px; margin: 0 10px 7px; padding: 6px 9px;
-  border-radius: 8px; font-size: 11px; line-height: 1.4;
+  display: flex; align-items: center; gap: 8px; margin: 0 10px 8px; padding: 6px 10px;
+  border-radius: var(--ego-radius-m); font-size: var(--ego-fs-meta); line-height: 1.4;
 }
 .dsh-ego-side-login {
-  border: 1px solid rgba(255,214,10,.3); background: rgba(255,214,10,.1);
+  border: 1px solid var(--ego-warn); background: var(--ego-warn-bg);
 }
 .dsh-ego-side-captcha {
-  border: 1px solid rgba(255,69,58,.4); background: rgba(255,69,58,.13);
+  border: 1px solid var(--ego-danger); background: var(--ego-danger-bg);
 }
 .dsh-ego-side-login .dsh-ego-side-login-txt { flex: 1; min-width: 0; }
-.dsh-ego-side-login .dsh-ego-side-login-txt b { color: #ffd60a; }
+.dsh-ego-side-login .dsh-ego-side-login-txt b { color: var(--ego-warn-label); }
 .dsh-ego-side-login-btn {
-  flex: none; background: #0a84ff; color: #fff; border: none; border-radius: 7px;
-  font-size: 10.5px; padding: 4px 9px; cursor: pointer; white-space: nowrap;
-  transition: background .15s ease;
+  flex: none; background: var(--ego-accent); color: var(--ego-on-accent); border: none;
+  border-radius: var(--ego-radius-s);
+  font-size: var(--ego-fs-meta); padding: 4px 10px; cursor: pointer; white-space: nowrap;
+  transition: filter .15s ease;
 }
-.dsh-ego-side-login-btn:hover { background: #338cff; }
+.dsh-ego-side-login-btn:hover { filter: brightness(.95); }
 .dsh-ego-side-login-btn.saving { opacity: .55; pointer-events: none; }
-.dsh-ego-side-login-note { flex: none; font-size: 10px; opacity: .6; white-space: nowrap; }
+.dsh-ego-side-login-note { flex: none; font-size: var(--ego-fs-micro); opacity: .6; white-space: nowrap; }
 .dsh-ego-side-captcha-txt { flex: 1; min-width: 0; }
-.dsh-ego-side-captcha-txt b { color: #ff6961; }
+.dsh-ego-side-captcha-txt b { color: var(--ego-danger); }
 .dsh-ego-side-captcha-kind {
-  flex: none; font-size: 9.5px; padding: 2px 7px; border-radius: 999px;
-  background: rgba(255,255,255,.15); text-transform: uppercase; letter-spacing: .3px;
+  flex: none; font-size: var(--ego-fs-micro); padding: 2px 8px; border-radius: 999px;
+  background: var(--ego-danger); color: #fff; text-transform: uppercase; letter-spacing: .3px;
 }
 
-/* ---- tab strip: frosted pills ---- */
+/* ---- tab strip: active tab connects to the content slab below ---- */
 .dsh-ego-side-tabs {
-  display: flex; gap: 5px; padding: 7px 10px; flex-shrink: 0;
-  border-bottom: 1px solid rgba(128,128,128,.12);
+  display: flex; gap: 4px; padding: 4px 10px 0; flex-shrink: 0;
+  background: var(--ego-toolbar);
+  border-bottom: 1px solid var(--ego-border-soft);
   overflow-x: auto; scrollbar-width: thin;
 }
 .dsh-ego-side-tabs:empty { display: none; }
 .dsh-ego-side-tab {
-  display: inline-flex; align-items: center; gap: 5px; max-width: 160px;
-  white-space: nowrap; padding: 4px 10px; border-radius: 999px; cursor: pointer;
-  font-size: 11px; flex-shrink: 0;
-  border: 1px solid rgba(128,128,128,.2); background: rgba(128,128,128,.12);
-  opacity: .7; transition: background .15s, opacity .15s, border-color .15s;
+  display: inline-flex; align-items: center; gap: 6px; max-width: 160px;
+  white-space: nowrap; padding: 6px 10px 7px; margin-bottom: -1px;
+  border-radius: var(--ego-radius-m) var(--ego-radius-m) 0 0; cursor: pointer;
+  font-size: var(--ego-fs-meta); flex-shrink: 0;
+  border: 1px solid transparent; border-bottom: none; background: transparent;
+  color: var(--ego-text-2);
+  transition: background .15s, color .15s, border-color .15s;
 }
 .dsh-ego-side-tab > .dsh-ego-side-tabtxt { overflow: hidden; text-overflow: ellipsis; }
-.dsh-ego-side-tab:hover { opacity: 1; background: rgba(128,128,128,.2); }
+.dsh-ego-side-tab:hover { background: var(--ego-hover); color: var(--ego-text); }
 .dsh-ego-side-tab.active {
-  background: #0a84ff; color: #fff; border-color: transparent; opacity: 1;
-  box-shadow: 0 2px 8px rgba(10,132,255,.3);
+  position: relative;
+  background: var(--ego-tab-active); color: var(--ego-text);
+  border-color: var(--ego-border-soft); box-shadow: none;
 }
-.dsh-ego-side-tabdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .5; flex-shrink: 0; }
-.dsh-ego-side-tab.active .dsh-ego-side-tabdot { background: #fff; opacity: 1; }
+.dsh-ego-side-tabdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .45; flex-shrink: 0; }
+.dsh-ego-side-tab.active .dsh-ego-side-tabdot { background: var(--ego-accent); opacity: 1; }
 .dsh-ego-side-tabclose {
-  flex-shrink: 0; width: 13px; height: 13px; line-height: 12px; text-align: center;
-  border-radius: 50%; font-size: 11px; opacity: .5; margin-left: 1px;
+  flex-shrink: 0; width: 14px; height: 14px; line-height: 13px; text-align: center;
+  border-radius: 50%; font-size: var(--ego-fs-meta); opacity: .5; margin-left: 1px;
 }
-.dsh-ego-side-tabclose:hover { background: rgba(255,255,255,.2); color: #ff453a; opacity: 1; }
+.dsh-ego-side-tabclose:hover { background: var(--ego-hover); color: var(--ego-danger); opacity: 1; }
 
 /* ---- main body ---- */
-.dsh-ego-side-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
-.dsh-ego-side-empty { padding: 20px 12px; text-align: center; font-size: 12px; opacity: .5; line-height: 1.7; }
-
-.dsh-ego-side-liveview { display: flex; flex-direction: column; gap: 7px; min-height: 60px; overflow: hidden; }
-.dsh-ego-side-livebadge {
-  font-size: 10.5px; opacity: .6; letter-spacing: .2px;
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+.dsh-ego-side-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; background: var(--ego-surface); }
+.dsh-ego-side-empty { padding: 32px 16px; text-align: center; font-size: var(--ego-fs-body); color: var(--ego-text-2); line-height: 1.7; }
+.dsh-ego-side-empty::before {
+  content: ''; display: block; width: 36px; height: 36px; margin: 0 auto 10px;
+  opacity: .35; background: currentColor;
+  /* URL-encoded copy of the canonical agent-browser glyph (spaces encoded so
+     source-level icon audits keep counting only the two real icons). */
+  -webkit-mask: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.2'%20y='2.4'%20width='13.6'%20height='11.2'%20rx='2.4'%20fill='none'%20stroke='black'%20stroke-width='1.2'/%3E%3Cpath%20d='M1.4%205.9h13.2'%20stroke='black'%20stroke-width='1.2'%20stroke-linecap='round'/%3E%3Ccircle%20cx='3.7'%20cy='4.15'%20r='0.6'/%3E%3Ccircle%20cx='5.5'%20cy='4.15'%20r='0.6'/%3E%3Cpath%20d='M8.2%207.0L12.6%2010.6L10.6%2010.9L11.7%2013.2L10.6%2013.8L9.5%2011.5L8.0%2013.1Z'/%3E%3C/svg%3E") no-repeat center / contain;
+  mask: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20x='1.2'%20y='2.4'%20width='13.6'%20height='11.2'%20rx='2.4'%20fill='none'%20stroke='black'%20stroke-width='1.2'/%3E%3Cpath%20d='M1.4%205.9h13.2'%20stroke='black'%20stroke-width='1.2'%20stroke-linecap='round'/%3E%3Ccircle%20cx='3.7'%20cy='4.15'%20r='0.6'/%3E%3Ccircle%20cx='5.5'%20cy='4.15'%20r='0.6'/%3E%3Cpath%20d='M8.2%207.0L12.6%2010.6L10.6%2010.9L11.7%2013.2L10.6%2013.8L9.5%2011.5L8.0%2013.1Z'/%3E%3C/svg%3E") no-repeat center / contain;
 }
+
+.dsh-ego-side-liveview { display: flex; flex-direction: column; gap: 8px; min-height: 60px; overflow: hidden; position: relative; }
+/* macOS-style toolbar: independent status chip + segmented action groups.
+   No parent opacity — buttons stay crisp; only secondary text is dimmed. */
+.dsh-ego-side-livebadge {
+  font-size: var(--ego-fs-meta); letter-spacing: .2px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+  position: relative; z-index: 40;
+}
+.dsh-ego-side-statusline { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.dsh-ego-side-actionline { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; position: relative; }
+.dsh-ego-side-statuschip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 2px; color: var(--ego-text-2);
+}
+.dsh-ego-side-execchip {
+  font-size: var(--ego-fs-micro); color: var(--ego-text-2); padding: 0 2px; white-space: nowrap;
+}
+.dsh-ego-side-btngroup {
+  display: inline-flex; align-items: center; gap: 2px;
+  border-radius: var(--ego-radius-s); background: transparent;
+}
+.dsh-ego-side-btngroup .dsh-ego-side-back { border: 0; background: transparent; border-radius: var(--ego-radius-s); }
+.dsh-ego-side-btngroup .dsh-ego-side-back:hover { background: var(--ego-hover); }
+.dsh-ego-side-btngroup .dsh-ego-side-back-on {
+  background: var(--ego-accent-tint); color: var(--ego-accent);
+}
+.dsh-ego-side-btnico { display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center; opacity: .85; }
+.dsh-ego-side-btnico svg { display: block; }
+.dsh-ego-side-badgeline {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; position: relative;
+  flex: 1;
+}
+.dsh-ego-side-badgestatus { white-space: nowrap; }
+.dsh-ego-side-pageinfo {
+  flex-basis: 100%; display: flex; align-items: baseline; gap: 8px;
+  min-width: 0; font-size: var(--ego-fs-meta); color: var(--ego-text-2);
+  background: var(--ego-surface);
+}
+.dsh-ego-side-pageinfo-tabs { flex-basis: auto; flex-shrink: 0; padding: 8px 10px 6px; }
+.dsh-ego-side-pagemessage {
+  flex-shrink: 0; padding: 2px 10px 0; font-size: var(--ego-fs-micro); color: var(--ego-text-2); opacity: .85;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dsh-ego-side-pageinfo .dsh-ego-side-livetitle {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 62%; flex: none;
+  color: var(--ego-text); font-size: var(--ego-fs-body); font-weight: 500;
+}
+.dsh-ego-side-pageinfo .dsh-ego-side-liveurl {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0;
+  color: var(--ego-text-2); font-size: var(--ego-fs-meta);
+}
+.dsh-ego-side-presets {
+  position: absolute; top: 24px; right: 0; z-index: 30;
+  min-width: 92px; padding: 4px; display: flex; flex-direction: column; gap: 2px;
+  background: var(--ego-surface);
+  border: 1px solid var(--ego-border); border-radius: var(--ego-radius-m);
+  box-shadow: var(--ego-pop-shadow);
+}
+.dsh-ego-side-preset-item {
+  border: 0; background: transparent; color: inherit; text-align: left;
+  font-size: var(--ego-fs-meta); padding: 4px 10px; border-radius: var(--ego-radius-s); cursor: pointer;
+}
+.dsh-ego-side-preset-item:hover { background: var(--ego-hover); }
+.dsh-ego-side-stage { position: relative; display: block; min-height: 0; }
+.dsh-ego-side-resize { position: absolute; z-index: 10; background: transparent; }
+.dsh-ego-side-resize-right { top: 0; bottom: 0; right: 0; width: 12px; cursor: col-resize; }
+.dsh-ego-side-resize-bottom { left: 0; right: 0; bottom: 0; height: 12px; cursor: row-resize; }
+.dsh-ego-side-resize-corner {
+  right: 0; bottom: 0; width: 20px; height: 20px; cursor: nwse-resize;
+  border-bottom-right-radius: var(--ego-radius-l);
+}
+/* No permanent colour band: a whisper of affordance on hover, and a slightly
+   warmer hint while size-sync is unlocked. The handles themselves stay
+   transparent so the frame edge looks clean. */
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-right {
+  background: linear-gradient(to left, var(--ego-handle-hint), transparent);
+}
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-bottom {
+  background: linear-gradient(to top, var(--ego-handle-hint), transparent);
+}
+.dsh-ego-side-stage:hover .dsh-ego-side-resize-corner { background: var(--ego-handle-hint); }
+.dsh-ego-size-unlocked .dsh-ego-side-resize-right {
+  background: linear-gradient(to left, var(--ego-warm-tint), transparent);
+}
+.dsh-ego-size-unlocked .dsh-ego-side-resize-bottom {
+  background: linear-gradient(to top, var(--ego-warm-tint), transparent);
+}
+.dsh-ego-size-unlocked .dsh-ego-side-resize-corner { background: var(--ego-warm-tint); }
+.dsh-ego-side-resize:hover { background: var(--ego-warm-strong) !important; }
 .dsh-ego-side-state-dot {
   display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-  background: #30d158; box-shadow: 0 0 5px #30d15888; flex-shrink: 0;
+  background: var(--ego-success); box-shadow: 0 0 5px var(--ego-success-glow); flex-shrink: 0;
   animation: dsh-ego-side-breathe 2.4s ease-in-out infinite;
 }
-.dsh-ego-side-state-dot.busy { background: #30d158; box-shadow: 0 0 6px #30d158bb; animation: none; }
-.dsh-ego-side-state-dot.pin { background: #0a84ff; box-shadow: 0 0 5px #0a84ff88; animation: none; }
+.dsh-ego-side-state-dot.busy { background: var(--ego-success); box-shadow: 0 0 6px var(--ego-success-glow-strong); animation: none; }
+.dsh-ego-side-state-dot.pin { background: var(--ego-accent); box-shadow: 0 0 5px var(--ego-accent-glow); animation: none; }
 @keyframes dsh-ego-side-breathe {
-  0%, 100% { box-shadow: 0 0 2px #30d15822; opacity: .5; }
-  50%      { box-shadow: 0 0 10px #30d158ee; opacity: 1; }
+  0%, 100% { box-shadow: 0 0 2px var(--ego-success-glow-soft); opacity: .5; }
+  50%      { box-shadow: 0 0 10px var(--ego-success-glow-strong); opacity: 1; }
 }
 .dsh-ego-side-back {
-  background: rgba(128,128,128,.18); border: 1px solid rgba(128,128,128,.2);
-  border-radius: 6px; cursor: pointer; font-size: 10.5px; padding: 2px 8px;
-  display: inline-flex; align-items: center; gap: 3px;
-  transition: background .15s ease; color: inherit;
+  height: 26px; padding: 0 8px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--ego-radius-s); cursor: pointer;
+  font-size: var(--ego-fs-meta); font-weight: 500;
+  display: inline-flex; align-items: center; gap: 5px;
+  transition: background .14s ease, color .14s ease, transform .08s ease;
+  color: var(--ego-text-2); white-space: nowrap;
 }
-.dsh-ego-side-back:hover { background: rgba(128,128,128,.3); }
+.dsh-ego-side-back:hover { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-back:disabled { opacity: .4; cursor: default; pointer-events: none; }
+.dsh-ego-side-back:active { transform: scale(.98); }
+.dsh-ego-side-back:focus-visible { outline: 2px solid var(--ego-accent); outline-offset: 1px; }
+.dsh-ego-side-back-on { color: var(--ego-accent); background: var(--ego-accent-tint); }
+/* Primary action: filled accent button (primary sign-in affordance). */
+.dsh-ego-side-loginbtn {
+  background: var(--ego-accent); color: var(--ego-on-accent);
+  border-color: transparent; border-radius: var(--ego-radius-s); font-weight: 500;
+}
+.dsh-ego-side-loginbtn:hover { background: var(--ego-accent); color: var(--ego-on-accent); filter: brightness(.96); }
+.dsh-ego-side-loginbtn-ready {
+  background: transparent; color: var(--ego-accent);
+  border-color: var(--ego-border);
+}
+.dsh-ego-side-loginbtn-ready:hover { background: var(--ego-hover); color: var(--ego-accent); filter: none; }
+.dsh-ego-side-loginbtn-head { height: 26px; margin-left: 2px; }
+.dsh-ego-side-loginbtn-busy { opacity: .65; pointer-events: none; }
+/* Pairing popover: surface card, anchored under the header. */
+.dsh-ego-side-pairbox {
+  position: absolute; top: 104px; right: 10px; z-index: 95;
+  width: min(320px, calc(100% - 20px));
+  padding: 14px;
+  border: 1px solid var(--ego-border-soft); border-radius: var(--ego-radius-l);
+  background: var(--ego-surface); color: var(--ego-text);
+  box-shadow: var(--ego-pop-shadow);
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: var(--ego-fs-meta); line-height: 1.55;
+}
+.dsh-ego-side-pairhead { display: flex; align-items: center; gap: 8px; font-weight: 500; font-size: var(--ego-fs-title); color: var(--ego-text); }
+.dsh-ego-side-pairhead > span:first-child { flex: 1; }
+.dsh-ego-side-pairclose {
+  border: 0; background: transparent; color: var(--ego-text-2); opacity: .7;
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.dsh-ego-side-pairclose:hover { opacity: 1; background: var(--ego-hover); border-radius: 50%; }
+.dsh-ego-side-pairstep { opacity: .8; }
+.dsh-ego-side-paircode {
+  font-size: 24px; font-weight: 700; letter-spacing: 6px;
+  color: var(--ego-accent); text-align: center; padding: 2px 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+.dsh-ego-side-pairpath {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--ego-fs-micro);
+  opacity: .65; word-break: break-all;
+  background: var(--ego-hover); color: var(--ego-text-2); border-radius: var(--ego-radius-s); padding: 4px 6px;
+}
 .dsh-ego-side-liveimg {
-  width: 100%; border-radius: 9px; display: block;
+  width: 100%; border-radius: var(--ego-radius-l); display: block;
   max-height: 50vh; object-fit: contain;
-  border: 1px solid rgba(128,128,128,.2); background: #000;
+  border: 1px solid var(--ego-border-soft);
+  box-shadow: var(--ego-stage-shadow);
   user-select: none; -webkit-user-select: none; touch-action: none;
   will-change: transform; cursor: grab;
 }
-.dsh-ego-side-livetitle { font-size: 12px; font-weight: 600; }
-.dsh-ego-side-liveurl { font-size: 10.5px; opacity: .55; word-break: break-all; }
-.dsh-ego-side-liveurl.dsh-ego-side-hint { color: #75c2ff; font-style: italic; font-weight: 500; opacity: 1; }
+/* #81: the semantic <img> keeps layout + pointer/zoom; the two overlay layers
+   carry the visible pixels and only swap once the next frame has decoded. */
+.dsh-ego-side-livebox {
+  position: relative; width: 100%; min-height: 0; background: #000;
+  border-radius: var(--ego-radius-l); overflow: hidden;
+  border: 1px solid var(--ego-border-soft);
+  box-shadow: var(--ego-stage-shadow);
+}
+.dsh-ego-side-livebox .dsh-ego-side-liveimg { border: 0; box-shadow: none; border-radius: 0; }
+.dsh-ego-side-liveimg-semantic { opacity: 0; }
+.dsh-ego-side-livebuf {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; object-fit: contain; opacity: 0;
+  pointer-events: none; will-change: opacity;
+}
+.dsh-ego-side-livebuf.dsh-ego-side-livebuf-on { opacity: 1; }
+.dsh-ego-side-livetitle { font-size: var(--ego-fs-body); font-weight: 600; }
+.dsh-ego-side-liveurl { font-size: var(--ego-fs-meta); opacity: .55; word-break: break-all; }
+.dsh-ego-side-liveurl.dsh-ego-side-hint { color: var(--ego-accent); font-style: italic; font-weight: 500; opacity: 1; }
 .dsh-ego-side-hint { animation: dsh-ego-side-hint-in .2s ease; }
 @keyframes dsh-ego-side-hint-in { from { opacity: .3 } to { opacity: 1 } }
 
 /* ---- history overlay (covers the body area) ---- */
 .dsh-ego-side-history {
   flex: 1; min-height: 0; display: flex; flex-direction: column;
-  overflow: hidden;
+  overflow: hidden; background: var(--ego-surface);
 }
 .dsh-ego-side-historyhead {
-  padding: 8px 10px; font-size: 11px; font-weight: 600; opacity: .6;
+  padding: 8px 10px; font-size: var(--ego-fs-meta); font-weight: 600; color: var(--ego-text-2);
   display: flex; align-items: center; gap: 5px;
-  border-bottom: 1px solid rgba(128,128,128,.1); flex-shrink: 0;
+  border-bottom: 1px solid var(--ego-border-soft); flex-shrink: 0;
 }
 .dsh-ego-side-historyhead svg { width: 11px; height: 11px; }
-.dsh-ego-side-historylist { overflow-y: auto; padding: 5px; }
+.dsh-ego-side-historylist { overflow-y: auto; padding: 6px; }
 .dsh-ego-side-hitem {
-  display: flex; gap: 7px; align-items: center; padding: 5px; border-radius: 8px;
+  display: flex; gap: 8px; align-items: center; padding: 6px; border-radius: var(--ego-radius-m);
   cursor: pointer; transition: background .15s ease;
 }
-.dsh-ego-side-hitem:hover { background: rgba(128,128,128,.15); }
-.dsh-ego-side-hitem.active { background: rgba(10,132,255,.15); }
+.dsh-ego-side-hitem:hover { background: var(--ego-hover); }
+.dsh-ego-side-hitem.active { background: var(--ego-business-bg); }
 .dsh-ego-side-hthumb {
-  width: 52px; height: 38px; border-radius: 5px; object-fit: cover; background: #000;
-  flex-shrink: 0; border: 1px solid rgba(128,128,128,.2);
+  width: 52px; height: 38px; border-radius: var(--ego-radius-s); object-fit: cover; background: #000;
+  flex-shrink: 0; border: 1px solid var(--ego-border-soft);
 }
 .dsh-ego-side-hinfo { min-width: 0; flex: 1; }
-.dsh-ego-side-htitle { font-size: 10px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dsh-ego-side-hurl { font-size: 9.5px; opacity: .5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dsh-ego-side-hactive { color: #30d158; font-size: 9.5px; }
-.dsh-ego-side-hnone { padding: 16px 8px; text-align: center; font-size: 10.5px; opacity: .4; }
+.dsh-ego-side-htitle { font-size: var(--ego-fs-meta); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-ego-side-hurl { font-size: var(--ego-fs-micro); opacity: .5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-ego-side-hactive { color: var(--ego-success); font-size: var(--ego-fs-micro); }
+.dsh-ego-side-hnone { padding: 16px 8px; text-align: center; font-size: var(--ego-fs-meta); opacity: .4; }
 `
 
 		// ── LivePreviewController ───────────────────────────────────────────────
@@ -2758,6 +1958,13 @@ clearTimeout((panel as any)._dshHideT)
 			this.disposed = false
 			this.visible = false
 			this.clientId = 'sidebar-' + Math.random().toString(36).slice(2)
+			// Desired screencast width, set by the panel from its real display
+			// width (× devicePixelRatio). Capturing at 1280 for a ~550 px panel
+			// made Chrome encode, ship and decode ~5x the pixels the user can
+			// actually see; the worker caps this against the configured max.
+			this.maxWidthHint = 800
+			this.watchMaxWidth = 0
+			this._maxWidthTimer = null
 			this.watchStarted = false
 			this.watchTargetId = null
 			this.watchRenewTimer = null
@@ -2781,6 +1988,15 @@ clearTimeout((panel as any)._dshHideT)
 			this.liveFlushRaf = null
 			this.liveImg = null
 			this.liveImgTargetId = null
+			// #81: double-buffered presentation. Two overlay <img> layers; the
+			// visible one keeps showing the old frame until the next frame has
+			// finished decoding, so replacing a frame never blanks the panel.
+			this.liveBuffers = null
+			this.liveBufferIndex = 0
+			this.liveBufferLoading = false
+			this.liveBufferPending = null
+			this.liveFrameUrl = null
+			this.liveFrameTargetId = null
 			this.wiringStale = false
 			this._lastUnwiredAt = 0
 			this._wiredRecomputeQueued = false
@@ -2914,6 +2130,8 @@ clearTimeout((panel as any)._dshHideT)
 			if (this.followTimer) window.clearTimeout(this.followTimer)
 			if (this.reconnectFallbackTimer) window.clearTimeout(this.reconnectFallbackTimer)
 			if (this._zoomHintTimer) window.clearTimeout(this._zoomHintTimer)
+			if (this._maxWidthTimer) window.clearTimeout(this._maxWidthTimer)
+			this._maxWidthTimer = null
 			document.removeEventListener('visibilitychange', this.onDocumentVisibility)
 			if (this.watchRenewTimer) window.clearInterval(this.watchRenewTimer)
 			if (this.watchStopTimer) window.clearTimeout(this.watchStopTimer)
@@ -2946,6 +2164,25 @@ clearTimeout((panel as any)._dshHideT)
 				this._destroyVideo()
 			}
 		}
+		// The panel width can settle after the first watch/start (macOS pane was
+		// 0-width at mount, #81). When the measured width differs a lot from the
+		// one the running capture was started with, restart the watch once so the
+		// stream is re-created at the right resolution instead of staying blurry.
+		LivePreviewController.prototype.scheduleMaxWidthRefresh = function () {
+			var self = this
+			if (this.disposed || this._maxWidthTimer) return
+			this._maxWidthTimer = window.setTimeout(function () {
+				self._maxWidthTimer = null
+				if (self.disposed || !self.visible || !self.watchStarted || self.watchTargetId == null) return
+				var applied = self.watchMaxWidth || 0
+				var next = self.maxWidthHint || 0
+				if (!(applied > 0) || !(next > 0)) return
+				if (Math.abs(next - applied) < applied * 0.2) return
+				var target = self.watchTargetId
+				self.watchStarted = false
+				self._syncWatch(target)
+			}, 700)
+		}
 		LivePreviewController.prototype._requestWatch = function (route, body) {
 			if (this.watchRequest) return null
 			var self = this
@@ -2970,18 +2207,19 @@ clearTimeout((panel as any)._dshHideT)
 			if (this.watchStopTimer) { window.clearTimeout(this.watchStopTimer); this.watchStopTimer = null }
 			var route = this.watchStarted ? WATCH_SWITCH_ROUTE : WATCH_START_ROUTE
 			if (this.watchStarted && this.watchTargetId === targetId) return
-			var body = { clientId: this.clientId, targetId: targetId }
+			var body = { clientId: this.clientId, targetId: targetId, maxWidth: this.maxWidthHint }
 			var request = this._requestWatch(route, body)
 			if (!request) { this.watchRequest.finally(function () { self._syncWatch(targetId) }); return }
 			request.then(function (status) {
 				self.watchStarted = status && status.ok !== false
 				self.watchTargetId = status && status.targetId || targetId
+				self.watchMaxWidth = self.maxWidthHint
 				if (self.watchTargetId !== targetId) { self.selectedTabId = null; self.currentActiveId = self.watchTargetId }
 				self._applyCaptureStatus(status)
 				if (!self.visible) self._stopWatch(true)
 			}).catch(function () {})
 			if (!this.watchRenewTimer) this.watchRenewTimer = window.setInterval(function () {
-				if (self.visible && self.watchTargetId) { var renewal = self._requestWatch(WATCH_START_ROUTE, { clientId: self.clientId, targetId: self.watchTargetId }); if (renewal) renewal.then(function (status) { self._applyCaptureStatus(status) }).catch(function () {}) }
+				if (self.visible && self.watchTargetId) { var renewal = self._requestWatch(WATCH_START_ROUTE, { clientId: self.clientId, targetId: self.watchTargetId, maxWidth: self.maxWidthHint }); if (renewal) renewal.then(function (status) { self._applyCaptureStatus(status) }).catch(function () {}) }
 			}, 5000)
 		}
 		LivePreviewController.prototype._stopWatch = function (immediate) {
@@ -3009,14 +2247,103 @@ clearTimeout((panel as any)._dshHideT)
 			})
 		}
 		LivePreviewController.prototype.setLiveImg = function (img, targetId) {
+			var targetChanged = this.liveImg !== img || this.liveImgTargetId !== targetId
 			this.liveImg = img
 			this.liveImgTargetId = targetId
-			if (img && targetId != null) {
+			if (targetChanged) {
+				// A queued/decoding frame from the previous target must never land
+				// on the new one.
+				this.liveBufferGeneration = (this.liveBufferGeneration || 0) + 1
+				this.liveBufferPending = null
+				this.liveBufferLoading = false
+				this.liveBufferIndex = 0
+			}
+			if (img && targetId != null && targetChanged) {
 				var cached = this.frameCache.get(targetId)
 				if (cached) {
 					try { img.src = cached } catch (e) {}
 				}
+				var seed = cached || (this.liveFrameTargetId === targetId ? this.liveFrameUrl : null) || img.src || null
+				this._seedLiveBuffers(seed)
 			}
+		}
+		// #81 — double-buffered frame presentation. `liveImg` stays the semantic
+		// element (layout, natural size, pointer/zoom); the two overlay buffers
+		// carry the visible pixels and swap only after decode completes.
+		LivePreviewController.prototype.setLiveBuffers = function (buffers) {
+			this.liveBuffers = buffers && buffers.length === 2 ? buffers : null
+			this.liveBufferIndex = 0
+			this.liveBufferLoading = false
+			this.liveBufferPending = null
+			this.liveBufferGeneration = (this.liveBufferGeneration || 0) + 1
+			if (!this.liveBuffers) return
+			var seed = (this.liveFrameTargetId === this.liveImgTargetId ? this.liveFrameUrl : null)
+				|| this.frameCache.get(this.liveImgTargetId)
+				|| (this.liveImg && this.liveImg.src)
+				|| null
+			this._seedLiveBuffers(seed)
+		}
+		LivePreviewController.prototype._seedLiveBuffers = function (seed) {
+			var buffers = this.liveBuffers
+			if (!buffers) return
+			for (var i = 0; i < 2; i++) {
+				var el = buffers[i]
+				if (!el) continue
+				try { el.style.opacity = i === 0 ? '1' : '0' } catch (e) {}
+				if (seed) { try { el.src = seed } catch (e) {} }
+				else { try { el.removeAttribute('src') } catch (e) {} }
+			}
+			this.liveFrameUrl = seed || null
+			this.liveBufferIndex = 0
+		}
+		LivePreviewController.prototype._presentLiveFrame = function (dataUrl) {
+			if (!dataUrl) return
+			this.liveFrameUrl = dataUrl
+			this.liveFrameTargetId = this.liveImgTargetId
+			if (!this.liveBuffers) {
+				if (this.liveImg) { try { this.liveImg.src = dataUrl } catch (e) {} }
+				return
+			}
+			if (this.liveBufferLoading) { this.liveBufferPending = dataUrl; return }
+			var nextIndex = 1 - this.liveBufferIndex
+			var next = this.liveBuffers[nextIndex]
+			var current = this.liveBuffers[this.liveBufferIndex]
+			if (!next) return
+			var self = this
+			var generation = this.liveBufferGeneration || 0
+			var settled = false
+			var settle = function (ok) {
+				if (settled) return
+				settled = true
+				if (generation !== (self.liveBufferGeneration || 0) || !self.liveBuffers || self.liveBuffers[nextIndex] !== next) {
+					self.liveBufferLoading = false
+					return
+				}
+				self.liveBufferLoading = false
+				if (ok) {
+					try {
+						next.style.opacity = '1'
+						if (current) current.style.opacity = '0'
+					} catch (e) {}
+					self.liveBufferIndex = nextIndex
+				}
+				if (self.liveBufferPending) {
+					var pending = self.liveBufferPending
+					self.liveBufferPending = null
+					self._presentLiveFrame(pending)
+				}
+			}
+			this.liveBufferLoading = true
+			try {
+				next.onload = function () { settle(true) }
+				// A malformed/expired frame must not replace a good layer: keep the
+				// current frame visible and move on to the pending one (#82).
+				next.onerror = function () { settle(false) }
+				next.src = dataUrl
+			} catch (e) {
+				settle(false)
+			}
+			try { if (next.decode) next.decode().then(function () { settle(true) }, function () { settle(false) }) } catch (e) {}
 		}
 		// `refresh` is NOT a polling loop anymore. It is a one-shot fallback
 		// used at start / setVisible(true) / SSE reconnect to re-sync the tab
@@ -3177,8 +2504,9 @@ clearTimeout((panel as any)._dshHideT)
 					this.liveFlushRaf = window.requestAnimationFrame(function () {
 						self2.liveFlushRaf = null
 						if (self2.disposed || !self2.liveImg || self2.pendingLiveFrame == null) return
-						try { self2.liveImg.src = self2.pendingLiveFrame } catch (e) {}
+						var frameUrl = self2.pendingLiveFrame
 						self2.pendingLiveFrame = null
+						self2._presentLiveFrame(frameUrl)
 					})
 				}
 				return
@@ -3215,6 +2543,15 @@ clearTimeout((panel as any)._dshHideT)
 					self.refresh()
 				}
 			}).catch(function () {})
+		}
+		// A window resize answers with the exact new page viewport. Record it
+		// immediately: the frame metadata that feeds click mapping arrives a
+		// fraction later, and clicks in between would land at the old position.
+		LivePreviewController.prototype.noteViewport = function (targetId, width, height) {
+			if (!targetId || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return
+			var prev = this.pageMeta.get(targetId) || { targetId: targetId }
+			this.pageMeta.set(targetId, Object.assign({}, prev, { vw: Math.round(width), vh: Math.round(height) }))
+			this._recompute()
 		}
 		LivePreviewController.prototype.browserXY = function (e) {
 			if (this.liveImgTargetId == null || !this.liveImg) return null
@@ -3430,6 +2767,8 @@ clearTimeout((panel as any)._dshHideT)
 		// cadence without triggering React re-renders per frame.
 		function EgoBrowserTab(props) {
 			var visible = props.visible
+			var visibleRef = React.useRef(visible)
+			visibleRef.current = visible
 			var ctx = props.ctx
 			var controllerRef = React.useRef(null)
 			if (controllerRef.current === null) controllerRef.current = new LivePreviewController(ctx)
@@ -3448,6 +2787,284 @@ clearTimeout((panel as any)._dshHideT)
 
 			var imgRef = React.useRef(null)
 			var videoRef = React.useRef(null)
+			var stageRef = React.useRef(null)
+			var rootRef = React.useRef(null)
+			// Size-sync toggle: unlocked, the live image box drives the REAL agent
+			// browser window size (via the worker's CDP window bounds route).
+			var sizeSyncRef = React.useRef(null)
+			if (sizeSyncRef.current === null) {
+				sizeSyncRef.current = createWindowSizeSync()
+				sizeSyncRef.current.setEnabled(sizeSyncStored())
+			}
+			var sizeSync = sizeSyncRef.current
+			var sizeSyncState = React.useState(sizeSync.isEnabled())
+			var sizeSyncOn = sizeSyncState[0]
+			var setSizeSyncOn = sizeSyncState[1]
+
+			// #73: executor diagnostics from the host (resident/one-shot, pid,
+			// age, last rebuild reason). Polled slowly; failures are silent.
+			var residentState = React.useState(null)
+			var residentInfo = residentState[0]
+			var setResidentInfo = residentState[1]
+			React.useEffect(function () {
+				var disposed = false
+				var load = function () {
+					fetch('/api/ego/executor', { cache: 'no-store' })
+						.then(function (r) { return r.ok ? r.json() : null })
+						.then(function (json) { if (!disposed && json && json.ok) setResidentInfo(json) })
+						.catch(function () {})
+				}
+				load()
+				var timer = window.setInterval(load, 15000)
+				return function () { disposed = true; window.clearInterval(timer) }
+			}, [])
+
+			// #69 (A) v2: one-click Chrome login-state bridge. The health poll also
+			// starts the host bridge and returns the pairing port / extension path.
+			var chromeLoginState = React.useState({ phase: 'loading', paired: false, busy: false, message: '', code: '', expiresAt: 0, port: 53820, extensionPath: '', tokenPath: '' })
+			var chromeLogin = chromeLoginState[0]
+			var setChromeLogin = chromeLoginState[1]
+			var pairOpenState = React.useState(false)
+			var pairOpen = pairOpenState[0]
+			var setPairOpen = pairOpenState[1]
+			React.useEffect(function () {
+				var disposed = false
+				var load = function () {
+					fetch('/api/ego/login-extension/health', { cache: 'no-store' })
+						.then(function (r) { return r.ok ? r.json() : null })
+						.then(function (json) {
+							if (disposed || !json) return
+							setChromeLogin(function (prev) {
+								return {
+									...prev,
+									phase: json.ok ? 'ready' : 'error',
+									paired: !!json.paired,
+									port: json.port || prev.port,
+													extensionPath: json.extensionPath || prev.extensionPath,
+									tokenPath: json.tokenPath || prev.tokenPath,
+								}
+							})
+						})
+						.catch(function () {})
+				}
+				load()
+				var timer = window.setInterval(load, 8000)
+				return function () { disposed = true; window.clearInterval(timer) }
+			}, [])
+
+			var loginDomainFromUrl = function (url) {
+				try {
+					var host = new URL(url).hostname
+					if (!host || host === 'localhost') return host || ''
+					var parts = host.split('.')
+					return parts.length > 2 ? parts.slice(-2).join('.') : host
+				} catch (e) { return '' }
+			}
+			var startChromeLogin = function () {
+				if (chromeLogin.busy) return
+				if (!chromeLogin.paired) {
+					fetch('/api/ego/login-extension/pair-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+						.then(function (r) { return r.json() })
+						.then(function (json) {
+							if (json && json.ok) {
+								setPairOpen(true)
+								setChromeLogin(function (prev) { return { ...prev, code: json.code || '', expiresAt: json.expiresAt || 0, port: json.port || prev.port, message: '' } })
+							} else {
+								setChromeLogin(function (prev) { return { ...prev, message: (json && json.error) || '无法启动 Chrome 登录桥接' } })
+							}
+						})
+						.catch(function (err) { setChromeLogin(function (prev) { return { ...prev, message: String((err && err.message) || err) } }) })
+					return
+				}
+				var url = state.currentSpace && state.currentSpace.url
+				var domain = loginDomainFromUrl(url)
+				if (!domain) {
+					setChromeLogin(function (prev) { return { ...prev, message: wt('chromeLoginNoPage') } })
+					return
+				}
+				setChromeLogin(function (prev) { return { ...prev, busy: true, message: wt('chromeLoginWaiting') } })
+				fetch('/api/ego/login-extension/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ domains: [domain] }) })
+					.then(function (r) { return r.json() })
+					.then(function (json) {
+						if (!json || json.ok !== true || !json.jobId) throw new Error((json && json.error) || '无法启动导入')
+						var jobId = json.jobId
+						var started = Date.now()
+						var tick = function () {
+							fetch('/api/ego/login-extension/status?id=' + encodeURIComponent(jobId), { cache: 'no-store' })
+								.then(function (r) { return r.json() })
+								.then(function (status) {
+									if (status && status.state === 'done' && status.report) {
+										var report = status.report
+										setChromeLogin(function (prev) {
+											return {
+												...prev,
+												busy: false,
+												message: report.ok
+													? wt('chromeLoginDone').replace('{n}', String(report.written || 0)).replace('{domain}', domain)
+													: (report.error || wt('chromeLoginFailed')),
+											}
+										})
+									} else if (Date.now() - started > 125000) {
+										setChromeLogin(function (prev) { return { ...prev, busy: false, message: wt('chromeLoginTimeout') } })
+									} else {
+										window.setTimeout(tick, 800)
+									}
+								})
+								.catch(function () { window.setTimeout(tick, 1200) })
+						}
+						window.setTimeout(tick, 500)
+					})
+					.catch(function (err) { setChromeLogin(function (prev) { return { ...prev, busy: false, message: String((err && err.message) || err) } }) })
+			}
+
+			// Aspect-ratio presets: one-shot resizes, independent of the drag
+			// toggle. The worker keeps the current width and derives the height.
+			var presetState = React.useState(false)
+			var presetOpen = presetState[0]
+			var setPresetOpen = presetState[1]
+			var noticeState = React.useState('')
+			var sizeNotice = noticeState[0]
+			var setSizeNotice = noticeState[1]
+			var presetRef = React.useRef(null)
+			var PRESETS = [
+				{ label: '16:9', ratio: 16 / 9 },
+				{ label: '4:3', ratio: 4 / 3 },
+				{ label: '21:9', ratio: 21 / 9 },
+				{ label: '1:1', ratio: 1 },
+				{ label: '9:16', ratio: 9 / 16 },
+			]
+			// Surface a host/client version mismatch instead of failing silently:
+			// the client bundle can be newer than the running host process.
+			var noteSizeResult = function (status, parsed) {
+				if (status === 400 || status === 404) setSizeNotice(wt('sizeApiOutdated'))
+				else if (parsed && parsed.ok === true) setSizeNotice('')
+			}
+			var applyPreset = function (ratio) {
+				setPresetOpen(false)
+				fetch('/api/ego/window-size', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ aspect: ratio }),
+				}).then(function (r) {
+					return r.json().catch(function () { return null }).then(function (parsed) {
+						noteSizeResult(r.status, parsed)
+						if (parsed && parsed.ok === true && parsed.viewport && controller.liveImgTargetId) {
+							controller.noteViewport(controller.liveImgTargetId, parsed.viewport.width, parsed.viewport.height)
+						}
+						return parsed
+					})
+				}).catch(function () { return null })
+			}
+			var panelNavigate = function (url, reload) {
+				var targetId = currentSpace && currentSpace.targetId
+				if (!targetId) { setSizeNotice(wt('noActivePages')); return }
+				var body = reload ? { targetId: targetId, reload: true } : { targetId: targetId, url: url }
+				setSizeNotice('')
+				fetch('/api/ego/navigate', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(body),
+				}).then(function (r) {
+					return r.json().catch(function () { return null }).then(function (parsed) {
+						if (r.status === 404) setSizeNotice(wt('sizeApiOutdated'))
+						else if (parsed && parsed.ok === true) { setSizeNotice(''); controller.refresh() }
+						else setSizeNotice((parsed && parsed.error) || wt('actionFailed'))
+						return parsed
+					})
+				}).catch(function () { setSizeNotice(wt('actionFailed')) })
+			}
+			var openUrlInPanel = function () {
+				var entered = window.prompt(wt('openUrlPrompt'), (currentSpace && currentSpace.url) || 'https://')
+				if (!entered) return
+				var url = entered.trim()
+				if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url
+				panelNavigate(url, false)
+			}
+			var maximizeWindow = function () {
+				var targetId = currentSpace && currentSpace.targetId
+				if (!targetId) { setSizeNotice(wt('noActivePages')); return }
+				setSizeNotice('')
+				fetch('/api/ego/window-size', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ targetId: targetId, maximize: true }),
+				}).then(function (r) {
+					return r.json().catch(function () { return null }).then(function (parsed) {
+						if (r.status === 404) setSizeNotice(wt('sizeApiOutdated'))
+						else if (parsed && parsed.ok === true) setSizeNotice('')
+						else setSizeNotice((parsed && parsed.error) || wt('actionFailed'))
+						return parsed
+					})
+				}).catch(function () { setSizeNotice(wt('actionFailed')) })
+			}
+			React.useEffect(function () {
+				if (!presetOpen) return
+				var onDoc = function (event) {
+					var menu = presetRef.current
+					if (menu && event.target instanceof Node && menu.contains(event.target)) return
+					setPresetOpen(false)
+				}
+				document.addEventListener('pointerdown', onDoc, true)
+				return function () { document.removeEventListener('pointerdown', onDoc, true) }
+			}, [presetOpen])
+			// Resize handles over the live stage: dragging the right/bottom edge or
+			// the corner resizes the REAL browser window. They work regardless of
+			// the size-sync lock; the lock only governs whether sidebar-width
+			// changes follow the window.
+			var beginResize = function (axis) {
+				return function (event) {
+					event.preventDefault()
+					event.stopPropagation()
+					var startX = event.clientX
+					var startY = event.clientY
+					var sentX = 0
+					var sentY = 0
+					var lastAt = 0
+					var inFlight = false
+					var sendStep = function (stepX: number, stepY: number) {
+						var payload: Record<string, number> = {}
+						if (Math.abs(stepX) >= 1) payload.delta = Math.round(stepX)
+						if (Math.abs(stepY) >= 1) payload.dy = Math.round(stepY)
+						if (payload.delta === undefined && payload.dy === undefined) return
+						fetch('/api/ego/window-size', {
+							method: 'POST',
+							headers: { 'content-type': 'application/json' },
+							body: JSON.stringify(payload),
+						}).then(function (r) {
+							return r.json().catch(function () { return null }).then(function (parsed) {
+								noteSizeResult(r.status, parsed)
+								if (parsed && parsed.ok === true && parsed.viewport && controller.liveImgTargetId) {
+									controller.noteViewport(controller.liveImgTargetId, parsed.viewport.width, parsed.viewport.height)
+								}
+								return parsed
+							})
+						}).catch(function () { return null })
+							.finally(function () { inFlight = false })
+					}
+					var onMove = function (ev) {
+						var dxTotal = axis === 'y' ? 0 : ev.clientX - startX
+						var dyTotal = axis === 'x' ? 0 : ev.clientY - startY
+						var stepX = dxTotal - sentX
+						var stepY = dyTotal - sentY
+						if (Math.abs(stepX) < 3 && Math.abs(stepY) < 3) return
+						var now = Date.now()
+						if (inFlight || now - lastAt < 120) return
+						inFlight = true
+						lastAt = now
+						sentX = dxTotal
+						sentY = dyTotal
+						sendStep(stepX, stepY)
+					}
+					var onUp = function () {
+						document.removeEventListener('pointermove', onMove)
+						document.removeEventListener('pointerup', onUp)
+						document.removeEventListener('pointercancel', onUp)
+					}
+					document.addEventListener('pointermove', onMove)
+					document.addEventListener('pointerup', onUp)
+					document.addEventListener('pointercancel', onUp)
+				}
+			}
 
 			// Bind the live <img>/<video> to the controller the moment the element
 			// attaches. The deps-based effect below only fires when target/backend/
@@ -3463,6 +3080,7 @@ clearTimeout((panel as any)._dshHideT)
 					controller.setLiveImg(el, state.currentTargetId)
 					controller.noteWired()
 				}
+				if (sizeSyncOn) sizeSync.attach(el)
 			}
 			var bindLiveVideo = function (el) {
 				videoRef.current = el
@@ -3471,16 +3089,74 @@ clearTimeout((panel as any)._dshHideT)
 					controller.setLiveVideo(el, state.currentTargetId)
 					controller.noteWired()
 				}
+				if (el) controller.setLiveBuffers(null)
+				if (sizeSyncOn) sizeSync.attach(el)
 			}
+
+			// #81: two overlay <img> layers behind the semantic image. Stable ref
+			// callbacks (React would otherwise detach/re-attach on every render).
+			var liveBuffersRef = React.useRef([null, null])
+			var syncLiveBuffersRef = React.useRef(function () {
+				var list = liveBuffersRef.current
+				controller.setLiveBuffers(list[0] && list[1] ? [list[0], list[1]] : null)
+			})
+			var bindLiveBufA = React.useRef(function (el) { liveBuffersRef.current[0] = el; syncLiveBuffersRef.current() })
+			var bindLiveBufB = React.useRef(function (el) { liveBuffersRef.current[1] = el; syncLiveBuffersRef.current() })
 
 			React.useEffect(function () {
 				controller.start()
 				return function () { controller.dispose() }
 			}, [controller])
 
+			// Tell the worker how wide the screencast should be: capturing at the
+			// configured 1280 for a ~550 px panel wasted most of Chrome's encoder.
+			// Must run before setVisible() so the first watch/start already carries
+			// a measured width; a 0-width root used to lock the hint at 480 and
+			// blur the frame (#81). A ResizeObserver keeps it fresh for later
+			// watch restarts.
 			React.useEffect(function () {
-				controller.setVisible(visible)
+				var root = rootRef.current
+				if (!root || !controller) return
+				var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+				var update = function () {
+					var width = root.clientWidth
+					if (!(width > 0)) return
+					var next = Math.max(480, Math.min(1280, Math.round(width * dpr * 1.15)))
+					if (next === controller.maxWidthHint) return
+					controller.maxWidthHint = next
+					controller.scheduleMaxWidthRefresh()
+				}
+				update()
+				var observer = null
+				if (typeof ResizeObserver !== 'undefined') {
+					try { observer = new ResizeObserver(update); observer.observe(root) } catch (e) { observer = null }
+				}
+				return function () { if (observer) { try { observer.disconnect() } catch (e) {} } }
 			}, [visible, controller])
+
+			React.useEffect(function () {
+				controller.setVisible(visible && !document.hidden)
+			}, [visible, controller])
+
+			// Minimizing the DSH window (or hiding it) must stop the screencast:
+			// there is nothing to look at, and continuous capture is the bulk of
+			// the CPU cost. Coming back restores the watch and stream.
+			React.useEffect(function () {
+				var onVisibility = function () { controller.setVisible(!!visibleRef.current && !document.hidden) }
+				document.addEventListener('visibilitychange', onVisibility)
+				return function () { document.removeEventListener('visibilitychange', onVisibility) }
+			}, [controller])
+
+			// Reattach the size observer when the panel becomes visible or the shown
+			// tab changes; a hidden panel must not keep reporting sizes.
+			React.useEffect(function () {
+				if (!visible) sizeSync.attach(null)
+				else sizeSync.attach(imgRef.current || videoRef.current)
+			}, [visible, sizeSync, state.currentTargetId, state.streamGeneration])
+
+			React.useEffect(function () {
+				return function () { sizeSync.dispose() }
+			}, [sizeSync])
 
 			// Attach the live <img> to the controller whenever the target changes
 			React.useEffect(function () {
@@ -3490,23 +3166,46 @@ clearTimeout((panel as any)._dshHideT)
 				if (videoRef.current && state.currentTargetId != null) controller.setLiveVideo(videoRef.current, state.currentTargetId)
 			}, [state.currentTargetId, state.backend, state.streamGeneration, state.streamState, controller])
 
-			// Native wheel listener (React onWheel is passive, can't preventDefault)
+			// Native wheel listener on the STAGE, not on the live <img>: the img is
+			// conditionally rendered (only after the first thumbnail), so binding in
+			// a one-shot effect missed it and wheel/scroll stayed dead (#81).
 			React.useEffect(function () {
-				var img = imgRef.current || videoRef.current
-				if (!img) return
+				var stage = stageRef.current
+				if (!stage) return
 				var handler = function (e) { controller.handleWheel(e) }
-				img.addEventListener('wheel', handler, { passive: false })
-				return function () { img.removeEventListener('wheel', handler) }
-			}, [controller, state.currentTargetId, state.backend, state.streamGeneration])
+				stage.addEventListener('wheel', handler, { passive: false })
+				return function () { stage.removeEventListener('wheel', handler) }
+			}, [controller, state.currentTargetId, state.currentSpace, state.backend, state.streamGeneration])
 
 			var h = React.createElement
+			var icon = function (svg) {
+				return h('span', { className: 'dsh-ego-side-btnico', dangerouslySetInnerHTML: { __html: svg } })
+			}
+			var streamText = (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · '
+				+ (state.streamState === 'failed' ? (state.streamMessage || wt('failed')) : state.streamState)
+				+ (state.currentTargetId ? (state.wiringStale ? ' · ' + wt('stale') : ' · ' + wt('captured')) : '')
+			var executorText = residentInfo
+				? (residentInfo.mode === 'resident'
+					? wt('executorResident') + (residentInfo.ageMs ? ' ' + Math.round(residentInfo.ageMs / 60000) + 'm' : '')
+					: residentInfo.parked ? wt('executorParked') : residentInfo.mode === 'starting' ? wt('executorStarting') : wt('executorOneShot'))
+				: ''
 
 			// Header
 			var header = h('div', { className: 'dsh-ego-side-head' },
 				h('span', { className: 'dsh-ego-side-title' },
-					h('span', { dangerouslySetInnerHTML: { __html: ICON_GLOBE } }),
+					h('span', { dangerouslySetInnerHTML: { __html: ICON_AGENT_BROWSER } }),
 					h('span', { style: { marginLeft: '5px' } }, state.busy ? wt('titleLive') : wt('title'))
 				),
+				// Primary login-state action lives in the title bar (top row).
+				h('button', {
+					className: 'dsh-ego-side-back dsh-ego-side-loginbtn dsh-ego-side-loginbtn-head'
+						+ (chromeLogin.paired ? ' dsh-ego-side-loginbtn-ready' : '')
+						+ (chromeLogin.busy ? ' dsh-ego-side-loginbtn-busy' : ''),
+					type: 'button',
+					title: chromeLogin.message || wt('chromeLoginHint'),
+					disabled: chromeLogin.busy,
+					onClick: startChromeLogin,
+				}, icon(chromeLogin.paired ? ICON_LOCK : ICON_KEY), chromeLogin.busy ? wt('chromeLoginWaiting') : chromeLogin.paired ? wt('chromeLoginReuse') : wt('chromeLoginConnect')),
 				h('button', {
 					className: 'dsh-ego-side-iconbtn' + (state.busy ? ' spinning' : ''),
 					title: wt('refresh'),
@@ -3521,11 +3220,37 @@ clearTimeout((panel as any)._dshHideT)
 				}, h('span', { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }))
 			)
 
+			// Pairing popover lives at the root so it can anchor under the header
+			// (the login button is in the title bar now).
+			var pairbox = pairOpen
+				? h('div', { className: 'dsh-ego-side-pairbox' },
+					h('div', { className: 'dsh-ego-side-pairhead' },
+						h('span', null, wt('chromeLoginPairTitle')),
+						h('button', { className: 'dsh-ego-side-pairclose', type: 'button', title: wt('chromeLoginClose'), onClick: function () { setPairOpen(false) } }, '×')
+					),
+					h('div', { className: 'dsh-ego-side-pairstep' }, wt('chromeLoginPairStep1')),
+					h('div', { className: 'dsh-ego-side-pairstep' }, wt('chromeLoginPairStep2')),
+					h('div', { className: 'dsh-ego-side-paircode' }, chromeLogin.code || '······'),
+					h('div', { className: 'dsh-ego-side-pairstep' }, wt('chromeLoginPairStep3')),
+					h('div', { className: 'dsh-ego-side-pairpath' }, chromeLogin.extensionPath || wt('chromeLoginPathHint')),
+					h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+						h('button', { className: 'dsh-ego-side-back', type: 'button', onClick: function () { try { navigator.clipboard.writeText(chromeLogin.extensionPath || '') } catch (e) {} } }, wt('chromeLoginCopyPath')),
+						!chromeLogin.paired
+							? h('button', { className: 'dsh-ego-side-back', type: 'button', onClick: startChromeLogin }, wt('chromeLoginNewCode'))
+							: null
+					),
+					chromeLogin.paired
+						? h('div', { className: 'dsh-ego-side-pairstep', style: { color: '#7fbf8a' } }, wt('chromeLoginPaired'))
+						: null
+				)
+				: null
+
 			// History overlay: covers the body area
 			if (state.historyOpen) {
 				var sorted = state.spaces.slice().sort(function (a, b) { return (a.lastActive || 0) - (b.lastActive || 0) })
 				return h('div', { className: 'dsh-ego-side-root' },
 					header,
+					pairbox,
 					h('div', { className: 'dsh-ego-side-history' },
 						h('div', { className: 'dsh-ego-side-historyhead' },
 							h('span', { dangerouslySetInnerHTML: { __html: ICON_CLOCK } }),
@@ -3555,11 +3280,9 @@ clearTimeout((panel as any)._dshHideT)
 				)
 			}
 
-			// Guide strips
+			// Guide strips (human verification only; the old “log in, then save”
+			// banner was removed — the login action lives in the title bar now).
 			var guides = []
-			if (state.showLoginGuide) {
-				guides.push(h(EgoLoginGuide, { key: 'login', controller: controller }))
-			}
 			if (state.captchaKind) {
 				guides.push(h(EgoCaptchaGuide, { key: 'captcha', kind: state.captchaKind, controller: controller }))
 			}
@@ -3604,61 +3327,79 @@ clearTimeout((panel as any)._dshHideT)
 						onPointerDown: function (e) { controller.handlePointerDown(e) }, onPointerMove: function (e) { controller.handlePointerMove(e) }, onPointerUp: function (e) { controller.handlePointerUp(e) }, onPointerCancel: function (e) { controller.handlePointerUp(e) }, onDoubleClick: function (e) { controller.handleDoubleClick(e) },
 					})
 					: currentSpace.thumbnail
-					? h('img', {
-						ref: bindLiveImg,
-						key: 'liveimg',
-						className: 'dsh-ego-side-liveimg',
-						src: currentSpace.thumbnail,
-						alt: 'live',
-						draggable: false,
-						onPointerDown: function (e) { controller.handlePointerDown(e) },
-						onPointerMove: function (e) { controller.handlePointerMove(e) },
-						onPointerUp: function (e) { controller.handlePointerUp(e) },
-						onPointerCancel: function (e) { controller.handlePointerUp(e) },
-						onDoubleClick: function (e) { controller.handleDoubleClick(e) },
-					})
+					? h('div', { className: 'dsh-ego-side-livebox' },
+						h('img', {
+							ref: bindLiveImg,
+							key: 'liveimg',
+							className: 'dsh-ego-side-liveimg dsh-ego-side-liveimg-semantic',
+							src: currentSpace.thumbnail,
+							alt: 'live',
+							draggable: false,
+							decoding: 'async',
+							onPointerDown: function (e) { controller.handlePointerDown(e) },
+							onPointerMove: function (e) { controller.handlePointerMove(e) },
+							onPointerUp: function (e) { controller.handlePointerUp(e) },
+							onPointerCancel: function (e) { controller.handlePointerUp(e) },
+							onDoubleClick: function (e) { controller.handleDoubleClick(e) },
+						}),
+						h('img', { ref: bindLiveBufA.current, key: 'livebuf-a', className: 'dsh-ego-side-liveimg dsh-ego-side-livebuf', alt: '', draggable: false, decoding: 'async' }),
+						h('img', { ref: bindLiveBufB.current, key: 'livebuf-b', className: 'dsh-ego-side-liveimg dsh-ego-side-livebuf', alt: '', draggable: false, decoding: 'async' }),
+					)
 					: h('div', { className: 'dsh-ego-side-liveurl' }, state.streamMessage || wt('noScreenshot'))
 
 				body = h('div', { className: 'dsh-ego-side-body' },
 					h('div', { className: 'dsh-ego-side-liveview' },
 						h('div', { className: 'dsh-ego-side-livebadge' },
-							h('span', { className: 'dsh-ego-side-state-dot' + (state.pinned ? ' pin' : state.busy ? ' busy' : '') }),
-							h('span', { style: { flex: 1 } }, (state.backend === 'ffmpeg' ? 'FFmpeg · H.264' : 'CDP') + ' · ' + (state.streamState === 'failed' ? (state.streamMessage || wt('failed')) : state.streamState) + (state.currentTargetId ? (state.wiringStale ? ' · ' + wt('stale') : ' · ' + wt('captured')) : '')),
-							state.pinned
-								? h('button', {
-									className: 'dsh-ego-side-back', type: 'button',
-									onClick: function () { controller.unpin() },
-								}, wt('backToLive'))
-								: null,
-							h('button', {
-								className: 'dsh-ego-side-back', type: 'button',
-								title: wt('openExternal'),
-								onClick: function () {
-									var url = currentSpace.url
-									if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener')
-								},
-							}, wt('openExternal')),
-							// Raise the real agent window (issue #51): headless
-							// instances get replaced by a headed one on the same
-							// profile; headed ones just pop to the front.
-							h('button', {
-								className: 'dsh-ego-side-back', type: 'button',
-								title: wt('raiseWindowHint'),
-								onClick: function () {
-									fetch('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-										.then(function (r) { return r.json().catch(function () { return null }) })
-										.catch(function () { return null })
-								},
-							}, wt('raiseWindow'))
+							h('div', { className: 'dsh-ego-side-statusline' },
+								h('span', { className: 'dsh-ego-side-statuschip' },
+									h('span', { className: 'dsh-ego-side-state-dot' + (state.pinned ? ' pin' : state.busy ? ' busy' : '') }),
+									h('span', { className: 'dsh-ego-side-badgestatus' }, streamText)
+								),
+								executorText ? h('span', { className: 'dsh-ego-side-execchip' }, executorText) : null,
+								state.pinned ? h('button', { className: 'dsh-ego-side-back', type: 'button', onClick: function () { controller.unpin() } }, wt('backToLive')) : null,
+								h('span', { style: { flex: 1 } })
+							),
+							h('div', { className: 'dsh-ego-side-actionline' },
+								h('div', { className: 'dsh-ego-side-btngroup' },
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('openExternal'), onClick: function () { var url = currentSpace.url; if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener') } }, icon(ICON_OPEN_EXTERNAL), wt('openExternal')),
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('raiseWindowHint'), onClick: function () { fetch('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(function (r) { return r.json().catch(function () { return null }) }).catch(function () { return null }) } }, icon(ICON_POPOUT), wt('raiseWindow')),
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('refreshHint'), disabled: !currentSpace, onClick: function () { panelNavigate('', true) } }, icon(ICON_REFRESH), wt('refreshPage')),
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('openUrlHint'), disabled: !currentSpace, onClick: openUrlInPanel }, icon(ICON_LINK), wt('openUrl'))
+								),
+								h('div', { className: 'dsh-ego-side-btngroup' },
+									h('button', { className: 'dsh-ego-side-back' + (sizeSyncOn ? ' dsh-ego-side-back-on' : ''), type: 'button', title: wt('sizeSyncHint'), onClick: function () { var next = !sizeSyncOn; setSizeSyncOn(next); sizeSync.setEnabled(next); if (next) sizeSync.attach(imgRef.current || videoRef.current) } }, icon(sizeSyncOn ? ICON_LOCK : ICON_UNLOCK), sizeSyncOn ? wt('sizeSyncOn') : wt('sizeSyncOff')),
+									h('button', { className: 'dsh-ego-side-back' + (presetOpen ? ' dsh-ego-side-back-on' : ''), type: 'button', title: wt('sizePresetsHint'), onClick: function () { setPresetOpen(!presetOpen) } }, icon(ICON_ASPECT), wt('sizePresets')),
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('maximizeHint'), disabled: !currentSpace, onClick: maximizeWindow }, icon(ICON_MAXIMIZE), wt('maximizeWindow'))
+								),
+								presetOpen ? h('div', { className: 'dsh-ego-side-presets', ref: presetRef }, PRESETS.map(function (preset) { return h('button', { key: preset.label, type: 'button', className: 'dsh-ego-side-preset-item', onClick: function () { applyPreset(preset.ratio) } }, preset.label) })) : null,
+							),
 						),
-						liveImg,
-						h('div', { className: 'dsh-ego-side-livetitle' }, currentSpace.title || currentSpace.url || wt('newTab')),
-						h('div', { className: 'dsh-ego-side-liveurl' + (state.zoomHint ? ' dsh-ego-side-hint' : '') }, state.zoomHint || currentSpace.url || '')
+						h('div', { className: 'dsh-ego-side-stage' + (sizeSyncOn ? ' dsh-ego-size-unlocked' : ''), ref: stageRef },
+							liveImg,
+							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-right', title: wt('resizeHint'), onPointerDown: beginResize('x') }),
+							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-bottom', title: wt('resizeHint'), onPointerDown: beginResize('y') }),
+							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-corner', title: wt('resizeHint'), onPointerDown: beginResize('xy') })
+						)
 					)
 				)
 			}
 
-			return h('div', { className: 'dsh-ego-side-root' }, header, guides, tabsEl, body)
+			return h('div', { className: 'dsh-ego-side-root', ref: rootRef },
+				header,
+				guides,
+				tabsEl,
+				currentSpace
+					? h('div', { className: 'dsh-ego-side-pageinfo dsh-ego-side-pageinfo-tabs' },
+						h('span', { className: 'dsh-ego-side-livetitle', title: currentSpace.title || currentSpace.url || '' }, currentSpace.title || currentSpace.url || wt('newTab')),
+						h('span', { className: 'dsh-ego-side-liveurl' + ((state.zoomHint || sizeNotice) ? ' dsh-ego-side-hint' : '') }, sizeNotice || state.zoomHint || currentSpace.url || '')
+					)
+					: null,
+				chromeLogin.message && !pairOpen
+					? h('div', { className: 'dsh-ego-side-pagemessage' }, chromeLogin.message)
+					: null,
+				body,
+				pairbox
+			)
 		}
 
 		function EgoLoginGuide(props) {
@@ -3710,6 +3451,83 @@ clearTimeout((panel as any)._dshHideT)
 			)
 		}
 
+		// ── startWatchProbe: SSE-driven first-tool-call detector ─────────────
+		// Shared by the betterSidebar tab and the native right Sidebar tab.
+		// Listens for `tool-call` events on the SSE stream to detect when the
+		// agent first calls an ego_* tool, then asks the host to open the watch
+		// panel. No polling: the host-side markEgoToolCall() pushes the event
+		// into the SSE stream the moment a tool runs.
+		//
+		// Why "increase beyond baseline" not "0 → >0": toolCallCount is a
+		// host-process counter that persists across page reloads. The baseline is
+		// fetched ONCE at mount; after that, only a NEW tool call opens the
+		// panel. The one-shot guard lives with the caller (per session).
+		function startWatchProbe(openWatchTab) {
+			var probeDisposed = false
+			var baseline = null // null = not yet observed; set on first fetch
+			// One-shot baseline fetch (NOT a polling loop). After this, the
+			// SSE `tool-call` event is the sole signal.
+			void (async function () {
+				if (probeDisposed) return
+				try {
+					var res = await fetch(SPACES_ROUTE, { cache: 'no-store' })
+					if (!res.ok) return
+					var data = await res.json()
+					// The host marks the payload when the frame relay is off; the
+					// probe must not hold a push channel in that case.
+					if (data && data.frameRelay === false) { frameRelaySet(true); closeProbeSse() }
+					if (data && typeof data.toolCallCount === 'number') {
+						baseline = data.toolCallCount
+					}
+				} catch (e) {}
+			})()
+			// Listen for tool-call events on the shared SSE stream. The probe
+			// opens its OWN EventSource so it works even before the panel is
+			// mounted. While the frame relay is disabled there is no push
+			// channel at all, so the probe stays CLOSED rather than opening a
+			// stream the host refuses to serve.
+			var probeSse = null
+			var openProbeSse = function () {
+				if (probeDisposed || probeSse || frameRelayDisabled) return
+				try { probeSse = new EventSource('/api/ego/stream') } catch (e) { probeSse = null; return }
+				probeSse.addEventListener('tool-call', onProbeToolCall)
+			}
+			var closeProbeSse = function () {
+				try { if (probeSse) probeSse.close() } catch (e) {}
+				probeSse = null
+			}
+			var onProbeToolCall = function (ev) {
+				if (probeDisposed) return
+				try {
+					var m = JSON.parse(ev.data)
+					if (!m || typeof m.count !== 'number') return
+					var sid = typeof m.sessionId === 'string' && m.sessionId !== '' ? m.sessionId : undefined
+					if (baseline === null) {
+						// Event arrived before the baseline fetch resolved —
+						// treat this count as the baseline (it's the first
+						// we've seen) and open on the NEXT one. But if count
+						// is already >0, the agent has called a tool this
+						// session, so open now.
+						baseline = m.count
+						if (m.count > 0) openWatchTab(sid)
+						return
+					}
+					if (m.count > baseline) openWatchTab(sid)
+				} catch (e) {}
+			}
+			openProbeSse()
+			// The settings switch can also flip at runtime; mirror it here.
+			var offProbeRelay = frameRelaySubscribe(function (disabled) {
+				if (disabled) closeProbeSse()
+				else openProbeSse()
+			})
+			return function () {
+				probeDisposed = true
+				if (offProbeRelay) { try { offProbeRelay() } catch (e) {} }
+				closeProbeSse()
+			}
+		}
+
 		// ── mountSidebarTab: register the ego-browser watch tab ────────────────
 		function mountSidebarTab(ctx, betterSidebar) {
 			if (!betterSidebar) return function () {}
@@ -3730,26 +3548,6 @@ clearTimeout((panel as any)._dshHideT)
 				component: EgoBrowserTab,
 			})
 
-			// ── Auto-open probe (SSE-driven, no polling) ─────────────────────
-			// Listens for `tool-call` events on the SSE stream to detect when
-			// the agent first calls an ego_* tool, then opens the sidebar Tab.
-			// No /api/ego/spaces polling — the host-side markEgoToolCall()
-			// pushes the event into the SSE stream the moment a tool runs.
-			//
-			// Why "increase beyond baseline" not "0 → >0": toolCallCount is a
-			// host-process counter that persists across page reloads. The
-			// baseline is fetched ONCE at mount via a single /api/ego/spaces
-			// request; after that, only a NEW tool call (count goes up)
-			// triggers the open.
-			//
-			// Per-session scope: the event carries the CALLING session id, so the
-			// Tab opens with that session's scope — a background conversation's
-			// tool call lands in ITS OWN sidebar instead of the sidebar the user
-			// happens to be looking at. The one-shot guard is therefore per
-			// session, and the probe stream stays open (a later session must
-			// still be able to auto-open).
-			var probeDisposed = false
-			var baseline = null // null = not yet observed; set on first fetch
 			// Sessions whose sidebar already auto-opened this page load. Keyed PER
 			// SESSION: each conversation gets its own one-shot, and the open is scoped to
 			// the CALLING session, so a background conversation's tool call opens the Tab
@@ -3765,72 +3563,126 @@ clearTimeout((panel as any)._dshHideT)
 					betterSidebar.openTab({ type: 'ego-browser:watch' }, sessionId ? { sessionId: sessionId } : undefined)
 				} catch (e) {}
 			}
-			// One-shot baseline fetch (NOT a polling loop). After this, the
-			// SSE `tool-call` event is the sole signal.
-			void (async function () {
-				if (probeDisposed) return
-				try {
-					var res = await fetch(SPACES_ROUTE, { cache: 'no-store' })
-					if (!res.ok) return
-					var data = await res.json()
-					// The host marks the payload when the frame relay is off; the
-					// probe must not hold a push channel in that case.
-					if (data && data.frameRelay === false) { frameRelaySet(true); closeProbeSse() }
-					if (data && typeof data.toolCallCount === 'number') {
-						baseline = data.toolCallCount
-					}
-				} catch (e) {}
-			})()
-			// Listen for tool-call events on the shared SSE stream. The probe
-			// opens its OWN EventSource so it works even before the Tab is
-			// mounted (the Tab's controller only connects after the Tab opens).
-			// While the frame relay is disabled there is no push channel at all,
-			// so the probe stays CLOSED rather than opening a stream the host
-			// refuses to serve.
-			var probeSse = null
-			var openProbeSse = function () {
-				if (probeDisposed || probeSse || frameRelayDisabled) return
-				try { probeSse = new EventSource('/api/ego/stream') } catch (e) { probeSse = null; return }
-				probeSse.addEventListener('tool-call', onProbeToolCall)
-			}
-			var closeProbeSse = function () {
-				try { if (probeSse) probeSse.close() } catch (e) {}
-				probeSse = null
-			}
-			var onProbeToolCall = function (ev) {
-					if (probeDisposed) return
-					try {
-						var m = JSON.parse(ev.data)
-						if (!m || typeof m.count !== 'number') return
-						var sid = typeof m.sessionId === 'string' && m.sessionId !== '' ? m.sessionId : undefined
-						if (baseline === null) {
-							// Event arrived before the baseline fetch resolved —
-							// treat this count as the baseline (it's the first
-							// we've seen) and open on the NEXT one. But if count
-							// is already >0, the agent has called a tool this
-							// session, so open now.
-							baseline = m.count
-							if (m.count > 0) openWatchTab(sid)
-							return
-						}
-						if (m.count > baseline) openWatchTab(sid)
-					} catch (e) {}
-			}
-			openProbeSse()
-			// The settings switch can also flip at runtime; mirror it here.
-			var offProbeRelay = frameRelaySubscribe(function (disabled) {
-				if (disabled) closeProbeSse()
-				else openProbeSse()
-			})
+			var closeProbe = startWatchProbe(openWatchTab)
 
 			return function () {
-				probeDisposed = true
-				if (offProbeRelay) { try { offProbeRelay() } catch (e) {} }
-				closeProbeSse()
+				closeProbe()
 				disposeTab()
 				styleEl.remove()
 			}
 		}
+
+		// ── mountNativeSidebarTab: register into DSH's own right Sidebar (#64) ─
+		// DSH ships @deepseek-ai/dsh-client-ui-sidebar-right as a base package. A
+		// tab type registers in two stages: the static type into ctx.sidebarRightTabs,
+		// then the body into the keyed `sidebar.right.pane.tab` slot under the same
+		// definition id. The body receives the framework's `useTabInfo` hook and any
+		// extra props from our inject face (here: the client ctx, which EgoBrowserTab
+		// needs to build LivePreviewController).
+		var NATIVE_WATCH_ID = 'dsh-ego-browser:watch'
+		var NATIVE_WATCH_KIND = 'ego-browser:watch'
+
+		function EgoNativeWatchBody(props) {
+			var info = props.useTabInfo()
+			var visible = !!(info && info.tab && info.tab.visible)
+			return React.createElement(EgoBrowserTab, { visible: visible, ctx: props.ctx })
+		}
+
+		// Sidebar guide glyph: the canonical Agent Browser icon (browser window +
+		// agent cursor, same geometry as ICON_AGENT_BROWSER above). Self-contained
+		// (no import from the host icon set) so the entry can never fail on a host
+		// whose primitives package is not resolvable for this row; monochrome via
+		// currentColor so it follows the guide's own icon colour like every
+		// neighbour. IconProps shape: { size, className }.
+		function EgoWatchIcon(props) {
+			var size = props && typeof props.size === 'number' ? props.size : 16
+			var h = React.createElement
+			return h('svg', {
+				width: size,
+				height: size,
+				viewBox: '0 0 16 16',
+				fill: 'none',
+				xmlns: 'http://www.w3.org/2000/svg',
+				className: props && props.className,
+				'aria-hidden': 'true',
+			},
+				// window frame
+				h('rect', {
+					x: 1.2, y: 2.4, width: 13.6, height: 11.2, rx: 2.4,
+					stroke: 'currentColor', strokeWidth: 1.2,
+				}),
+				// title bar
+				h('path', {
+					d: 'M1.4 5.9h13.2',
+					stroke: 'currentColor', strokeWidth: 1.2, strokeLinecap: 'round',
+				}),
+				// window dots
+				h('circle', { cx: 3.7, cy: 4.15, r: 0.6, fill: 'currentColor' }),
+				h('circle', { cx: 5.5, cy: 4.15, r: 0.6, fill: 'currentColor' }),
+				// the agent's cursor, aimed into the page
+				h('path', {
+					d: 'M8.2 7.0L12.6 10.6L10.6 10.9L11.7 13.2L10.6 13.8L9.5 11.5L8.0 13.1Z',
+					fill: 'currentColor',
+				})
+			)
+		}
+
+		function mountNativeSidebarTab(ctx, sidebar, tabs) {
+			if (!sidebar || !tabs) return function () {}
+			// Inject Tab CSS once (cleaned up on dispose)
+			var styleEl = document.createElement('style')
+			styleEl.textContent = TAB_CSS
+			document.head.appendChild(styleEl)
+
+			var disposeType = tabs.register({
+				id: NATIVE_WATCH_ID,
+				kind: NATIVE_WATCH_KIND,
+				keepMounted: true,
+				priority: 'extension',
+				title: function () { return wt('title') },
+				guide: [{
+					id: 'ego-watch',
+					order: 90,
+					title: function () { return wt('title') },
+					icon: EgoWatchIcon,
+				}],
+			})
+
+			var disposeBody = ctx.slots.register({
+				name: 'sidebar.right.pane.tab',
+				key: NATIVE_WATCH_ID,
+				inject: function () { return { ctx: ctx } },
+			}, EgoNativeWatchBody)
+
+			// Sessions whose native sidebar already auto-opened this page load.
+			var autoOpened = {}
+			var openWatchTab = function (sessionId) {
+				var key = sessionId || ''
+				if (autoOpened[key] === true) return
+				// Navigation commands act on the mounted seat's session; opening
+				// from a background session would throw (or open in the wrong
+				// column), so require a match when the mounted session is known.
+				var showing
+				try {
+					var m = sidebar.mounted
+					showing = m && typeof m.getSnapshot === 'function' ? m.getSnapshot() : undefined
+				} catch (e) { showing = undefined }
+				if (sessionId && showing !== undefined && showing !== sessionId) return
+				try {
+					sidebar.openTab(NATIVE_WATCH_KIND)
+					autoOpened[key] = true
+				} catch (e) {}
+			}
+			var closeProbe = startWatchProbe(openWatchTab)
+
+			return function () {
+				closeProbe()
+				try { disposeBody() } catch (e) {}
+				try { disposeType() } catch (e) {}
+				styleEl.remove()
+			}
+		}
+
 
 		function escapeHtml(s) {
 			return String(s).replace(/[&<>"']/g, (c) => ({

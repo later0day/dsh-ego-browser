@@ -130,6 +130,8 @@ interface CurrentCapture {
   sessionId: string
   lastFrameAt: number
   startedAt: number
+  /** Effective screencast width for this capture (panel-sized, capped by config). */
+  maxWidth: number
 }
 
 export interface CdpCaptureBackendOptions {
@@ -156,6 +158,13 @@ export class CdpCaptureBackend {
   pendingFrame: JpegFrame | null
   sendTimer: NodeJS.Timeout | null
   backstopTimer: NodeJS.Timeout | null
+  /**
+   * Screencast metadata only carries a fresh viewport size when Chrome decides
+   * to include it; after a programmatic window resize the frames kept reporting
+   * the old width/height, so panel clicks were mapped into a stale coordinate
+   * space. Refresh the real viewport on a slow cadence while streaming.
+   */
+  viewportTimer: NodeJS.Timeout | null
   lastSentAt: number
   metrics: { sourceFrames: number; sentFrames: number; droppedFrames: number; ackErrors: number }
   offFrame: (() => void) | null
@@ -174,6 +183,7 @@ export class CdpCaptureBackend {
     this.pendingFrame = null
     this.sendTimer = null
     this.backstopTimer = null
+    this.viewportTimer = null
     this.lastSentAt = 0
     this.metrics = { sourceFrames: 0, sentFrames: 0, droppedFrames: 0, ackErrors: 0 }
     this.offFrame = cdp.on('Page.screencastFrame', (params: unknown, targetSessionId?: string) => this.#onFrame(params as Record<string, unknown>, targetSessionId))
@@ -185,21 +195,30 @@ export class CdpCaptureBackend {
     })
   }
 
-  async start({ targetId }: { targetId: string }): Promise<void> {
+  async start({ targetId, maxWidth }: { targetId: string; maxWidth?: number }): Promise<void> {
     await this.stop('restart')
     const session = await this.sessions.ensure(targetId)
     const config = this.getConfig()
-    this.current = { targetId, sessionId: session.sessionId, lastFrameAt: 0, startedAt: this.now() }
+    // The panel asks for roughly its own display width; never exceed the
+    // configured ceiling (users who want full 1280 keep it via settings).
+    const effectiveMaxWidth = Math.max(320, Math.min(config.cdpMaxWidth, maxWidth && maxWidth > 0 ? Math.round(maxWidth) : config.cdpMaxWidth))
+    this.current = { targetId, sessionId: session.sessionId, lastFrameAt: 0, startedAt: this.now(), maxWidth: effectiveMaxWidth }
     this.onStatus({ backend: 'cdp', state: 'starting', targetId })
     try {
       await this.cdp.call('Page.startScreencast', {
         format: 'jpeg',
         quality: config.cdpQuality,
-        maxWidth: config.cdpMaxWidth,
-        everyNthFrame: 1,
+        maxWidth: effectiveMaxWidth,
+        // Chrome encodes every presented frame by default (~100/s on an
+        // animated page) while the panel forwards cdpFps. Ask Chrome to skip
+        // frames at the source: a 60 Hz compositor with everyNthFrame=3 emits
+        // ~20 fps, which matches the panel rate without the encoder doing 5x
+        // the work.
+        everyNthFrame: Math.max(1, Math.min(8, Math.round(60 / Math.max(1, config.cdpFps)))),
       }, session.sessionId)
       this.onStatus({ backend: 'cdp', state: 'streaming', targetId, metrics: this.metrics })
       this.#scheduleBackstop()
+      this.#scheduleViewportSync()
     } catch (error) {
       this.current = null
       this.onStatus({ backend: 'cdp', state: 'failed', targetId, code: 'cdp-start-failed', message: (error as Error).message })
@@ -207,20 +226,22 @@ export class CdpCaptureBackend {
     }
   }
 
-  async switchTarget({ targetId }: { targetId: string }): Promise<void> {
+  async switchTarget({ targetId, maxWidth }: { targetId: string; maxWidth?: number }): Promise<void> {
     this.onStatus({ backend: 'cdp', state: 'switching', targetId })
-    await this.start({ targetId })
+    await this.start({ targetId, maxWidth })
   }
 
   async updateConfig(): Promise<void> {
-    if (this.current) await this.start({ targetId: this.current.targetId })
+    if (this.current) await this.start({ targetId: this.current.targetId, maxWidth: this.current.maxWidth })
   }
 
   async stop(reason = 'stopped'): Promise<void> {
     this.clearTimer(this.sendTimer!)
     this.clearTimer(this.backstopTimer!)
+    this.clearTimer(this.viewportTimer!)
     this.sendTimer = null
     this.backstopTimer = null
+    this.viewportTimer = null
     this.pendingFrame = null
     const current = this.current
     this.current = null
@@ -237,6 +258,8 @@ export class CdpCaptureBackend {
   }
 
   dispose(): void {
+    if (this.viewportTimer) this.clearTimer(this.viewportTimer)
+    this.viewportTimer = null
     this.offFrame?.()
     this.offFrame = null
     this.offDestroyed?.()
@@ -287,8 +310,28 @@ export class CdpCaptureBackend {
     this.onJpegFrame(frame)
   }
 
-  #scheduleBackstop(): void {
-    this.clearTimer(this.backstopTimer!)
+  /**
+   * Keep the session's viewport size in sync with the real page. Chrome does
+   * not reliably attach fresh viewport metadata to every screencast frame, and
+   * the window-size route resizes the window directly; without this poll the
+   * frames kept advertising the pre-resize viewport and panel input was mapped
+   * to the wrong coordinates.
+   */
+  #scheduleViewportSync(): void {
+    if (this.viewportTimer) this.clearTimer(this.viewportTimer)
+    this.viewportTimer = this.setTimer(async () => {
+      const current = this.current
+      if (!current) return
+      try {
+        await this.sessions.updateViewport(current.targetId)
+      } catch {
+        /* ignore */
+      }
+      if (this.current === current) this.#scheduleViewportSync()
+    }, 1000)
+  }
+
+  #scheduleBackstop(): void {    this.clearTimer(this.backstopTimer!)
     const interval = this.getConfig().cdpBackstopIntervalMs
     this.backstopTimer = this.setTimer(async () => {
       const current = this.current
@@ -296,7 +339,8 @@ export class CdpCaptureBackend {
       if (this.now() - current.lastFrameAt >= interval) {
         try {
           const session = await this.sessions.updateViewport(current.targetId)
-          const scale = session.viewportW! > this.getConfig().cdpMaxWidth ? this.getConfig().cdpMaxWidth / session.viewportW! : 1
+          const maxWidth = this.current?.maxWidth ?? this.getConfig().cdpMaxWidth
+          const scale = session.viewportW! > maxWidth ? maxWidth / session.viewportW! : 1
           const result = await this.cdp.call('Page.captureScreenshot', {
             format: 'jpeg',
             quality: this.getConfig().cdpQuality,

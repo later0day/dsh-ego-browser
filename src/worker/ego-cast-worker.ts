@@ -9,7 +9,9 @@ import { WebSocket } from 'ws'
 import { CdpClient } from './cdp-client.ts'
 import { TargetSessions, CdpCaptureBackend } from './capture-cdp.ts'
 import { CaptureManager } from './capture-manager.ts'
+import { captureSnapshot } from './snapshot.ts'
 import { FfmpegCaptureBackend } from './capture-ffmpeg.ts'
+import { computeWindowBounds, widthWithDelta, clampViewportSize } from './window-size.ts'
 
 const SENTINEL = '@@DSH_RESULT@@'
 const HOME = homedir() || process.env.HOME || process.env.USERPROFILE || '/root'
@@ -37,7 +39,7 @@ interface CastConfig {
 
 const DEFAULT_CONFIG: CastConfig = {
   captureBackend: 'auto', streamProfile: 'balanced', ffmpegFallbackReason: '',
-  cdpFps: 20, cdpQuality: 55, cdpMaxWidth: 960, cdpBackstopIntervalMs: 3000,
+  cdpFps: 20, cdpQuality: 55, cdpMaxWidth: 1280, cdpBackstopIntervalMs: 3000,
   ffmpegFps: 20, ffmpegMaxWidth: 1280, ffmpegBitrateKbps: 4000, ffmpegEncoder: 'auto', ffmpegPath: '', ffmpegResolvedPath: '',
 }
 let castConfig: CastConfig = { ...DEFAULT_CONFIG }
@@ -387,6 +389,73 @@ function stopSiblingWorkers(): void {
   } catch { /* ignore */ }
 }
 
+/**
+ * Chrome's own frame around the page, used to turn a desired PAGE viewport into
+ * a WINDOW size. Measured from the page because the frame height differs by
+ * platform/version; falls back to a conservative constant when the page cannot
+ * be evaluated (closed tab, navigation in flight).
+ */
+async function measureChromeFrame(browser: ActiveBrowser, targetId: string): Promise<{ width: number; height: number }> {
+  try {
+    const response = await browser.sessions.call(targetId, 'Runtime.evaluate', {
+      expression: '({ ow: window.outerWidth, iw: window.innerWidth, oh: window.outerHeight, ih: window.innerHeight })',
+      returnByValue: true,
+    }) as { result?: { value?: { ow?: number; iw?: number; oh?: number; ih?: number } } }
+    const value = response?.result?.value
+    if (value && Number.isFinite(value.ow) && Number.isFinite(value.iw) && Number.isFinite(value.oh) && Number.isFinite(value.ih)) {
+      return {
+        width: Math.max(0, Math.round((value.ow as number) - (value.iw as number))),
+        height: Math.max(0, Math.round((value.oh as number) - (value.ih as number))),
+      }
+    }
+  } catch {
+    // best effort only; the fallback keeps the resize useful
+  }
+  return { width: 0, height: IS_WIN ? 132 : 88 }
+}
+
+/**
+ * The page's real viewport size. The panel reports only a width (its element
+ * box cannot be trusted for height: CSS caps it and the thumbnail branch
+ * distorts it), so the height follows the aspect the page is actually laid out
+ * at right now.
+ */
+async function measureViewport(browser: ActiveBrowser, targetId: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const response = await browser.sessions.call(targetId, 'Runtime.evaluate', {
+      expression: '({ w: window.innerWidth, h: window.innerHeight })',
+      returnByValue: true,
+    }) as { result?: { value?: { w?: number; h?: number } } }
+    const value = response?.result?.value
+    if (value && Number.isFinite(value.w) && Number.isFinite(value.h) && (value.w as number) > 0 && (value.h as number) > 0) {
+      return { width: Math.round(value.w as number), height: Math.round(value.h as number) }
+    }
+  } catch {
+    // best effort; the caller falls back to a sane aspect
+  }
+  return null
+}
+
+interface WindowSizeCacheEntry {
+  windowId: number
+  chromeFrame: { width: number; height: number }
+  viewport: { width: number; height: number }
+  left: number
+  top: number
+  measuredAt: number
+  viewportAt: number
+}
+
+/**
+ * The panel's resize handles fire several requests per second while dragging.
+ * Measuring the window, Chrome's frame and the page viewport on every one of
+ * them meant ~5 CDP round-trips per step and made the drag stutter. Cache the
+ * expensive parts; the cached viewport is maintained by our own resizes and
+ * re-read from the session every couple of seconds.
+ */
+const windowSizeCache = new Map<string, WindowSizeCacheEntry>()
+const windowSizeViewportRefresh = new Map<string, ReturnType<typeof setTimeout>>()
+
 async function main(): Promise<void> {
   stopSiblingWorkers()
   rmSync(CAST_STATE_FILE, { force: true })
@@ -395,11 +464,132 @@ async function main(): Promise<void> {
     try {
       if (req.method === 'GET' && url.pathname === '/api/health') return sendJson(res, 200, { workerOk: true, browserConnected: !!active, capture: manager.status() })
       if (req.method === 'GET' && url.pathname === '/api/spaces') return sendJson(res, 200, { ok: true, spaces: active ? await snapshotSpaces() : [], capture: manager.status() })
+      if (req.method === 'GET' && url.pathname === '/api/snapshot') {
+        const browser = active
+        if (!browser) return sendJson(res, 409, { ok: false, error: 'no live browser' })
+        const maxWidth = Number(url.searchParams.get('maxWidth') ?? 320)
+        if (!Number.isInteger(maxWidth) || maxWidth < 1 || maxWidth > 1920) return sendJson(res, 400, { ok: false, error: 'maxWidth must be an integer from 1 to 1920' })
+        const targets = await listTargets()
+        const targetId = url.searchParams.get('targetId') || await activeTargetId() || targets[0]?.targetId
+        if (!targetId || !targets.some((target) => target.targetId === targetId)) return sendJson(res, 409, { ok: false, error: 'target is no longer available' })
+        const png = await captureSnapshot(browser.sessions, targetId, maxWidth)
+        res.writeHead(200, { 'content-type': 'image/png', 'content-length': png.length, 'cache-control': 'no-store' })
+        return res.end(png)
+      }
+      if (req.method === 'POST' && url.pathname === '/api/window-size') {
+        const body = await readJson(req)
+        const requestedWidth = Number(body.width)
+        const requestedDelta = Number(body.delta)
+        const requestedHeight = Number(body.height)
+        const requestedDy = Number(body.dy)
+        const requestedAspect = Number(body.aspect)
+        const maximize = body.maximize === true
+        const hasWidth = Number.isFinite(requestedWidth) && requestedWidth >= 200
+        const hasDelta = Number.isFinite(requestedDelta) && requestedDelta !== 0
+        const hasHeight = Number.isFinite(requestedHeight) && requestedHeight >= 120
+        const hasDy = Number.isFinite(requestedDy) && requestedDy !== 0
+        const hasAspect = Number.isFinite(requestedAspect) && requestedAspect > 0 && requestedAspect < 10
+        if (!hasWidth && !hasDelta && !hasHeight && !hasDy && !hasAspect && !maximize) {
+          return sendJson(res, 400, { ok: false, error: 'width, delta, height, dy, aspect or maximize is required' })
+        }
+        if (!active) return sendJson(res, 409, { ok: false, code: 'browser-disconnected', error: 'no live browser' })
+        // Capture the browser for the whole request: `active` can go null while
+        // a CDP round-trip is in flight, and a closure would lose the narrowing.
+        const browser = active
+        const targetId = typeof body.targetId === 'string' && body.targetId ? body.targetId : await activeTargetId()
+        if (!targetId) return sendJson(res, 409, { ok: false, error: 'no active target' })
+        try {
+          const now = Date.now()
+          if (maximize) {
+            const { windowId } = await browser.cdp.call('Browser.getWindowForTarget', { targetId }) as { windowId?: number }
+            if (typeof windowId !== 'number') {
+              return sendJson(res, 409, { ok: false, code: 'headless', error: 'the browser has no window (headless); use the pop-out button first' })
+            }
+            await browser.cdp.call('Browser.setWindowBounds', { windowId, bounds: { windowState: 'maximized' } })
+            windowSizeCache.delete(targetId)
+            return sendJson(res, 200, { ok: true, windowId, maximized: true })
+          }
+          let cache = windowSizeCache.get(targetId)
+          if (!cache || now - cache.measuredAt > 10000) {
+            const { windowId } = await browser.cdp.call('Browser.getWindowForTarget', { targetId }) as { windowId?: number }
+            if (typeof windowId !== 'number') {
+              return sendJson(res, 409, { ok: false, code: 'headless', error: 'the browser has no window (headless); use the pop-out button first' })
+            }
+            const current = await browser.cdp.call('Browser.getWindowBounds', { windowId }) as { bounds?: { left?: number; top?: number; width?: number; height?: number } }
+            const chromeFrame = await measureChromeFrame(browser, targetId)
+            const measured = await measureViewport(browser, targetId)
+            const bounds = current?.bounds ?? {}
+            cache = {
+              windowId,
+              chromeFrame,
+              viewport: measured ?? {
+                width: Math.max(0, (bounds.width ?? 0) - chromeFrame.width),
+                height: Math.max(0, (bounds.height ?? 0) - chromeFrame.height),
+              },
+              left: typeof bounds.left === 'number' ? bounds.left : 0,
+              top: typeof bounds.top === 'number' ? bounds.top : 0,
+              measuredAt: now,
+              viewportAt: now,
+            }
+            windowSizeCache.set(targetId, cache)
+          } else if (now - cache.viewportAt > 2000) {
+            // Re-read the viewport before computing a delta: the page may have
+            // been resized outside this route.
+            const session = await browser.sessions.updateViewport(targetId).catch(() => null)
+            if (session && Number.isFinite(session.viewportW) && Number.isFinite(session.viewportH)) {
+              cache.viewport = { width: session.viewportW as number, height: session.viewportH as number }
+            }
+            cache.viewportAt = now
+          }
+          const currentWidth = cache.viewport.width
+          const currentHeight = cache.viewport.height
+          if ((currentWidth <= 0 || currentHeight <= 0) && !(hasWidth && hasHeight)) {
+            return sendJson(res, 409, { ok: false, error: 'could not determine the current viewport size' })
+          }
+          // Resolve the requested page viewport. `delta`/`dy` come from panel
+          // drags (incremental), `width`/`height` from tools, `aspect` from the
+          // preset menu (keep the current width, derive the height).
+          const width = hasWidth
+            ? Math.round(requestedWidth)
+            : hasDelta
+              ? widthWithDelta(currentWidth, requestedDelta)
+              : currentWidth
+          let height: number
+          if (hasHeight) height = Math.round(requestedHeight)
+          else if (hasAspect) height = Math.round(width / requestedAspect)
+          else if (hasDy) height = Math.round(currentHeight + requestedDy)
+          else height = Math.round(width * currentHeight / currentWidth)
+          const clamped = clampViewportSize(width, height)
+          const bounds = computeWindowBounds(clamped, cache.chromeFrame, { left: cache.left, top: cache.top })
+          await browser.cdp.call('Browser.setWindowBounds', { windowId: cache.windowId, bounds })
+          cache.viewport = clamped
+          cache.left = typeof bounds.left === 'number' ? bounds.left : cache.left
+          cache.top = typeof bounds.top === 'number' ? bounds.top : cache.top
+          cache.measuredAt = now
+          cache.viewportAt = now
+          // Make the capture session advertise the new viewport promptly: the
+          // panel maps its clicks through the frame's vw/vh, so stale metadata
+          // would offset input right after a resize. Debounced to one refresh
+          // per drag step burst.
+          if (!windowSizeViewportRefresh.has(targetId)) {
+            const timer = setTimeout(() => {
+              windowSizeViewportRefresh.delete(targetId)
+              void browser.sessions.updateViewport(targetId).catch(() => {})
+            }, 160)
+            timer.unref?.()
+            windowSizeViewportRefresh.set(targetId, timer)
+          }
+          return sendJson(res, 200, { ok: true, windowId: cache.windowId, bounds, viewport: clamped })
+        } catch (error) {
+          windowSizeCache.delete(targetId)
+          return sendJson(res, 503, { ok: false, code: 'window-resize-failed', error: (error as Error).message || String(error) })
+        }
+      }
       if (req.method === 'GET' && url.pathname === '/api/watch/status') return sendJson(res, 200, { ok: true, ...manager.status() })
       if (req.method === 'GET' && url.pathname === '/api/video/status') return sendJson(res, 200, { ok: true, ...manager.status(), mime: videoInit?.mime || null })
       if (req.method === 'POST' && url.pathname === '/api/config') { castConfig = normalizeConfig(await readJson(req)); await manager.updateConfig(); return sendJson(res, 200, { ok: true, config: castConfig }) }
-      if (req.method === 'POST' && url.pathname === '/api/watch/start') { if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' }); return sendJson(res, 200, { ok: true, ...await manager.startWatch(await readJson(req) as { clientId: string; targetId: string }) }) }
-      if (req.method === 'POST' && url.pathname === '/api/watch/switch') return sendJson(res, 200, { ok: true, ...await manager.switchWatch(await readJson(req) as { clientId: string; targetId: string }) })
+      if (req.method === 'POST' && url.pathname === '/api/watch/start') { if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' }); return sendJson(res, 200, { ok: true, ...await manager.startWatch(await readJson(req) as { clientId: string; targetId: string; backend?: string; maxWidth?: number }) }) }
+      if (req.method === 'POST' && url.pathname === '/api/watch/switch') return sendJson(res, 200, { ok: true, ...await manager.switchWatch(await readJson(req) as { clientId: string; targetId: string; maxWidth?: number }) })
       if (req.method === 'POST' && url.pathname === '/api/watch/stop') return sendJson(res, 200, { ok: true, ...await manager.stopWatch(await readJson(req) as { clientId: string }) })
       if (req.method === 'POST' && url.pathname === '/api/input') {
         const body = await readJson(req)
@@ -415,8 +605,42 @@ async function main(): Promise<void> {
           return sendJson(res, 503, { ok: false, code: 'input-dispatch-failed', error: (error as Error).message || String(error) })
         }
       }
+      if (req.method === 'POST' && url.pathname === '/api/navigate') {
+        const body = await readJson(req)
+        if (!active) return sendJson(res, 409, { ok: false, code: 'browser-disconnected', error: 'no live browser' })
+        const targetId = typeof body.targetId === 'string' && body.targetId ? body.targetId : await activeTargetId()
+        if (!targetId) return sendJson(res, 409, { ok: false, error: 'no active target' })
+        const targets = await listTargets()
+        if (!targets.some((target) => target.targetId === targetId)) {
+          return sendJson(res, 409, { ok: false, code: 'target-stale', error: 'target is no longer available' })
+        }
+        try {
+          if (body.reload === true) {
+            await active.sessions.call(targetId, 'Page.reload', { ignoreCache: body.hard === true })
+          } else if (typeof body.url === 'string' && body.url.trim()) {
+            await active.sessions.call(targetId, 'Page.navigate', { url: body.url.trim() })
+          } else {
+            return sendJson(res, 400, { ok: false, error: 'url or reload is required' })
+          }
+          return sendJson(res, 200, { ok: true, targetId, ...(body.reload === true ? { reloaded: true } : { navigated: true }) })
+        } catch (error) {
+          return sendJson(res, 503, { ok: false, code: 'navigate-failed', error: (error as Error).message || String(error) })
+        }
+      }
       if (req.method === 'POST' && url.pathname === '/api/close') { const { targetId } = await readJson(req); if (!active || !targetId) return sendJson(res, 400, { ok: false, error: 'targetId required' }); await active.cdp.call('Target.closeTarget', { targetId }); return sendJson(res, 200, { ok: true }) }
-      if (req.method === 'POST' && url.pathname === '/api/flush') { if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' }); await active.cdp.call('Storage.flushCookies').catch(() => { /* ignore */ }); return sendJson(res, 200, { ok: true }) }
+      if (req.method === 'POST' && url.pathname === '/api/flush') {
+        if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' })
+        // Report the actual jar size before nudging Chrome to persist it. The
+        // old handler returned {ok:true} without counts, so callers saw
+        // total:0 even when the browser held cookies (#93).
+        let total = 0
+        try {
+          const jar = await active.cdp.call('Storage.getCookies', {}) as { cookies?: unknown[] }
+          total = Array.isArray(jar.cookies) ? jar.cookies.length : 0
+        } catch { /* leave 0 */ }
+        try { await active.cdp.call('Storage.flushCookies') } catch { /* best effort */ }
+        return sendJson(res, 200, { ok: true, total, flushed: total })
+      }
       if (req.method === 'GET' && url.pathname === '/api/stream') {
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' })
         res.write(':ok\n\n')

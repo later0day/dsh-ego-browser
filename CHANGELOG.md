@@ -2,6 +2,265 @@
 
 所有对用户可见的变更集中在各版本号下。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本语义遵循 [SemVer](http://semver.org/)。
 
+## [0.9.13] - 2026-11-09 — 浏览器操作能力增强 & 观察窗 UI 重做
+
+### 新增
+- **原生操作规则提示（不引入 skill）**：注册 `plugin:ego-browser:rules` 系统提示段，文本按每个 step 重新求值——本进程第一次出现 `ego_*` 调用前为空（零 token），之后注入 8 条防错规则；装配上下文带 session id 时按会话门控，没有 `systemPrompt` 服务的主机静默跳过。
+- **结构化失败契约**：动作类工具失败不再抛异常，而是返回 `{ ok:false, code, actionSent, retry, hint }` 并渲染成一条可执行的恢复提示。覆盖 `TIMEOUT / LOCATOR_NOT_FOUND / NAVIGATION_FAILED / DIALOG_BLOCKING / CAPTCHA / USER_CONTROLLING / SPACE_STALE / BROWSER_DOWN / NO_PAYLOAD / INVALID_ARGS / UNKNOWN`；`actionSent=true` 表示动作可能已送达页面，应先观察而不是盲目重试。
+- **`ego_navigate` 新增 `reuse`**：`origin`（默认，同源已开标签页就地导航）/ `exact`（仅完全相同的 URL 切换、不重载）/ `none`（始终导航当前标签页，保持旧行为）。默认策略避免同站导航顶掉正在看的无关页面。
+- **`ego_help` 文档注册表**：主题升级为 `mode: inline/lookup` + 平台门控；新增 `gui-test`（黑盒 GUI 测试清单）、`login-import`（仅 macOS/Windows）；`topic=list` 按 inline/lookup/本平台不可用分组。
+- **`ego_status` 返回三行 `rulesSummary` 与 `help` 指针**；交互工具成功返回附带 `hint`（先做最便宜观察、不要重复同一动作）；新增 `rulesPrompt` 诊断（enabled/registered）。
+- **`rulesPrompt` 设置（默认 true）**：可关闭规则段；section 仍在注册，只是渲染为空，且按每次装配实时读取。
+- **`ego_snapshot({ diff: true })`**：按 session/space/scope 缓存上一份语义树，只返回新增/移除/变化的行（变化行成对给出 before/after），首次 diff 返回完整树作为基线；diff 结果不含可操作 ref，提示操作前重新取完整快照。
+- **`ego_tabs` 返回任务空间归属**：list/switch/open/close 的结果附带 `spaces: [{ id, name, ownership, recentTabTitles }]`；user-owned 空间不应被关闭或接管（facade 缺失时 best-effort，不影响动作）。
+- **`ego_screenshot` 新增 `fullPage` 与 `clip:{x,y,width,height}`**；与 `selector` 互斥，非法组合明确报错。
+- **观察窗 UI 重做**：实时观察面板改用 DSH 宿主主题 token（颜色/圆角/间距随主题切换），不再硬编码皮肤。
+- **插件图标与包元数据**：新增 `assets/icon*.png`，`package.json#icon` 与 `files` 收录；包描述更新为中文能力概览。
+
+### 修复
+- **`ego_cli` / `ego_script` 失败统一为结构化值**（`code/actionSent/retry/hint`），不再是这两个逃生舱独有的裸字符串错误；两者 schema 同步扩展。
+
+### 测试
+- 新增 `tests/errors.test.ts`（10）、`tests/rules.test.ts`（7）、`tests/navigate-reuse.test.ts`（9）、`tests/snapshot-diff.test.ts`（12）、`tests/help-topics.test.ts`（5）；`tests/tui-tools.test.ts` 增加 diff 接线、交互成功 hint、截图参数、`ego_cli` 失败契约用例。
+- `tests/tui-tools.test.ts` 的冷启动用例改为断言结构化失败值（`ok:false, code:BROWSER_DOWN`）。
+- 新增 `scripts/smoke-0.9.13.mjs`：真实 vendored runtime + 本地页面的端到端 smoke（31/31 通过），覆盖规则段、导航复用、diff、截图参数、tabs 归属、失败契约与 8 轮稳定性。
+- 全量：**420 passed / 7 skipped**；typecheck 通过。
+
+## [0.9.12] - 2026-11-09 — macOS Cookie 落盘修复开关（#93 收尾）
+
+### 新增
+- **「macOS Cookie 落盘修复」设置（`useMockKeychain`，默认关闭）**：把 0.9.11 的诊断开关升级为正式 opt-in 选项。开启后插件在 macOS 上向运行时注入 `EGO_LINUX_USE_MOCK_KEYCHAIN=1`，Chrome 以 `--use-mock-keychain` 启动，恢复 cookie 落盘（#93 社区实测：重启后探针 cookie 仍存在）。仅 macOS 生效，Windows/Linux 不注入；用户显式设置的同名环境变量仍然优先。
+- 设置页（Web 设置卡片 + TUI settings section，manifest 同步）新增该布尔项与中英文文案；`ego_doctor` 输出 `useMockKeychain` 状态，并在 macOS 未开启时给出提示。
+
+### 文档
+- README 的 macOS Cookie 章节改写为**已确认成因 + 修复开关 + 验证步骤**：明确 `--use-mock-keychain` 已被真机验证有效；**落盘是延迟的（约 60 秒后出现在 `Default/Cookies`）**，flush 后立刻查询会误判为 0 行；说明 mock Keychain 降低静态加密强度、需浏览器冷启动，以及 `chromeArgs` / `EGO_LINUX_USE_MOCK_KEYCHAIN` 的等价做法与官方 ego lite 线的差异。
+
+### 测试
+- `tests/config.test.ts`：`useMockKeychain` 默认 false 与字符串/数字真值解析。
+- `tests/env.test.ts`：macOS 注入 `EGO_LINUX_USE_MOCK_KEYCHAIN=1`、关闭时不注入、Windows/Linux 不注入、用户环境变量优先。
+- `tests/tui-integration.test.ts`：同步 manifest 字段列表（含新字段）。
+
+## [0.9.11] - 2026-11-06 — cast worker 状态路径修复 / macOS Cookie 诊断
+
+### 诊断
+- **macOS 27 + Chrome 156 cookie 不落盘（#93 后续）**：新增 `EGO_LINUX_USE_MOCK_KEYCHAIN=1`（或 `chromeArgs: "--use-mock-keychain"`）对照开关：macOS 上让 Chrome 使用 mock/test Keychain，用于判断实时 cookie jar 非空但 `Default/Cookies` 不变是否由登录 Keychain 引起。**默认关闭**，开启会降低静态加密强度，只建议诊断使用。
+- README 增加 macOS Cookie 落盘排查步骤，并明确 macOS 仍使用 `Default/Cookies`（不是 Windows 的 `Default/Network/Cookies`）。
+
+### 修复
+- **自定义 `EGO_LINUX_STATE_DIR` 下 cast worker 无限重启（#97）**：worker 把 `ego-cast.json` 直接写在 `$EGO_LINUX_STATE_DIR`，而插件 `castStatePath()` 又拼了一层 `ego-lite-linux`，导致永远找不到 worker → 每 8 秒重新 spawn，旧 worker 不退出、内存持续增长。现在两边统一为 `<EGO_LINUX_STATE_DIR>/ego-cast.json`；`ensureWorker()` 增加单次 in-flight 保护与 8s→16s→…→60s 指数退避，避免重复 spawn。
+
+### 测试
+- 新增 `tests/worker-state.test.ts`：自定义 state dir 路径、读取 ego-cast.json。
+- 全量：**364 passed / 7 skipped**；typecheck/build 通过。
+
+## [0.9.10] - 2026-11-06 — 标签页选择 / 脚本 space / 面板刷新与最大化
+
+### 修复
+- **`ensureRealTab` 选中 `chrome://newtab`（#92）**：没有 active 标签时，旧兜底把 `__tabs[0]`（常驻 newtab）当成真实页，`ego_script` 的 `page` 句柄指向空白页。现在统一识别 `about:/chrome:/chrome-extension:/edge:/devtools:/data:`，优先「active 且非空白」→ 非空白 → active → 第一个标签；显式 pin 仍优先。
+- **`ego_script` / `ego_cli` 没有 space（#92）**：两个脚本工具现在接受 `space` 参数，脚本前置 `taskSpaces.useOrCreate(space)`，并使用同一个 space 记录 targetId pin，和结构化工具的 target 保持一致。
+- **Windows 最小化后每次调用弹窗（#96）**：`ensureRealTab` 不再对已经 active 的标签调用 `browser.switchTab`（`Target.activateTarget` 会恢复最小化窗口）；只有 pinned/后台目标才切换。
+- **截图包含 agent 光标（#96）**：新增 `ego_screenshot({ hideCursor })`，默认 `true`：截图前临时 `ego.hideCursor()`，完成后 `ego.showCursor()`；浏览器窗口仍显示光标，PNG 不再截到它。
+- **macOS 运行时仍只认 Linux PATH（#95）**：`runtime/ego-linux/src/chrome.mjs` 的 `resolveBinary()` 在 `which` 失败后增加平台安装路径兜底——macOS `/Applications` 与 `~/Applications` 下的 Chrome/Chromium/Edge/Brave/Tungsten Edge `.app`，Windows Program Files/LocalAppData；PATH 仍优先。README 增加 macOS 官方 ego lite 桥接说明。
+- **`ego_auth_flush` 报告真实 cookie 数量（#93 诊断）**：worker `/api/flush` 现在先 `Storage.getCookies` 统计 jar，再 `Storage.flushCookies`，返回 `{total, flushed}`；不再固定 `total:0`。macOS 持久化是否落盘仍需报告者按 issue 步骤复测。另新增 macOS 的 `EGO_LINUX_USE_MOCK_KEYCHAIN=1` / `chromeArgs: "--use-mock-keychain"` 对照开关（默认关闭，会降低静态加密强度），用于判断是否 Keychain 导致 cookie 不落盘。
+
+### 新增
+- **面板刷新 / 手动网址 / 最大化（#94）**：工具栏新增「刷新」「网址」按钮，以及尺寸预设右侧的「最大化」按钮；新增 `/api/ego/navigate` 主机路由和 worker 的 `Page.reload`/`Page.navigate`；`/api/ego/window-size` 支持 `maximize`（`Browser.setWindowBounds({windowState:'maximized'})`）。
+
+### 测试
+- 扩充 `tests/tab-and-viewport.test.ts`：模拟 tab 列表验证空白 active、已 active 不切换、显式 pin；验证脚本 space 前置。
+- 新增 `tests/panel-actions.test.ts`：刷新/网址/最大化路由与 UI 接线、焦点回归、截图隐藏光标。
+- 全量：**362 passed / 7 skipped**；typecheck/build 通过。
+
+## [0.9.9] - 2026-11-03 — 登录参数归一化 / X display 存活判断
+
+### 修复
+- **`ego_login_import(source="extension")` 恒 0 条（#90）**：DSH 宿主会把 `type: "json"` 参数以 JSON 字符串交给 `execute`，旧代码的 `Array.isArray(args.domains)` 因此恒为 false，`domains` 变成空数组，扩展静默读到 0 条。新增 `parseJsonArg()` / `asStringArray()` / `asArrayArg()` 统一归一化 JSON 字符串、数组和逗号分隔值；`domains`、`ego_select.value`、`ego_drag.points`、`ego_cdp.params`、`ego_http.headers` 都走归一化。
+- **扩展 domains 语义**：省略/空 domains 现在按文档读取**全部 cookie**（`chrome.cookies.getAll({})`），不再静默导出 0 条；结果带 `warning`，面板卡片也会展示。
+- **僵尸 X display（#91）**：`displayUsable()` 现在同时检查 `/tmp/.X11-unix/X<n>` 与 `.X<n>-lock` 中的 pid 是否存活；`pickFreeDisplayNumber()` 只把 live display 算作占用。死 Xvfb 不再触发一次 20s 冷启动失败，也不会让 display 号每次重启漂移。
+
+### 测试
+- 新增 `tests/json-args.test.ts`：JSON/数组/逗号分隔归一化、domains/select/points/CDP 接线、空 domains 全量读取、0 条 warning。
+- 新增 `tests/display-usable.test.ts`：死/活 lock pid、无 socket、无 lock、僵尸 display 复用、live display 跳过。
+- `tests/login-extension.test.ts` 增加“扩展返回 0 条时 warning”用例。
+- 全量：**350 passed / 7 skipped**；typecheck/build 通过。
+
+## [0.9.8] - 2026-11-01 — ego_tabs 脚本生成的重复 space 声明
+
+### 修复
+- **`ego_tabs` 四个动作全部报 `SyntaxError: Identifier 'task' has already been declared`（#88，0.9.7 回归）**：0.9.7 给 `ego_tabs` 加能力降级守卫（#87）时，`guard()` 把 `useSpace(...)`（声明 `const task`）拼进了 `if` 分支、`else` 分支和结尾各一次，加上 action body 自带的那次，单次脚本里同一段 `const task` 出现 4 次。运行时用 `new AsyncFunction(code)` 编译 heredoc，重复的块级 `const` 在编译期就被拒绝，因此 `list/switch/open/close` 在碰到浏览器之前就失败，而其它工具不受影响（它们不经过这个 guard）。
+
+  `guard()` 现在只保留一处空格锚定：space 在守卫之前声明一次，两个分支不再重复声明。`ego_tabs` 的脚本生成同时被抽成 `tabsScript()`（`src/index.ts`），以便对生成结果做编译级单测；`runtime capability missing: …` 的 #87 文案与 `switch/open/close` 的行为保持不变。
+
+### 测试
+- 新增 `tests/tabs-script.test.ts`（13 项）：用运行时同款 `new AsyncFunction(...)` 编译四个 action 的生成脚本，断言 `const task` 恰好声明一次、守卫在声明之后、#87 能力文案齐全、缺 `targetId`/未知 action 的早退分支仍可编译。
+
+## [0.9.7] - 2026-10-29 — egoBin 运行时选型 / 官方 ego lite 文档 / ego_tabs 能力降级
+
+### 修复
+- **`egoBin` 填官方 `.exe` 时给出可执行错误（#87）**：插件以 `node <egoBin>` 启动运行时，官方 `ego-browser.exe` 不能直接使用。`validateEgoBinPath()` 现在拒绝 `.exe/.cmd/.bat`，在工具执行前返回“需要 Node 脚本或 .mjs 桥”的明确提示；`.mjs/.js/.cjs`/无扩展名脚本不受影响。
+- **`ego_tabs` 对运行时能力做降级（#87）**：`list/switch` 检查 `browser.listTabs/switchTab`，`open` 检查 `ego.createTab`，`close` 检查 `browser.closeTab`；官方 ego lite 或精简桥缺少 API 时返回 `runtime capability missing: …`，不再抛 ReferenceError/TypeError。
+
+### 新增
+- **设置页 `egoBin` 字段**：可直接填 Node 运行时脚本路径；留空使用内置运行时。`ego_doctor` 增加 `egoBin kind` 与无效时的 warning。
+
+### 文档
+- README 新增「运行时选型：内置运行时 vs 官方 ego lite」：两条线的定位、`--serve`/`waitForResponse` 缓冲/元素级截图/`ego_tabs` 能力差异、桥接示例与“只能补 `ego` 方法、不能整体替换”的注意事项。
+- Windows 内置运行时 `Chrome came up ... no WebSocket URL` 排查清单；`cpu-features`/`ssh2` 安装噪音说明。
+
+## [0.9.6] - 2026-10-28 — 等待响应回放 / 会话级 space / 截图卡片与人工等待
+
+### 修复
+- **`ego_wait_for_response` 看不到"已经完成"的响应**：运行时只在等待期间启用 Network 域，且只监听**未来**事件——典型场景（`page.goto()` 之后再等那次文档响应）永远匹配不到，只能干等到超时。现在：
+  - 会话 attach 时即启用 `Network.enable`（导航期间的请求因此也会被记录），并且等待结束后**不再关闭**该域，全局事件缓冲得以保留整段导航；
+  - `waitForResponse` 在等待前先**回放缓冲**：窗口从当前文档的 `Network.requestWillBeSent` 开始——该事件早于 `Page.frameNavigated`，所以不能简单地"从 frameNavigated 之后切片"（第一版就是这么错的，真机上文档响应始终匹配不到，已修正）；
+  - 新增 `includeBuffered` 选项（**默认 true**）回放当前文档已完成的请求；传 `false` 可回到 Playwright 的严格"只看未来"语义；
+  - 超时时若命中的请求由缓存提供（`Network.requestServedFromCache`，不产生网络往返），错误信息会列出具体 URL 并提示加 cache-busting 查询，而不是一句莫名的 timeout。
+- **`ego_wait_for_response` 工具**：新增 `includeBuffered` 参数（默认 true），超时 hint 补充缓存说明与"请求与等待需在同一 `ego_script`"的边界。
+
+### 新增
+- **会话级 task space（PR #85）**：新增 `sessionScopedSpaces` 设置（默认 **开**）。省略 `space` 时按 `dsh-agent-<sessionId前8位>` 解析，每个 DSH session 拥有独立的 browser context / window / tab 集合 / tab cursor，并发 session 或子 agent 不再互相抢标签、覆盖目标；显式传 `space` 仍共享。tab cursor key 也加入 session，因此关闭该设置后两个 session 仍保持各自 target。升级后首次调用会为新 space 打开一个新窗口，旧 `dsh-agent` 的标签不迁移；可设 `sessionScopedSpaces: false` 或显式 `space: "dsh-agent"` 保持旧行为。
+- **截图/下载卡片 + `ego_wait_for_human`（PR #86）**：`ego_screenshot` / `ego_download` 通过 `deliverables/presented` 事件让 Web GUI 显示可点击卡片（`deliver:false` 可关闭，best-effort）；新增 `ego_wait_for_human` 阻塞等待 CAPTCHA / 登录 / 2FA 完成（可选 `selector` 作为"已登录"信号），超时返回 `resolved:false` + 可执行提示，而不是抛错；它不是审批流程。
+
+### 测试
+- 新增 `tests/wait-for-response-buffer.test.ts`（6 项）：Network 域的启用时机、等待结束后不关闭、回放窗口包含文档请求、缓存提示文案、插件侧默认传参。
+- 真机验证（repo 运行时 + 真实 Chrome）：`page.goto()` 之后等待文档响应 → `{firstLoadMatched:true, firstStatus:200}`；`includeBuffered:false` 仍按 Playwright 语义超时。
+
+## [0.9.5] - 2026-10-27 — 滚轮修复 / 双缓冲硬化 / PR #83
+
+### 修复
+- **侧栏滚轮/触控板滚动失效（#81 回归）**：0.9.4 的 wheel 监听绑在条件渲染的语义 `<img>` 上，首帧到达前 `<img>` 不存在，one-shot effect 之后不再重绑。现在监听器挂在**始终存在的 `.dsh-ego-side-stage`** 上（`passive:false`），点击/双击/`Ctrl+滚轮` 行为不变。
+- **双缓冲 review 硬化（#82）**：冷启动/切目标时用 `liveFrameUrl` / frameCache / 当前缩略图做种子，不再清空两层导致空白；`onerror` 不再交换失败层（保留上一帧）；目标切换清理 `liveBufferPending` 并加 generation guard，防止旧页面的帧落到新页面；黑色背景移到 `.dsh-ego-side-livebox`。`maxWidthHint` 变化后重启 watch 的逻辑已在 0.9.4 提供。
+
+### 新增
+- **PR #83（社区 @mecamangeg）**：修复多标签时结构化工具总是切到第一个 tab / `ego_script` 没有 tab 选择的问题——新增 per-space tab cursor + `@@EGO_TARGET@@` side channel；`ego_navigate`/`ego_script`/`ego_cli` 支持显式 `tab`；新增 `viewportWidth` / `viewportHeight` / `deviceScaleFactor`（HiDPI 下避免移动版布局）；`ego_select` 回退 value → label → index。源码已 rebase 到 0.9.4 并用当前工具链重建，新增 25 个测试。
+
+## [0.9.4] - 2026-10-27 — Chrome 风格 UI / 一键登录态 / ego_tabs
+
+### 新增
+- **Agent 浏览器面板 UI 重做（Chrome 配色）**：移除「需要账号登录时…」引导条；改用 Chrome 调色板（`#f1f3f4` 工具栏、`#202124/#5f6368` 文字、`#1a73e8` 强调，深色模式跟随 `prefers-color-scheme`）；标题栏为浅灰工具区 + 蓝色实心「连接/复用 Chrome 登录态」主按钮；标签栏改为 Chrome 式活动白标签；页面标题/URL 放在标签栏下方；状态改为轻量 dot + 文本 + 执行器 chip；操作按钮改为扁平 ghost 样式（26px 高、4px 圆角、hover/focus 状态）；配对面板为 Chrome 风白色浮层（锚定在页面信息下方）。同时修掉整行 `opacity:.6` 导致按钮发灰的问题。
+- **`ego_tabs` 工具（0.9.4）**：一个工具管理标签页——`list`（返回 targetId/title/url/active/index）、`switch`（按 targetId 切换）、`open`（按 url 新建，默认 about:blank）、`close`（按 targetId 关闭），每次操作后返回最新标签列表。底层复用 runtime 的 `browser.listTabs/switchTab/closeTab` 与 `ego.createTab`，targetId 与 `ego_space_open`/`ego_navigate` 返回一致。真机脚本已验证 list → open → switch → close 全链路。
+- **`ego_login_import` 双安全路径（#69 E + A）**：
+  - **E 安全复制**：删除 junction/symlink 启动真实 profile + 强杀的旧路径；现在只复制 `Local State` + Cookies 到临时 profile 读取，真实 profile **从不被浏览器打开/写入**。Chrome/Edge 127+ 因 ABE 复制读到 0 条 cookie，工具明确报错而不是回退到破坏性路径。真机验证：源 Cookies SHA-256 前后一致。
+  - **A Chrome 扩展桥接**：新增 `extension/`（MV3，`cookies`/`alarms` 权限）与常驻回环桥接 `login-extension.ts`；Agent 浏览器面板右侧新增 **「连接 / 复用 Chrome 登录态」** 按钮：首次配对码（6 位）配对一次，之后每次点击即启动导入任务，扩展通过后台轮询（30s alarm，配对后立即触发）自动读取当前网站 cookie 并写入 ego 浏览器——不再需要每次打开 Chrome UI 或手动点 Export。`ego_login_import({source:"extension",domains:[...]})` 仍可用（等待扩展轮询）。用 Chrome for Testing 156 完成真实端到端验证（扩展读取测试 cookie → 回环 POST → ego 浏览器写入 1 条）。
+
+## [0.9.3] - 2026-10-26 — 侧栏双缓冲 / TUI 纯文字 / 图标统一 / 移除悬浮球
+
+### 新增
+- **常驻执行器可视化与失败监督（#73 phase 2）**：新增 host 路由 `/api/ego/executor`，观察窗状态行显示当前执行模式（`常驻` + 运行时长 / `一次性` / `常驻已停用`），悬停可看到 pid、最后一次重建原因或停用原因。监督逻辑：连续 3 次冷启动失败后常驻进程保持停用（`parked`），一次性 spawn 继续工作，直到用户切换设置或插件重启，避免 park → one-shot → respawn 循环。默认保持 opt-in（`residentExecutor` 默认关）：尚无"一整天浸泡无回归"的数据，先不做默认开启决策。设置持久化（gateway 写入后重启回退）仍需真机复现，留待验证。
+
+### 修复
+- **统一 Agent 浏览器图标**：面板头部原先用 globe 图标，与侧边栏入口的「浏览器窗口 + 光标」不一致；现在两处都使用同一个 `ICON_AGENT_BROWSER` 几何（16×16 圆角窗口、标题栏双点、agent 光标），侧边栏 `EgoWatchIcon` 与字符串图标保持同步。
+- **移除悬浮球回退**：DSH 官方右侧边栏已覆盖观察窗，删除浮动 FAB / 浮窗、拖拽吸附、其专用 CSS/图标/常量与键盘代理代码（client bundle 明显减小），只保留原生侧边栏 Tab + 可选 `dsh-better-sidebar` 回退；两者都不可用时不再显示侧栏面板。
+- **侧栏实时画面黑闪（#81 / #82）**：`<img src>` 逐帧替换会在新 JPEG 解码完成前丢掉已绘制的位图，面板整块露出黑色背景（macOS 无头 CDP 链路尤其明显，Windows 也可复现）。原生侧栏改为**双缓冲**：语义 `<img>` 只负责布局与指针/缩放（`opacity:0`），上方两层层叠 `<img>` 承载可见像素，新帧在隐藏层 `load`/`decode` 完成后才交换可见层，旧帧始终保留；挂载/切标签时用缓存的上一帧做种子，避免首帧空窗。旧浮动面板同样改为**先预加载/解码、再换可见帧**。另修 `maxWidthHint`：在 `root.clientWidth` 为 0 时不再锁成 480；宽度测量提前到首次 watch 之前，`ResizeObserver` 更新后若与当前采集宽度差 >20% 则防抖重启一次 watch，避免 Retina 上一直用 800 采集导致发虚。验证：staging 中两层交替、可见层始终有帧、指针映射不受影响、采集宽度 653px。macOS 实机复测待 #81 报告者确认。
+- **TUI 面板改为纯文字（无画面）**：TUI 没有浏览器视窗渲染能力，面板不再使用 `ui.Image`/`/api/snapshot`/SSE 帧，只显示标签、状态、人机验证、当前工具/错误、最近动作与快捷键；同时把标签元数据与 `disableFrameRelay` 解耦（禁用 Web 画面回传时 TUI 仍能看到标签列表）。选中项改为按 **`targetId`** 保持，标签增删/重排后 `x`/`o` 不会作用到错误的页面。
+- **登录导入安全范围扩大（#69）**：Windows 上从仅拒绝 Chrome ≥155 扩展为拒绝 **Chrome/Edge ≥127**（App-Bound Encryption 范围）。127–154 同样存在"junction 启动真实 profile + 强杀"的破坏性路径，本次先 fail-closed；`EGO_LINUX_LOGIN_IMPORT_FORCE=1` 仍可覆盖。Linux/macOS 与 Windows 上 Chrome <127 不受影响。
+- **headless UA 版本与实际 Chromium 不一致（#79）**：headless 启动时注入的 UA 一直是硬编码 `Chrome/152.0.0.0`，而 `navigator.userAgentData` 来自真实二进制（社区实测 Termux 上外部 Chromium 为 155）。这种自相矛盾的指纹会被风控标记。现在运行时首次 headless 启动会用 `<binary> --version` 探测真实主版本（缓存，2s 超时，失败才回落 152）；Windows 上为避免 `chrome.exe --version` 弹窗不做探测，继续使用兜底值。新增 `parseChromeVersionMajor()` 单测。
+
+### 文档
+- **macOS 27 / Chrome 156 复测通过（#68）**：社区在 0.9.2 上复测（macOS 27.0.1 arm64 + Chrome 156.0.8078.47，去掉 `chromePath`/`--headless` 两个旧 workaround）——`.app` 自动探测、headed 冷启动、navigate/截图/`ego_doctor` 全通；README 的 macOS 实测记录已补充该环境（此前为 macOS arm64 + Chrome 154）。
+- **Termux / Android 开箱说明（#78）**：README 新增 Termux 小节——`pkg install chromium`（x11 repo）、`chromium-browser` 已在候选列表中、无 `$DISPLAY`/Xvfb 自动 headless、无需 `--no-sandbox`、DBus 报错无害、手机终端建议 `disableFrameRelay: true`；`ego_doctor` 的“未找到浏览器”提示补充 `pkg install chromium`。
+- **`ego_script` 的 page 门面不是 Playwright API（#80）**：`ego_help script`、`ego_script` 工具描述与 README 都列出完整 page 方法清单，并明确没有 `fill/click/type/press`（用 `ego_fill`/`ego_click` 或 `page.locator(...)`），`page.goto()` 不返回 Playwright Response。
+
+## [0.9.2] - 2026-10-23 — macOS 开箱支持（#65/#68，社区 PR #72 移植）
+
+本版把 macOS 从"需手动填 chromePath、headed 路径找 Xvfb"变成**开箱即用**：自动探测 `.app` 内的 Chrome/Chromium/Edge/Brave 并注入运行时，headed 启动不再依赖 X11/Xvfb，同时保留 #16 要求的真实窗口能力。社区贡献者 @syjnzh918 提供实现与 macOS arm64 真机验证。
+
+### 修复
+- **macOS 开箱可用（#65、#68）**：两处平台缺口叠在一起，使 macOS 首装第一次调用任意 `ego_*` 工具必然失败。其一，`COMMON_CHROME_BINS` 只列 Linux 路径、`resolveEgoEnv()` 的注入条件也不含 darwin，而 macOS 上 Chrome 不在 `PATH` 里（只在 `.app` bundle 内），于是报 `no Chrome/Chromium binary found`；现在由 `darwinChromeCandidates()` 探测 Chrome / Chromium / Edge / Brave（含 `~/Applications`），并像 win32 一样把结果注入 `EGO_LINUX_CHROME`。其二，填好路径后仍会撞运行时 `ensureXDisplay()`：它只给 win32 留了"有桌面会话、无 X server"的豁免，而 macOS 在这一点上完全同形（GUI 是 Aqua/Quartz，永不导出 `$DISPLAY`，Xvfb 也不存在于该生态），现在同样豁免。`isHeadlessDetected` 保持排除 darwin——把缺 `$DISPLAY` 当成无头正是 #16 的回归。真机验证：macOS arm64 + Chrome 154，冷启动 → navigate → 截图 → `ego_doctor` 全通。
+
+### 社区
+- macOS 适配（#65/#68）来自社区 PR [#72](https://github.com/Fisfzy/dsh-ego-browser/pull/72)（@syjnzh918），由其基于当时主干提交并附 macOS arm64 真机冷启动验证；本次将其移植到 0.9.1 后的主线上（解冲突、保留后续 win32/no-Xvfb、常驻执行器与观察窗改动，并补回归测试）。
+
+## [0.9.1] - 2026-10-23 — 观察窗尺寸同步 / 帧链路性能 / 输入映射修复
+
+本版把观察窗从"只能看"扩展成"能直接改真实窗口大小"：尺寸同步开关 + 比例预设 + 边缘拖拽，同时把串流 CPU 砍到约一半，并修复窗口缩放后的点击偏移与拖动卡顿。
+
+### 新增
+- **观察窗尺寸同步（真实窗口）**：侧边栏观察窗的「打开真实页 / 弹出窗口」按钮行新增 **🔒/🔓 尺寸同步** 开关与 **尺寸预设** 菜单。
+  - **解锁本身不改变窗口**；之后拖动右侧边栏宽度、或直接拖观察窗的**右侧 / 底部 / 右下角手柄**，窗口按拖动**增量** 1:1 缩放（`POST /api/ego/window-size` + CDP `Browser.setWindowBounds`），横向拖动保持页面比例，纵向拖动改变高度。
+  - **尺寸预设** 提供 16:9 / 4:3 / 21:9 / 1:1 / 9:16：保持当前窗口宽度，把高度设成对应比例。
+  - 页面标题与 URL 现在显示在实时状态栏那一行（画面下方不再占两行）。
+  - 布局/窗口其它变化会被吸收为新的基准，不会形成"越缩越小"的反馈环；无头浏览器返回 `headless` 并提示先「弹出窗口」；本次只做 CDP 后端，FFmpeg 路径未改。
+
+### 修复
+- **重启后观察窗卡在「⚠ 未接管 / 暂无截图」**：如果面板在浏览器/worker 还没起来时打开，host 的 `/api/ego/stream` 当时只能建一条静默 SSE，并且之后永远不会再接上 worker——即使浏览器后来启动了、worker 也在推帧，面板也收不到任何 `frame` / `spaces` 事件。现在这条流会每 1.5 秒重试 `ensureWorker()`，worker 一出现就自动接上（新增单测覆盖"worker 晚于 SSE 出现"的情况）。
+- **画面边缘的红/橙色条**：边缘拖拽热区原来常显高亮条，看起来像画面多了一圈红边。现在热区默认完全透明，只在鼠标悬停时低调显示；解锁尺寸同步时仅保留极淡的提示色。
+- **调整窗口后点击位置偏移**：screencast 帧携带的 `vw/vh` 视口元数据不会在每次窗口变化后更新（实测窗口已缩到 900×573 时帧仍标注 1264×805），面板按旧视口换算点击坐标导致落点偏移。现在：capture 每秒用 `Page.getLayoutMetrics` 同步真实视口；`/api/ego/window-size` 应用新尺寸后 160ms 内刷新会话视口；客户端收到 resize 响应立即用返回的 `viewport` 更新坐标映射。验证：窗口缩放到 900×573 后点击面板 60%/40% 位置，页面收到的坐标与预期一致（540,229）。
+- **拖动边缘缩放卡顿**：`/api/ego/window-size` 原来每一步都重新 getWindowForTarget + getWindowBounds + 测量 chrome 边框 + 测量视口 + setWindowBounds（约 5 次 CDP 往返）。现在缓存 windowId / chrome 边框 / 窗口位置与视口（10s / 2s 过期），每步只需 1 次 setWindowBounds；实测单步延迟 avg 22ms（10–47ms）。
+
+### 性能
+- **观察窗串流 CPU 大幅下降**：两处结构性优化，帧率与功能不变。
+  - **按源取帧**：`Page.startScreencast` 的 `everyNthFrame` 现在按 `cdpFps` 计算（20fps → 每 3 帧取 1 帧），Chrome 不再编码 ~100 帧/秒再丢掉 80%；实测源帧 ~100/s → ~33/s。
+  - **采集宽度跟随面板**：客户端把面板实际显示宽度（× devicePixelRatio，含余量）通过 `watch/start` 的 `maxWidth` 上报，worker 取配置上限与面板宽度的较小值。面板约 550px 时采集从 1280 宽降到 ~654 宽，编码/传输/解码像素约降 4 倍；全屏面板时仍会按需放大。
+  - 实测（Windows，面板开启、视频页面）：总 CPU 约占 **196% 单核 → 72% 单核**（Chrome ~170% → ~63%，worker ~20% → ~4%）；实际下发帧率 ~19/s → ~17/s。
+- **窗口隐藏/最小化时停止串流**：面板监听到 `visibilitychange` 后会停掉 watch、关闭 SSE 与画面（恢复窗口时自动重新 watch/串流）。实测：最小化后 watchers 2 → 1，采集侧 CPU 降到约 6%；恢复后自动回到 2 并继续出帧。纯静态页面本来就只在内容变化时出帧。
+- **TUI/无头环境可不传画面**：TUI 设置新增「关闭实时画面传输」（`disableFrameRelay`）开关；开启后不启动 cast worker、不做 screencast、不发帧，TUI 面板仅保留文字状态，`ego_*` 工具不受影响。TUI 面板本身只是事件驱动地按需取一张快照（maxWidth 320），没有连续串流。
+- 画面 `<img>` 使用 `decoding="async"`，减少主线程解码阻塞。
+
+## [0.9.0] - 2026-10-22 — dsh-TUI 支持（设置页 / 状态栏 / 侧栏面板 / 页面缩略图）
+
+TUI 集成全部通过**可选服务独立注入**：宿主没有对应服务时静默跳过，不新增文件读取、轮询或 worker 启动。合并社区 PR #74、#75、#76（ccch1mneyyy）。
+
+### 新增
+- TUI 通过独立可选注入注册真实的 Agent Browser 设置页、工具活动状态栏和有限通知；缺席服务时不新增 TUI I/O 或后台轮询。
+- 不可变浏览器状态快照记录当前工具与最近十次完成结果，包含执行耗时和截短错误；锁内工具从实际取得锁后开始计时。
+- Web/TUI 共用安全的工具卡标题：只显示允许的定位摘要，按终端单元截断，隐藏输入值、HTTP 头/正文以及可执行源码。
+- 侧栏面板（PR #75）：可选 28 列 Agent Browser 面板，展示浏览器运行/无头状态、活动页标题与 URL、按任务空间分组的标签列表、人机验证提示、最近 3–5 次动作；面板聚焦时支持 `↑/↓` 选标签、`o` 弹出真实窗口、`x` 关闭标签（有对话框服务时确认，否则双按）、`f` 落盘登录态、`r` 刷新；可见时约 2 秒刷新、隐藏即停、并发合并。新增 `tuiAutoOpenPanel`（默认关）。
+- 页面缩略图（PR #76）：worker 新增本机回环 `GET /api/snapshot?targetId=…&maxWidth=…`（不占插件全局锁、不启动直播订阅），终端用宿主 `ui.Image` 显示；选中标签/工具结束/`r` 时各截一帧，隐藏时不请求，无拖影；PNG 用 Node `zlib` 自解（含大小/尺寸/解压上限，无新依赖），终端不支持图形协议时回退为一行文字；`disableFrameRelay` 时不截图。另显示既有的捕获后端/状态行。
+
+### 修复
+- 删除未实现的 TUI Scene 清单声明，Notification fallback 改为无 toast 服务时省略通知、保留工具结果。
+- TUI 设置直接读取清单字段作为单一来源，并将清单画质选项纠正为运行时实际接受的 `low / balanced / high`；不改现有 Web 设置实现。
+
+### 验证范围
+- 增加可选服务、真实注册、设置一致性、隐私、Unicode 宽度、不可变快照、锁内执行、重试通知、空闲回收成功与生命周期清理测试。
+- 合并后在本地通过 `typecheck` / `vitest`（234 passed, 5 skipped）/ `build`；尚未在真实 DSH TUI 或 Chrome 环境验证视觉布局与人工接管。
+
+## [0.8.8] - 2026-10-22 — 原生右侧边栏 + 常驻执行器 + 孤儿标签清扫 + 登录导入定向放行
+
+### 新增
+- **原生右侧边栏支持（#64）**：DSH ≥ 0.2.1 自带右侧边栏（`@deepseek-ai/dsh-client-ui-sidebar-right`）时，观察窗注册为原生 Tab——`dsh-ego-browser:watch` 类型 + `sidebar.right.pane.tab` 面板 + guide 入口（自绘「浏览器窗口 + agent 光标」图标）。检测用 `ctx.inject(['sidebarRight','sidebarRightTabs'])` 等待服务（服务晚于插件就绪时不再漏检），优先级 **原生 > dsh-better-sidebar > 浮动球**；升级挂载时会释放上一个宿主，不会出现两份面板。自动打开仍按调用会话作用域。
+- **常驻执行器（#56 第一期，可选）**：新增 `residentExecutor`（默认关）与 `residentIdleMin`（默认 30 分钟，0 = 保留到卸载）。开启后 `ego_*` 调用复用同一个 `ego-browser --serve` 进程：首次调用支付启动开销，之后每次 **~1–2 ms**（一次性 spawn 基准 ~340 ms）。浏览器被空闲回收/崩溃后，下一次调用自动回退到一次性 spawn 并重新拉起浏览器（带启动重试），随后恢复常驻；**已经写出的请求不会重试**，避免重复点击/填表。设置卡片（插件 → dsh-ego-browser → 配置）与 TUI settings 字段均已接线。
+- **TUI 设置字段**：`dsh-plugin.json` 的 SettingsSection 补充常驻两项。
+
+### 修复
+- **浏览器在常驻进程下被停/崩溃后请求永久失败（#56）**：`--serve` 的 CDP socket 在浏览器停止后不会恢复，旧实现之后每次请求都报 `CDP channel is not open`。现在 `--serve` 每请求检查 `cdp.isOpen()`，失效立即返回可重试的 `browser is not reachable`；插件把它归为冷启动错误，回收常驻进程并走一次性 spawn 恢复（10s cooldown 后才重新常驻）。Windows 上启动失败不再空等 Xvfb（本来不存在，只会多等 10s+）。
+- **孤儿标签（#67）**：`reconcile()` 增加两阶段 + 120s 宽限的孤儿 page target 清扫——关闭不属于任何 space 的标签（崩溃恢复/手动打开），跳过 `about:blank`/`chrome://`，并在 `closedSpaces` 留下 `(orphan tab)` 轨迹。此前 `pruneIdle`/`pruneAbandoned`/`--prune-spaces` 只遍历 `state.spaces`，扫不到这些孤儿。
+- **登录导入定向放行（#69）**：`ego_login_import` 从"全禁"改为仅 **Windows + Chrome ≥155** 拒绝（该组合的 junction 别名 + 无头启动 + 强杀路径会读到 0 条 cookie 并破坏源 profile）；Linux / macOS / 旧 Chrome 正常可用，`EGO_LINUX_LOGIN_IMPORT_FORCE=1` 可在任何环境强制放行。工具会在错误信息里带上检测到的版本。
+
+### 变更
+- README 同步 v0.8.8：版本号、DSH 兼容矩阵（0.2.1 原生侧边栏）、侧边栏三种形态、常驻执行器、登录导入定向放行、Windows 已知限制。
+- `dsh-plugin.json` 版本 0.8.8。
+- 测试：181 passed / 5 skipped（新增常驻传输、恢复契约、配置与孤儿选择器用例）。
+
+### 验证
+- 真实桌面端（DSH 0.2.1-rc.2）：常驻首调 1485ms（含浏览器冷启动）→ 之后 1ms；`--stop` 后下一次调用自动恢复并重新拉起浏览器；冷却期走一次性；冷却后回到新常驻；全程仅 1 个常驻进程、无残留。
+- 原生侧边栏（临时 web profile）：guide 出现「Agent 浏览器」及图标，面板正常推流/输入。
+- #69：Windows + Chrome 155 正确拒绝并给出原因。
+
+## [0.8.7] - 2026-10-22 — 工具语义修复 + Windows 孤儿锁 + 登录导入止损 + 回收器会话清理
+
+### 修复
+- **虚拟光标箭头与小手重叠**：覆盖层 `#arrow` 的 ID 规则带 `display:block`，优先级压过 `svg.shape{display:none}`——`showShape()` 切到手形/文字光标后箭头仍在绘制，两者在同一点重叠。现在可见性统一由 `svg.shape` / `.on` 控制：悬停链接只显示手形，悬停文本显示输入光标。
+- **`ego_wait_for_url` 在导航已完成后仍报 `reached:false`（#71）**：改为两段式——先比对当前 URL（对无 glob 的模式做保守子串匹配），再等待未来导航；失败 payload 带当前 URL 与 `matchedCurrent`，并提示等待只在同一次调用内有效、匹配语义是全 URL 或 `**` glob。
+- **`ego_wait_for_response` 超时直接抛错（#71）**：现在捕获超时并返回结构化 `{ok:false, reached:false, url, error, hint}`，不再让整次调用以退出码 1 结束。
+- **`ego_dialog` 的误导性 "No dialog is showing"（#71）**：描述明确"只对当前正阻塞的 dialog 有效，跨调用的 dialog 已被自动 dismiss"；失败时附当前 URL 与可执行建议（在同一次 `ego_script` 里 `page.once('dialog', d => d.accept())` 后再触发点击）。
+- **`ego_script`/`ego_cli` 忘记哨兵即硬失败（#71）**：描述写出 `@@DSH_RESULT@@` 字面量；新增兜底解析——没有哨兵时取最后一行可解析 JSON，并标记 `result.fallback: true`。
+- **Windows 上孤儿 Chrome 永久占住 agent profile（#70）**：Chrome 在 Windows 只留空 `lockfile`、没有 `SingletonLock` 符号链接，旧 `clearProfileLock()` 永远 no-op；浏览器一旦非优雅退出，之后每次启动都被转交给孤儿进程并耗尽 20s 超时。现在 win32 下按命令行枚举持有本 profile 的 `chrome.exe`，先收集后终止（500ms 释放等待、10s 硬上限），再清 `lockfile`；只按本 profile 路径匹配，不动用户自己的 Chrome。
+- **`ego_login_import` 默认关闭（#69 止损）**：Chrome 155 上 junction 别名 + 无头启动 + 强杀路径读到 0 条 cookie，且被观测到会清空真实 profile 的扩展注册表、重置默认搜索引擎。现在默认 fail-closed，`EGO_LINUX_LOGIN_IMPORT_FORCE=1` 才放行；彻底修复待独立设计。
+- **空闲回收后 Chrome 崩溃恢复复活全部旧标签（#67 止损）**：`--stop` 被 Chrome 记为 crash，`Default/Sessions/` 残留会让下次冷启动静默恢复上一轮标签，而这些页面不在 `state.spaces` 中、`pruneIdle`/`pruneAbandoned`/`--prune-spaces` 都扫不到。现在 `stopBrowser()` 在确认浏览器已停止（或本就没在跑）后清理 `Default/Sessions/`；登录态在 `Network/Cookies`，不受影响。
+- **纯文本/JSON 标签页不再被光标覆盖层糊成"乱码"**：`renderOverlay()` 在 `document.contentType` 非 `text/html` / `application/xhtml+xml` 时不注入覆盖层，并清掉上一个文档残留的 host（本地 runtime 补丁，见 `runtime/PATCHES.md`）。
+
+### 变更
+- **CDP 预览帧默认宽度 960 → 1280**：960 会把 1264 宽的常见笔记本视口先缩小再由面板放大，是"面板里文字发虚/发糊"的直接来源；1280 让常见视口落在原生宽度，更大屏幕可在设置页调到 1600/1920。
+
+### 新增
+- **`--serve` 常驻传输层（PR #63，BeiWay1145，refs #56）**：CLI 新增 NDJSON 常驻模式，一次启动摊掉进程启动与 harness 加载开销（报告者实测 ~350ms → 后续请求 0–1ms 级）。本次只合并传输半边，默认仍走 spawn 路径；插件侧生命周期（spawn 策略/监督/设置开关/客户端重建）留待后续版本接线。
+
+### 社区
+- 合并 PR #63（`--serve` 常驻传输，BeiWay1145）。
+- macOS 适配（#65/#68）暂缓：维护者暂无 Mac 设备验证。
+
 ## [0.8.6] - 2026-09-28 — 登录态导入安全加固 + DSH 0.1.7 设置适配 + 人机验证误报修复
 
 ### 安全
@@ -87,7 +346,23 @@
 - **peer 依赖对齐 0.1.x 家族**（client-locale / client-ui-slots / client-ui-settings-plugins / dsh-settings / dsh-tools 声明 `>=0.1.1-rc.2`），`engines.dsh: >=0.1.2-alpha.1`。
 - 修复后实测：client 模块正常物化、侧边栏「Agent 浏览器」Tab 与接管观看流程可用、`/api/ego/*` 路由 200、实时推流 `streaming`、画面点击/输入链路可达（pointerdown → `/api/ego/input` → CDP 派发）。
 
-## [Unreleased]
+## [v0.8.0] - 2026-08
+
+sidebar Tab 集成：当 `dsh-better-sidebar` 可用时，实时查看窗注册为 sidebar 原生 Tab 而非浮动浮窗。
+
+### 新增
+- **dsh-better-sidebar Tab 集成**：`apply()` 用 `ctx.get('betterSidebar')` 机会性探测 sidebar 服务（不用 `ctx.betterSidebar`——那要求 `inject` 声明，会把 sidebar 变成硬依赖，没装时整个插件含设置卡都不加载），可用时通过 `registerTab()` 注册一个 `ego-browser:watch` Tab（`single: true`，常驻），不可用时退回原有浮动浮窗。这是 DSH 文档化的可选服务消费模式（见 approval-seam 笔记、postmortem 0001）。
+- **首次 ego_* 工具调用自动打开 Tab**：`defineEgoTool` / `ego_cli` / `ego_captcha` / `ego_script` 的 execute 路径调 `markEgoToolCall()` 递增 host 端计数器，该计数器随 `/api/ego/spaces` 响应下发。`LivePreviewController` 检测计数器 0 → >0 跳变时调 `ctx.get('betterSidebar').openTab({ type: 'ego-browser:watch' })`，Tab 自动展开。`autoOpened` 标志保证每会话只开一次。
+- **React Tab 组件 `EgoBrowserTab`**：用 `React.createElement` + `bindSnapshotSelector` 渲染 sidebar Tab 内容（头部 / 标签栏 / 实时主视图 / 历史覆盖层 / 登录与验证码提示条）。历史浏览轨迹从原侧抽改为覆盖式（点历史按钮接管整个 Tab 内容区，点条目进入预览或返回实时），适配 sidebar 窄宽度。
+- **`LivePreviewController` vanilla 类**：从浮动浮窗的命令式 DOM 代码中提取出轮询 / SSE / 帧缓存 / 缩放 / 输入坐标逆映射 / 自动跟随逻辑，供 React 组件通过 `subscribe`+`getSnapshot` 订阅、通过方法调用转发 pointer/wheel 事件。控制器直接持有 `<img>` ref 以 rAF 合帧频率原地替换 `src`，不触发 React 逐帧重渲染。
+- **`dsh-better-sidebar` 不列为 peer 依赖**：用 `ctx.get()` 机会性消费，不需要声明 `inject`，因此也不需要把它列为 peer。装了 sidebar 就用 Tab，没装就退回浮动浮窗，两种部署都干净。
+
+### 设计取舍（诚实说明）
+- **混合而非完全重写**：React 负责 UI 结构（头部 / 标签 / 提示条 / 历史覆盖层），vanilla 控制器负责实时帧管道（SSE / rAF 合帧 / 坐标逆映射 / 输入转发）。~1000 行脆弱的实时流逻辑未用 React hooks 重写，降低回归风险。
+- **历史轨迹覆盖式**：原浮动浮窗的侧抽设计在 sidebar 窄宽度（~300-400px）下两列都很窄，改为覆盖式后空间利用最好。
+- **竞态条件（已知，可接受）**：若 `dsh-better-sidebar` 在 ego-browser 之后加载，`apply()` 运行时 `ctx.betterSidebar` 可能仍为 `undefined`，此时退回浮动浮窗。DSH 模块加载器通常按依赖顺序加载，sidebar 作为基础 UI 插件一般先加载；若不然，刷新页面即可。
+- **浮动浮窗代码原样保留**：`mountFloatingWatch()` 是原 effect body 的机械移动，未做逻辑改动，确保无 sidebar 时的体验与 0.7.x 完全一致。
+
 
 观察窗落地双画面管线：修复 CDP 协议根因，并加入可选 FFmpeg H.264/fMP4 后端。
 
@@ -124,23 +399,6 @@
 
 ### 工程重构
 - **纯 JS → TypeScript 迁移**（PR #14）：源码从 `lib/` 移至 `src/`（`src/index.ts` 工具层、`src/client/index.ts` 前端、`src/worker/ego-cast-worker.ts` worker），`lib/` 与 `bin/ego-cast-worker.mjs` 改为构建产物（预构建入库）。构建链路改 `pnpm typecheck`（tsc 类型门禁，tsconfig.json + tsconfig.client.json）+ `pnpm test`（vitest）+ `pnpm run build`（tsdown 三 bundle）。测试同步迁移 `tests/*.test.mjs` → `.test.ts` 并补 `vitest.config.ts`。`lib/` 不再手改。
-
-## [v0.8.0] - 2026-08
-
-sidebar Tab 集成：当 `dsh-better-sidebar` 可用时，实时查看窗注册为 sidebar 原生 Tab 而非浮动浮窗。
-
-### 新增
-- **dsh-better-sidebar Tab 集成**：`apply()` 用 `ctx.get('betterSidebar')` 机会性探测 sidebar 服务（不用 `ctx.betterSidebar`——那要求 `inject` 声明，会把 sidebar 变成硬依赖，没装时整个插件含设置卡都不加载），可用时通过 `registerTab()` 注册一个 `ego-browser:watch` Tab（`single: true`，常驻），不可用时退回原有浮动浮窗。这是 DSH 文档化的可选服务消费模式（见 approval-seam 笔记、postmortem 0001）。
-- **首次 ego_* 工具调用自动打开 Tab**：`defineEgoTool` / `ego_cli` / `ego_captcha` / `ego_script` 的 execute 路径调 `markEgoToolCall()` 递增 host 端计数器，该计数器随 `/api/ego/spaces` 响应下发。`LivePreviewController` 检测计数器 0 → >0 跳变时调 `ctx.get('betterSidebar').openTab({ type: 'ego-browser:watch' })`，Tab 自动展开。`autoOpened` 标志保证每会话只开一次。
-- **React Tab 组件 `EgoBrowserTab`**：用 `React.createElement` + `bindSnapshotSelector` 渲染 sidebar Tab 内容（头部 / 标签栏 / 实时主视图 / 历史覆盖层 / 登录与验证码提示条）。历史浏览轨迹从原侧抽改为覆盖式（点历史按钮接管整个 Tab 内容区，点条目进入预览或返回实时），适配 sidebar 窄宽度。
-- **`LivePreviewController` vanilla 类**：从浮动浮窗的命令式 DOM 代码中提取出轮询 / SSE / 帧缓存 / 缩放 / 输入坐标逆映射 / 自动跟随逻辑，供 React 组件通过 `subscribe`+`getSnapshot` 订阅、通过方法调用转发 pointer/wheel 事件。控制器直接持有 `<img>` ref 以 rAF 合帧频率原地替换 `src`，不触发 React 逐帧重渲染。
-- **`dsh-better-sidebar` 不列为 peer 依赖**：用 `ctx.get()` 机会性消费，不需要声明 `inject`，因此也不需要把它列为 peer。装了 sidebar 就用 Tab，没装就退回浮动浮窗，两种部署都干净。
-
-### 设计取舍（诚实说明）
-- **混合而非完全重写**：React 负责 UI 结构（头部 / 标签 / 提示条 / 历史覆盖层），vanilla 控制器负责实时帧管道（SSE / rAF 合帧 / 坐标逆映射 / 输入转发）。~1000 行脆弱的实时流逻辑未用 React hooks 重写，降低回归风险。
-- **历史轨迹覆盖式**：原浮动浮窗的侧抽设计在 sidebar 窄宽度（~300-400px）下两列都很窄，改为覆盖式后空间利用最好。
-- **竞态条件（已知，可接受）**：若 `dsh-better-sidebar` 在 ego-browser 之后加载，`apply()` 运行时 `ctx.betterSidebar` 可能仍为 `undefined`，此时退回浮动浮窗。DSH 模块加载器通常按依赖顺序加载，sidebar 作为基础 UI 插件一般先加载；若不然，刷新页面即可。
-- **浮动浮窗代码原样保留**：`mountFloatingWatch()` 是原 effect body 的机械移动，未做逻辑改动，确保无 sidebar 时的体验与 0.7.x 完全一致。
 
 ## [v0.7.1] - 2026-08
 

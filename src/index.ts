@@ -35,19 +35,31 @@
  * 加工具：在 registerActionTools 里 reg(t({...}))，并同步 EGO_HELP_INDEX，跑 npm run build。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
+import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { importLoginCookies } from './login-import.ts'
+import { importLoginCookiesFromExtension } from './login-extension.ts'
+import { BrowserStateStore } from './browser-state.ts'
+import { installTui } from './tui/integration.ts'
+import { installBrowserPanel } from './tui/panel.ts'
+import { makeEnsureWorker, proxyFrom, proxyPost, readBrowserState, readTaskSpaceGroups } from './worker-client.ts'
+import { safeLocatorSummary, toolCallTitle } from './tui/presentation.ts'
 import { initCastServer, markEgoToolCall, getLastEgoActivity } from './cast-server.ts'
-import { EGO_HELP_INDEX } from './help.ts'
+import { EGO_HELP_DOCS, isEgoHelpVisible, renderEgoHelpList } from './help.ts'
+import { failureValue } from './errors.ts'
+import { noteEgoToolUse, registerEgoRulesSection } from './rules.ts'
+import { SnapshotCache } from './snapshot-diff.ts'
 import { HUMAN_CHECK_PROBE } from './captcha.ts'
-import { Config as ConfigSchema, resolveConfig, EGO_CLI_BLOCKED, CHROME_BLOCKED, filterArgs } from './config.ts'
+import { Config as ConfigSchema, resolveConfig, EGO_CLI_BLOCKED, CHROME_BLOCKED, filterArgs, validateEgoBinPath } from './config.ts'
 import { installEgoBrowserSettings } from './settings.ts'
 import { registerEgoBrowserGateway } from './gateway.ts'
 import { registerRemoteUiTrust } from './remote-ui-trust.ts'
+import { ResidentProcess, ResidentNotRunningError, type ResidentFrame } from './resident.ts'
 import { getSharedFfmpegInstallationManager } from './ffmpeg-installation.ts'
-import { SENTINEL, j, str, num, bool, readAll, SAFE_FN } from './util.ts'
+import { SENTINEL, j, str, num, bool, readAll, SAFE_FN, parseJsonArg, asStringArray } from './util.ts'
 import type { EgoContext, RawConfig, ResolvedConfig, SubprocessService, ToolExec, WebServerLike } from './types.ts'
 
 export const name = 'ego-browser'
@@ -82,6 +94,27 @@ const DEFAULT_SPACE = 'dsh-agent'
 const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 const DEFAULT_GRACE_MS = 15_000
 const TOOL_TIMEOUT_MS = 120_000
+/** Three-line onboarding shown by ego_status; the full text lives in ego_help. */
+const STATUS_RULES_SUMMARY = [
+  '先观察再动作：ego_snapshot（ref 只对本次快照有效）/ ego_tabs list。',
+  '每次只做一个会改变页面的动作，之后用 ego_page_info / ego_read_element 确认效果。',
+  '超时或找不到目标时重新快照，不要原样重试；失败按返回的 retry / hint 处理。',
+].join('\n')
+/**
+ * Last full snapshot text per session/space/scope, used to serve
+ * `ego_snapshot({ diff: true })`. Bounded LRU; module-scoped so it survives
+ * tool calls but not a plugin reload (that is the right lifetime: a reload
+ * corresponds to a fresh runtime anyway).
+ */
+const snapshotCache = new SnapshotCache(32)
+/** Whether the host accepted the native rules prompt section. */
+let rulesSectionRegistered = false
+/**
+ * Appended to interaction results so the "cheapest observation" rule arrives
+ * exactly when a repeated action would otherwise be tempting.
+ */
+const ACTION_SUCCESS_HINT =
+  '动作已执行。确认效果优先用 ego_page_info / ego_read_element；需要新定位再 ego_snapshot；若预期变化未出现，不要重复同一动作。'
 
 export interface ActiveSpaceTracker {
   current(): string | number
@@ -99,6 +132,43 @@ function humanCheckScript(space: string | number): string {
     `let __hc = null\n` +
     `try { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}) } catch { __hc = null }\n` +
     `console.log('${SENTINEL}' + JSON.stringify({ ok: true, humanCheck: __hc }))\n`
+  )
+}
+
+/**
+ * Script that blocks until the human clears a challenge.
+ *
+ * Polls the page (rather than sleeping once) so it returns as soon as the user
+ * solves the CAPTCHA or completes the login. When `selector` is given, that
+ * element must also exist — the usual "logged in now" signal. Returns a
+ * structured payload, never an error: `resolved:false` is the honest answer
+ * when the deadline passes.
+ */
+export function waitForHumanScript(
+  space: string | number,
+  opts: { timeoutMs: number; pollMs: number; selector?: string },
+): string {
+  const selector = opts.selector ?? ''
+  const selectorCheck =
+    selector === ''
+      ? '  const __selOk = true\n'
+      : `  let __selOk = false\n  try { __selOk = (await page.count(${j(selector)})) > 0 } catch { __selOk = false }\n`
+  return (
+    `${useSpace(space)}${ensureRealTab()}` +
+    `const __wb = Date.now()\n` +
+    `let __saw = false, __resolved = false, __polls = 0, __last = null\n` +
+    `for (;;) {\n` +
+    `  let __hc = null\n` +
+    `  try { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}) } catch { __hc = null }\n` +
+    `  if (__hc && __hc.detected) __saw = true\n` +
+    `  __last = __hc\n` +
+    selectorCheck +
+    `  if (!(__hc && __hc.detected) && __selOk) { __resolved = true; break }\n` +
+    `  if (Date.now() - __wb >= ${opts.timeoutMs}) break\n` +
+    `  __polls++\n` +
+    `  await page.waitForTimeout(${opts.pollMs})\n` +
+    `}\n` +
+    `console.log('${SENTINEL}' + JSON.stringify({ ok: true, needed: __saw, resolved: __resolved, waitedMs: Date.now() - __wb, polls: __polls, detected: !!(__last && __last.detected), kind: (__last && __last.kind) || null, url: await page.url().catch(() => null) }))\n`
   )
 }
 
@@ -133,13 +203,90 @@ export function createActiveSpaceTracker(defaultSpace: string | number = DEFAULT
   }
 }
 
+/**
+ * The session whose tool call is currently being prepared. Set for the whole
+ * `execute` of a tool (buildScript runs synchronously inside it), so the space
+ * tracker can answer "what is THIS session's default space?" without threading
+ * a parameter through 30 buildScript closures.
+ */
+let pendingSessionId: string | undefined
+
+/** The session id a tool call belongs to (undefined for host-initiated runs). */
+export function currentSessionId(): string | undefined {
+  return pendingSessionId
+}
+
+/**
+ * Per-session default space name.
+ *
+ * Two DSH sessions (or two subagents) that both omit `space` used to share one
+ * task space — and therefore one tab set and one cursor — so they stole each
+ * other's pages. With session-scoped spaces each session gets its own space
+ * (`dsh-agent-<sid8>`), hence its own browser context and window.
+ */
+export function spaceNameForSession(
+  sessionId: string | undefined,
+  baseDefault: string | number,
+  scoped: boolean,
+): string | number {
+  if (!scoped || sessionId === undefined || sessionId === '') return baseDefault
+  const short = String(sessionId)
+    .replace(/^session-/, '')
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .slice(0, 8)
+  if (short === '') return baseDefault
+  return `${String(baseDefault)}-${short}`
+}
+
+/**
+ * Cursor key for the tab tracker. The session is part of the key so two
+ * sessions sharing one space (session scoping off) still keep their own tab.
+ */
+export function scopedTargetKey(sessionId: string | undefined, space: string | number): string {
+  return `${sessionId ?? ''}\u0000${String(space)}`
+}
+
+export interface SessionScopedSpaceTracker extends ActiveSpaceTracker {
+  forSession(sessionId: string | undefined): ActiveSpaceTracker
+}
+
+/**
+ * A space tracker per DSH session, lazily created.
+ *
+ * `isScoped` is a live getter: the setting can be flipped without rebuilding
+ * the tracker map, and existing sessions keep the space they already selected.
+ */
+export function createSessionScopedSpaceTracker(
+  baseDefault: string | number = DEFAULT_SPACE,
+  isScoped: () => boolean = () => true,
+): SessionScopedSpaceTracker {
+  const bySession = new Map<string, ActiveSpaceTracker>()
+  const trackerFor = (sessionId: string | undefined): ActiveSpaceTracker => {
+    const key = sessionId ?? ''
+    let tracker = bySession.get(key)
+    if (tracker === undefined) {
+      tracker = createActiveSpaceTracker(
+        spaceNameForSession(sessionId, baseDefault, isScoped()),
+      )
+      bySession.set(key, tracker)
+    }
+    return tracker
+  }
+  return {
+    forSession: trackerFor,
+    current: () => trackerFor(pendingSessionId).current(),
+    opened: (args, result) => trackerFor(pendingSessionId).opened(args, result),
+    selected: (space) => trackerFor(pendingSessionId).selected(space),
+    closed: (space, done) => trackerFor(pendingSessionId).closed(space, done),
+    resetToName: () => trackerFor(pendingSessionId).resetToName(),
+  }
+}
+
 // ── serialization ───────────────────────────────────────────────────────────
 /**
  * The ego-lite host is a single persistent browser shared by every tool call;
  * concurrent tool executions would race on the same task space / tabs. All
- * ego_* executions are therefore serialized through one in-process lock. This
- * guards against concurrent tool calls within this plugin instance; separate
- * harness sessions sharing the same browser remain unsupported (host-level).
+ * ego_* executions are therefore serialized through one in-process lock.
  */
 let egoLockChain: Promise<unknown> = Promise.resolve()
 function withEgoLock<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -180,6 +327,7 @@ const BUNDLED_WRAPPER = fileURLToPath(
   new URL('../bin/ego-chrome-wrapper.sh', import.meta.url),
 )
 const IS_WIN = process.platform === 'win32'
+const IS_DARWIN = process.platform === 'darwin'
 const AUTO_ADAPT_OFF = /^(0|false|no)$/i.test(
   process.env.EGO_BROWSER_AUTO_ADAPT ?? '',
 )
@@ -214,6 +362,33 @@ function windowsChromeCandidates(): string[] {
     b(local) + '\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   ]
   return out.filter(Boolean) as string[]
+}
+/**
+ * macOS registry-free probe of the usual `.app` bundles (no subprocess).
+ *
+ * Chrome on macOS is never on PATH: the launcher lives inside the bundle at
+ * `<App>.app/Contents/MacOS/<binary>`. Both the system-wide and per-user
+ * `/Applications` locations are probed, Chrome first so that a machine with
+ * several browsers picks the same one the README documents.
+ */
+function darwinChromeCandidates(): string[] {
+  const roots = ['/Applications']
+  if (process.env.HOME) {
+    roots.push(`${process.env.HOME}/Applications`)
+  }
+  const bundles = [
+    'Google Chrome.app/Contents/MacOS/Google Chrome',
+    'Chromium.app/Contents/MacOS/Chromium',
+    'Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    'Brave Browser.app/Contents/MacOS/Brave Browser',
+  ]
+  const out: string[] = []
+  for (const root of roots) {
+    for (const bundle of bundles) {
+      out.push(`${root}/${bundle}`)
+    }
+  }
+  return out
 }
 /** Find a usable Chrome binary by scanning PATH + common fixed locations. */
 export function findChromeBinary(): string | undefined {
@@ -257,6 +432,21 @@ export function findChromeBinary(): string | undefined {
     }
     return undefined
   }
+  // macOS: Chrome lives inside a `.app` bundle, never on PATH. Probe the bundle
+  // locations and stop there — the POSIX PATH walk below cannot find it (there
+  // is no `google-chrome` shim on macOS), so falling through only wastes time.
+  if (IS_DARWIN) {
+    for (const p of darwinChromeCandidates()) {
+      try {
+        if (existsSync(p)) {
+          return p
+        }
+      } catch {
+        // fall through
+      }
+    }
+    return undefined
+  }
   // POSIX: absolute + PATH walk.
   for (const name of COMMON_CHROME_BINS) {
     if (name.includes('/')) {
@@ -290,9 +480,17 @@ function isPosixRoot(platform: NodeJS.Platform = process.platform): boolean {
   const uid = process.getuid?.()
   return typeof uid === 'number' && uid === 0 && platform !== 'win32'
 }
-/** No display server → headless is required (Linux/macOS headless servers). */
+/** No display server → headless is required (Linux headless servers). */
 function isHeadlessDetected(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
-  // Windows and macOS always have a desktop session; only Linux headless servers need to run the backing browser headless.
+  // Windows and macOS always have a desktop session; only Linux headless
+  // servers need to run the backing browser headless.
+  //
+  // macOS must keep returning false here, and this is not the "adaptation" for
+  // #65: macOS GUI sessions are Aqua/Quartz and never export `$DISPLAY`, so its
+  // absence says nothing about whether a window can be shown — treating it as
+  // headless is precisely the regression that issue #16 fixed. The headed path
+  // works on darwin because the vendored runtime's ensureXDisplay() skips the
+  // Xvfb requirement on darwin exactly as it already does on win32 (#65).
   if (platform === 'win32' || platform === 'darwin') {
     return false
   }
@@ -335,7 +533,13 @@ export function resolveEgoEnv(cfg: Partial<ResolvedConfig>, { platform = process
   // the bundled wrapper is a POSIX shell script that cannot run here. Pass the
   // binary path directly so the vendored runtime (which uses POSIX `which`)
   // doesn't have to resolve it itself.
-  if (env.EGO_LINUX_CHROME === undefined && platform === 'win32' && chrome) {
+  //
+  // macOS shares both properties: no sandbox gate (the wrapper exists only to
+  // add --no-sandbox for root/Docker on Linux), and the vendored runtime's
+  // name-based lookup would never find a path inside a `.app` bundle. Without
+  // this branch `EGO_LINUX_CHROME` is never injected on darwin and the first
+  // cold start fails with "no Chrome/Chromium binary found" (issue #68).
+  if (env.EGO_LINUX_CHROME === undefined && (platform === 'win32' || platform === 'darwin') && chrome) {
     env.EGO_LINUX_CHROME = chrome
   }
   // Headless servers (no DISPLAY) must run the backing browser headless.
@@ -350,6 +554,14 @@ export function resolveEgoEnv(cfg: Partial<ResolvedConfig>, { platform = process
   const configChromeArgs = cfg?.chromeArgs
   if (env.EGO_LINUX_EXTRA_ARGS === undefined && typeof configChromeArgs === 'string' && configChromeArgs.trim() !== '') {
     env.EGO_LINUX_EXTRA_ARGS = configChromeArgs
+  }
+  // #93: macOS 27 + Chrome 156 silently stop flushing the cookie jar to disk when
+  // the login Keychain is used. `--use-mock-keychain` (added by the vendored
+  // runtime on darwin) restores persistence. Bridge the opt-in settings field to
+  // the runtime switch; a user-set env var still wins. Only injected on darwin
+  // because the flag is darwin-only — other platforms must stay untouched.
+  if (env.EGO_LINUX_USE_MOCK_KEYCHAIN === undefined && cfg?.useMockKeychain === true && platform === 'darwin') {
+    env.EGO_LINUX_USE_MOCK_KEYCHAIN = '1'
   }
   if (env.EGO_ISOLATE_SPACES === undefined && cfg?.isolateSpaces !== undefined) {
     env.EGO_ISOLATE_SPACES = cfg.isolateSpaces ? '1' : '0'
@@ -393,7 +605,8 @@ const COLD_START_SIGNS = [
   /target.*(closed|not found|detached|crashed)/i,
   /ECONNREFUSED/i,
 ]
-function isColdStartError(message: string): boolean {
+/** @internal exported for tests (also the contract the resident error relies on) */
+export function isColdStartError(message: string): boolean {
   return COLD_START_SIGNS.some((re) => re.test(message))
 }
 interface WarmupResult {
@@ -487,6 +700,7 @@ export async function runWithStaleSpaceRetry(  ctx: EgoContext,
     cfg.spaceTracker.resetToName()
     result = await withWarmupRetry(() => runEgoScript(ctx.subprocess, buildScript(), exec, cfg, graceOverrideMs))
   }
+  if (!result.ok && isColdStartError(result.error ?? '')) cfg.onColdStartFailure?.()
   return result
 }
 /** Find the last line carrying the sentinel and JSON-parse its payload. */
@@ -504,16 +718,48 @@ function parseSentinel(stdout: string): Record<string, unknown> | undefined {
   }
   return undefined
 }
+/**
+ * Parse the result of one script run: the sentinel payload when present, else
+ * the last parseable JSON line as a rescue path (#71: a script that succeeded
+ * but printed plain JSON used to be reported as a hard failure). The sentinel
+ * stays the primary contract; `fallback` marks the rescue so callers can say so.
+ * Exported for tests.
+ */
+export function parseSentinelOrLastJson(
+  stdout: string,
+): { value: Record<string, unknown>; fallback: boolean } | undefined {
+  const sentinel = parseSentinel(stdout)
+  if (sentinel !== undefined) return { value: sentinel, fallback: false }
+  const lines = stdout.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const text = lines[i]!.trim()
+    if (text === '' || !/^[[{]/.test(text)) continue
+    try {
+      return { value: JSON.parse(text) as Record<string, unknown>, fallback: true }
+    } catch {
+      // keep scanning upward
+    }
+  }
+  return undefined
+}
 
 /** The live runtime config object built in apply() (getters read the settings bridge). */
 interface EgoRuntimeConfig {
+  onColdStartFailure?: () => void
+  observeTool?: <T>(name: string, args: Record<string, unknown>, run: () => Promise<T> | T) => Promise<T>
   egoBin: string
   configuredDefaultSpace: string | number
-  spaceTracker: ActiveSpaceTracker
+  spaceTracker: SessionScopedSpaceTracker
+  /** Per-space tab cursor: which tab the previous call acted on. */
+  targetTracker: TargetTracker
+  /** True = each DSH session gets its own task space. */
+  readonly sessionScopedSpaces: boolean
   readonly defaultSpace: string | number
   maxOutputBytes: number
   graceMs: number
   readonly chromePath: string
+  /** macOS only: pass --use-mock-keychain to Chrome so cookies flush to disk (#93). */
+  readonly useMockKeychain: boolean
   readonly captureBackend: ResolvedConfig['captureBackend']
   readonly streamProfile: ResolvedConfig['streamProfile']
   readonly cdpFps: number
@@ -529,15 +775,233 @@ interface EgoRuntimeConfig {
   readonly egoCliArgs: string
   readonly idleTimeoutMin: number
   readonly chromeArgs: string
+  /** Fixed CSS viewport width for agent pages. 0 = off (browser window size). */
+  readonly viewportWidth: number
+  /** Fixed CSS viewport height for agent pages. 0 = off (browser window size). */
+  readonly viewportHeight: number
+  /** Device pixel ratio for the fixed viewport. 0 = browser default. */
+  readonly deviceScaleFactor: number
   readonly isolateSpaces: boolean
   readonly disableFrameRelay: boolean
+  readonly tuiAutoOpenPanel: boolean
+  /** Reuse a resident `ego-browser --serve` process across ego_* calls (issue #56). */
+  readonly residentExecutor: boolean
+  /** Minutes without an ego_* call before the resident process is stopped. 0 = keep until unmount. */
+  readonly residentIdleMin: number
+  /** Render the compact browser rules section in the system prompt after first use. */
+  readonly rulesPrompt: boolean
 }
 
 interface ExecLike {
   signal?: AbortSignal
 }
 
+// ── resident `--serve` transport (issue #56) ──────────────────────────────
+// One process per (bin, user CLI args) combination. Recreated when the user
+// changes egoCliArgs, stopped on idle timeout and on plugin teardown. Every
+// call still has the one-shot spawn path as a fallback, so a dead resident can
+// only cost latency, never a failed tool.
+let residentTransport: ResidentProcess | null = null
+let residentTransportKey = ''
+/**
+ * While a resident's CDP channel is dead (browser stopped, relaunch still
+ * settling), this timestamp parks the resident and lets the one-shot path do
+ * the call — it carries the launch retries. Without it every retry would spawn
+ * another doomed resident before the browser is back.
+ */
+let residentCooldownUntil = 0
+
+// ── #73 phase 2: executor diagnostics + failure supervision ────────────────
+// The panel/settings need to answer "is this call going through the resident,
+// how old is it, and why was it last rebuilt?" without DevTools. Supervision
+// stops the park → one-shot → respawn loop: after three consecutive cold-start
+// failures the resident stays parked (one-shot keeps working) until the user
+// toggles the setting or the plugin restarts.
+let residentConsecutiveFailures = 0
+let residentStartedAt = 0
+let residentLastRebuildReason = 'not started'
+let residentParkReason: string | null = null
+
+/** @internal exported for tests: the supervision state machine. */
+export function superviseResidentFailure(failures: number, error: string): { failures: number; parkReason: string | null } {
+  const next = failures + 1
+  return {
+    failures: next,
+    parkReason: next >= 3 ? `resident failed ${next} times in a row; last error: ${error}` : null,
+  }
+}
+
+export interface ResidentDiagnostics {
+  enabled: boolean
+  mode: 'resident' | 'starting' | 'one-shot'
+  running: boolean
+  pid: number | null
+  ageMs: number | null
+  consecutiveFailures: number
+  lastRebuildReason: string
+  parked: boolean
+  parkReason: string | null
+}
+
+/** @internal exported for tests (also used by /api/ego/executor + ego_status). */
+export function residentDiagnostics(cfg: EgoRuntimeConfig): ResidentDiagnostics {
+  const running = residentTransport !== null && residentTransport.alive
+  const active = cfg.residentExecutor === true && residentParkReason === null && Date.now() >= residentCooldownUntil
+  return {
+    enabled: cfg.residentExecutor === true,
+    mode: !active ? 'one-shot' : running ? 'resident' : 'starting',
+    running,
+    pid: running ? residentTransport?.pid ?? null : null,
+    ageMs: running && residentStartedAt > 0 ? Date.now() - residentStartedAt : null,
+    consecutiveFailures: residentConsecutiveFailures,
+    lastRebuildReason: residentLastRebuildReason,
+    parked: residentParkReason !== null,
+    parkReason: residentParkReason,
+  }
+}
+
+/** @internal exported for tests */
+export function resetResidentTransportForTests(): void {
+  const transport = residentTransport
+  residentTransport = null
+  residentTransportKey = ''
+  residentCooldownUntil = 0
+  residentConsecutiveFailures = 0
+  residentStartedAt = 0
+  residentLastRebuildReason = 'not started'
+  residentParkReason = null
+  transport?.stop()
+}
+
+function stopResidentTransport(): void {
+  const transport = residentTransport
+  residentTransport = null
+  residentTransportKey = ''
+  transport?.stop()
+}
+
+/**
+ * Return the live resident for this configuration, creating it when needed.
+ * @internal exported for tests
+ */
+export function ensureResidentTransport(cfg: EgoRuntimeConfig): ResidentProcess {
+  const extraCliArgs = filterArgs(cfg.egoCliArgs ?? '', EGO_CLI_BLOCKED)
+  const key = JSON.stringify([cfg.egoBin, extraCliArgs])
+  if (residentTransport !== null && residentTransportKey === key && residentTransport.alive) {
+    return residentTransport
+  }
+  const rebuilding = residentTransport !== null
+  stopResidentTransport()
+  residentTransportKey = key
+  residentTransport = new ResidentProcess({
+    argv: [process.execPath, cfg.egoBin, 'nodejs', '--serve', ...extraCliArgs],
+    env: resolveEgoEnv(cfg),
+    cwd: process.cwd(),
+    graceMs: cfg.graceMs,
+    idleMs: cfg.residentIdleMin > 0 ? cfg.residentIdleMin * 60_000 : 0,
+    onExit: () => {
+      // A crashed/hung resident is replaced lazily by the next call; nothing to
+      // do here but keep the reference honest.
+    },
+  })
+  residentTransport.start()
+  residentStartedAt = Date.now()
+  residentLastRebuildReason = rebuilding ? 'rebuilt: configuration changed' : 'created'
+  return residentTransport
+}
+
+/** Map a resident frame onto the shape the one-shot spawn path returns. */
+function residentFrameToResult(frame: ResidentFrame): WarmupResult {
+  const stdout = frame.stdout
+  const stderr = frame.stderr
+  if (!frame.ok) {
+    return {
+      ok: false,
+      error: `ego-browser script failed: ${frame.error ?? 'unknown failure'}${describeStderr(stderr)}`,
+      stdout,
+      stderr,
+    }
+  }
+  const parsed = parseSentinelOrLastJson(stdout)
+  if (parsed === undefined) {
+    return {
+      ok: false,
+      error: `ego-browser finished but no ${SENTINEL} JSON payload was found on stdout${describeStderr(
+        stderr,
+      )}`,
+      stdout,
+      stderr,
+    }
+  }
+  const value = parsed.fallback ? { ...parsed.value, fallback: true } : parsed.value
+  return { ok: true, value, stdout, stderr }
+}
+
+
 async function runEgoScript(subprocess: SubprocessService, script: string, exec: ExecLike, cfg: EgoRuntimeConfig, graceOverrideMs?: number): Promise<WarmupResult> {
+  // #87: egoBin is executed as `node <egoBin>`; fail before spawning when it
+  // points at a Windows executable (e.g. the official ego-browser.exe).
+  const egoBinCheck = validateEgoBinPath(cfg.egoBin)
+  if (!egoBinCheck.ok) return { ok: false, error: `egoBin is not usable: ${egoBinCheck.reason}`, stdout: '', stderr: '' }
+  // Resident path (opt-in, issue #56). Only a request that was never written
+  // falls back to the one-shot spawn below: once written, a retry could
+  // double-execute a click/fill, so the resident reports the failure instead.
+  if (cfg.residentExecutor && Date.now() >= residentCooldownUntil) {
+    let transport: ResidentProcess | null = null
+    try {
+      transport = ensureResidentTransport(cfg)
+    } catch {
+      transport = null // spawn failed; the one-shot path below reports it
+    }
+    if (transport !== null) {
+      try {
+        const frame = await transport.run(script, {
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+          ...(Number.isFinite(graceOverrideMs) && graceOverrideMs! > 0 ? { graceMs: graceOverrideMs! } : {}),
+        })
+        const result = residentFrameToResult(frame)
+        if (result.ok) {
+          residentConsecutiveFailures = 0
+          residentParkReason = null
+          return result
+        }
+        if (!isColdStartError(result.error ?? '')) return result
+        // Cold-start failure: the script never reached the browser (dead CDP
+        // channel, or a relaunch that has not settled). Safe to retry — park
+        // the resident and let the one-shot path below (with its launch
+        // retries) run this call. Three consecutive failures park it for good
+        // (until the setting is toggled or the plugin restarts), so we stop
+        // alternating park -> one-shot -> respawn (issue #73).
+        const supervision = superviseResidentFailure(residentConsecutiveFailures, result.error ?? 'cold start')
+        residentConsecutiveFailures = supervision.failures
+        residentLastRebuildReason = `cold-start failure: ${result.error ?? 'unknown'}`
+        if (supervision.parkReason !== null) {
+          residentParkReason = supervision.parkReason
+          residentCooldownUntil = Number.MAX_SAFE_INTEGER
+        } else {
+          residentCooldownUntil = Date.now() + 10_000
+        }
+        stopResidentTransport()
+      } catch (err) {
+        if (!(err instanceof ResidentNotRunningError)) {
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+            stdout: '',
+            stderr: '',
+          }
+        }
+        // not written → retry through the one-shot path
+      }
+    }
+  } else if (!cfg.residentExecutor) {
+    if (residentTransport !== null) stopResidentTransport()
+    if (residentParkReason !== null || residentConsecutiveFailures !== 0) {
+      residentConsecutiveFailures = 0
+      residentParkReason = null
+      residentLastRebuildReason = 'disabled by setting'
+    }
+  }
   let handle
   try {
     // User-configured extra ego-browser CLI args (settings field `egoCliArgs`).
@@ -610,8 +1074,8 @@ async function runEgoScript(subprocess: SubprocessService, script: string, exec:
       stderr,
     }
   }
-  const value = parseSentinel(stdout)
-  if (value === undefined) {
+  const parsed = parseSentinelOrLastJson(stdout)
+  if (parsed === undefined) {
     return {
       ok: false,
       error: `ego-browser finished but no ${SENTINEL} JSON payload was found on stdout${describeStderr(
@@ -621,6 +1085,7 @@ async function runEgoScript(subprocess: SubprocessService, script: string, exec:
       stderr,
     }
   }
+  const value = parsed.fallback ? { ...parsed.value, fallback: true } : parsed.value
   return { ok: true, value, stdout, stderr }
 }
 // ── tool plumbing ───────────────────────────────────────────────────────────
@@ -628,17 +1093,414 @@ async function runEgoScript(subprocess: SubprocessService, script: string, exec:
 const useSpace = (name: string | number): string =>
   `const task = await taskSpaces.useOrCreate(${j(name)})\n`
 /**
+ * Optional `tab` parameter shared by every tool that can be pinned to one tab.
+ * Declared at module scope so both registration functions can reuse it.
+ */
+export const tabParam = {
+  type: 'string',
+  description:
+    'Optional tab targetId (from ego_tabs list). Omit to use the tab Chrome reports as active, falling back to the first real page.',
+}
+
+/** Optional `space` parameter shared by action and raw-script tools. */
+export const spaceParam = {
+  type: 'string',
+  description:
+    'Task-space name or numeric id. Omit to use this session’s own space (dsh-agent-<session>) when session-scoped spaces are on (default), otherwise the most recently opened or explicitly selected space.',
+}
+
+/**
+ * Side-channel line the prelude prints with the target it actually chose.
+ * The host records it per space so the NEXT call — a brand-new process — can
+ * re-pin the same tab. Chrome's own `active` flag is not enough: it resets to
+ * the first tab when the previous CDP client disconnects, so a new process
+ * cannot tell which tab the last call used.
+ */
+const TARGET_MARKER = '@@EGO_TARGET@@'
+
+/** Per-space cursor: the tab the agent last acted on. */
+export interface TargetTracker {
+  get(space: string): string | undefined
+  set(space: string, targetId: string): void
+}
+
+export function createTargetTracker(): TargetTracker {
+  const bySpace = new Map<string, string>()
+  return {
+    get: (space) => bySpace.get(space),
+    set: (space, targetId) => {
+      if (space !== '' && targetId !== '') bySpace.set(space, targetId)
+    },
+  }
+}
+
+/**
+ * The pin the tool wrapper feeds to `ensureRealTab()` for the current
+ * buildScript call. Module-level because buildScript signatures are
+ * (args) => string and every page tool calls the same shared helper.
+ */
+let pendingTargetPin: string | undefined
+
+/** Viewport applied by `ensureRealTab()` for the current buildScript call. */
+let pendingViewport: ViewportSpec | undefined
+
+export interface ViewportSpec {
+  viewportWidth?: number
+  viewportHeight?: number
+  deviceScaleFactor?: number
+}
+
+/** Record the target a finished call actually used. */
+export function recordPinnedTarget(
+  tracker: TargetTracker,
+  space: string,
+  stdout: string,
+): void {
+  const at = stdout.lastIndexOf(TARGET_MARKER)
+  if (at === -1) return
+  const id = stdout.slice(at + TARGET_MARKER.length).split(/\s/)[0]
+  if (id !== undefined && id !== '') tracker.set(space, id)
+}
+
+/** Drop the pin side-channel from stdout returned to the model. */
+export function stripTargetMarkers(text: string): string {
+  if (!text.includes(TARGET_MARKER)) return text
+  return text
+    .split('\n')
+    .filter((line) => !line.includes(TARGET_MARKER))
+    .join('\n')
+}
+
+/** A file a tool produced and wants surfaced as a session deliverable. */
+export interface DeliverableFile {
+  path: string
+  description?: string
+}
+
+/**
+ * Record produced files as session deliverables.
+ *
+ * This emits the same `deliverables/presented` event the `present` tool emits,
+ * so a screenshot or a downloaded file shows up as a card the user can open in
+ * the Sidebar instead of a bare `/tmp/...` path they must copy from the chat.
+ *
+ * Entirely best-effort: a host without the projection service, a tool call
+ * with no initiating agent, or a session that rejects the append must never
+ * turn a successful screenshot into a failed tool call.
+ *
+ * @returns true when the event was appended.
+ */
+export function deliverToSession(
+  ctx: EgoContext,
+  exec: ToolExec | undefined,
+  files: DeliverableFile[],
+): boolean {
+  if (files.length === 0) return false
+  const session = (exec?.agent as { session?: { append?: unknown } } | undefined)?.session
+  if (session === undefined || typeof session.append !== 'function') return false
+  try {
+    const projections = ctx.get?.('sessionProjections') as
+      | { stateOf?: (target: unknown, key: string) => { lastTurn?: unknown } | undefined }
+      | undefined
+    const turn = projections?.stateOf?.(session, 'turnBoundary')?.lastTurn
+    if (typeof turn !== 'number') return false
+    ;(session.append as (target: string, payload: unknown) => void)('deliverables/presented', {
+      turn,
+      callId: exec?.callId,
+      files,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * JS snippet that makes the harness act on a real page tab.
  *
- * The Linux host (PR #234 ego-linux) does not reliably persist "current tab"
- * across CLI invocations: a fresh process sometimes resolves page actions
- * against a blank/stale tab. Selecting the first non-blank tab in the space
- * before acting makes cross-process tool calls deterministic.
+ * The Linux host does not persist "current tab" across CLI invocations: every
+ * ego_* call is a fresh process, and Chrome reports the first tab as active
+ * again once the previous CDP client goes away. Selecting a tab before acting
+ * is therefore mandatory for deterministic cross-process behaviour.
+ *
+ * Selection order (first match wins):
+ *  1. an explicit `tab` targetId supplied by the caller,
+ *  2. this space's cursor — the tab the previous call used (self-healing: a
+ *     closed tab no longer matches, so selection falls through),
+ *  3. the tab Chrome reports as active (correct within one process, and for
+ *     a human who just clicked a tab),
+ *  4. the first non-blank page (last-resort fallback).
+ *
+ * Before 0.9.5 there were no steps 1–2 and step 3 did not exist: the prelude
+ * always jumped to the FIRST real tab, silently retargeting every call
+ * whenever more than one tab was open.
+ *
+ * The viewport override is emitted AFTER the switch on purpose: `cdp()` needs
+ * an attached session, and before the first tab exists (a cold browser) there
+ * is nothing to attach to — running it first failed every tool with
+ * "no active tab to attach session".
  */
-const ensureRealTab = (): string =>
-  `const __tabs = await browser.listTabs()\n` +
-  `const __real = __tabs.find(t => !t.url.startsWith('about:') && !t.url.startsWith('chrome://')) ?? __tabs[0]\n` +
-  `if (__real) await browser.switchTab(__real.targetId)\n`
+export const ensureRealTab = (preferred?: string, viewport?: ViewportSpec): string => {
+  const explicit = preferred !== undefined && preferred !== '' ? preferred : undefined
+  const pin = explicit ?? pendingTargetPin
+  const spec = viewport ?? pendingViewport
+  return (
+    `const __tabs = await browser.listTabs()\n` +
+    `const __want = ${pin !== undefined ? j(pin) : 'null'}\n` +
+    `const __blank = (u) => /^(about:|chrome:|chrome-extension:|edge:|devtools:|data:)/.test(String(u || ''))\n` +
+    `const __pinned = __want ? __tabs.find(t => t.targetId === __want) : null\n` +
+    `const __real = __pinned\n` +
+    `  ?? __tabs.find(t => t.active === true && !__blank(t.url))\n` +
+    `  ?? __tabs.find(t => !__blank(t.url))\n` +
+    `  ?? __tabs.find(t => t.active === true)\n` +
+    `  ?? __tabs[0]\n` +
+    // Do not re-activate a tab that is already active: Target.activateTarget
+    // restores a minimized Chrome window on Windows, which made every tool
+    // call pop the browser back up (#96). A pinned/background target still
+    // needs the switch.
+    `if (__real && __real.active !== true) await browser.switchTab(__real.targetId)\n` +
+    `if (__real) console.log('${TARGET_MARKER}' + __real.targetId)\n` +
+    // Guarded: an existing space can be tab-less (every tab closed), and cdp
+    // has no session then. Skip emulation rather than failing the whole call.
+    (spec ? `if (__real) {\n${viewportPrelude(spec)}}\n` : '')
+  )
+}
+
+/**
+ * JS snippet that pins the page viewport with CDP emulation.
+ *
+ * A one-shot `ego-browser nodejs` process dies with the call, and a
+ * session-scoped `Emulation.setDeviceMetricsOverride` dies with it — the next
+ * call starts from the raw window size again. Emitting the override at the
+ * head of every script keeps a configured viewport stable across calls, and
+ * also fixes hosts whose display scaling shrinks the CSS viewport into a
+ * site's mobile breakpoint.
+ */
+export const viewportPrelude = (cfg: {
+  viewportWidth?: number
+  viewportHeight?: number
+  deviceScaleFactor?: number
+}): string => {
+  const width = Math.round(cfg.viewportWidth ?? 0)
+  const height = Math.round(cfg.viewportHeight ?? 0)
+  if (!(width > 0) || !(height > 0)) return ''
+  const scale = cfg.deviceScaleFactor !== undefined && cfg.deviceScaleFactor > 0
+    ? cfg.deviceScaleFactor
+    : 1
+  return (
+    `await cdp('Emulation.setDeviceMetricsOverride', { width: ${width}, height: ${height}, ` +
+    `deviceScaleFactor: ${scale}, mobile: false })\n`
+  )
+}
+
+/**
+ * Prelude for the raw heredoc tools (ego_cli / ego_script).
+ *
+ * These tools do NOT go through buildScript, so before this helper they ran
+ * with no tab selection at all and a fresh process could attach to a stale
+ * target. The prelude restores the same guarantees the structured tools get,
+ * but is wrapped in try/catch: a diagnostic script that never touches `page`
+ * must keep working even when no browser is up.
+ */
+export const rawScriptPrelude = (
+  cfg: {
+    viewportWidth?: number
+    viewportHeight?: number
+    deviceScaleFactor?: number
+    defaultSpace?: string | number
+  },
+  tab: string,
+  space?: string | number,
+): string => `try {\n${useSpace(space ?? cfg.defaultSpace ?? '')}${ensureRealTab(tab, cfg)}} catch {}\n`
+
+/**
+ * ego_tabs script builder (list / switch / open / close).
+ *
+ * Split out of the tool registration so the generated heredoc is unit-testable:
+ * 0.9.7 interpolated `useSpace(...)` (which declares `const task`) three times
+ * per action — once before the guard, once inside its `if` branch, once at its
+ * tail — and `new AsyncFunction(code)` rejects the repeated block-scoped
+ * `const`, so all four actions died with `SyntaxError: Identifier 'task' has
+ * already been declared` before anything reached the browser.
+ *
+ * Contract: the space pin is declared EXACTLY once, ahead of the capability
+ * guard, and the branches never re-declare it.
+ *
+ * #87: the official ego-lite runtime does not implement every helper the
+ * bundled runtime provides. A missing capability reports
+ * `runtime capability missing: …` instead of a raw ReferenceError.
+ */
+export const tabsScript = (opts: {
+  action: string
+  targetId?: string
+  url?: string
+  space: string | number
+}): string => {
+  const space = useSpace(opts.space)
+  const action = opts.action
+  const targetId = opts.targetId ?? ''
+  const url = opts.url ?? ''
+  const fail = (message: string): string =>
+    `console.log('${SENTINEL}' + JSON.stringify({ ok: false, error: ${j(message)} }))\n`
+  const done = (extra: string): string =>
+    `const __tabs = await browser.listTabs()\n` +
+    // Ownership matters: a user-owned space must not be closed or taken over by
+    // the agent. The facade may be missing on an older bridge, so keep it
+    // best-effort instead of failing the whole action.
+    `let __spaces = []\n` +
+    `try {\n` +
+    `  const __all = await taskSpaces.list()\n` +
+    `  __spaces = (__all || []).map(s => ({ id: s.id, name: s.name, ownership: s.ownership, recentTabTitles: s.recentTabTitles || [] }))\n` +
+    `} catch {}\n` +
+    `console.log('${SENTINEL}' + JSON.stringify({ ok: true${extra}, tabs: __tabs, spaces: __spaces }))\n`
+  const noBrowser = (cap: string): string =>
+    `typeof browser === 'undefined' || typeof browser.${cap} !== 'function'`
+  // The body is emitted after the guard's `else {`, and close brace at the end.
+  const guard = (expr: string, missing: string, body: string): string =>
+    `${space}if (${expr}) {\n${fail(`runtime capability missing: ${missing}; use the bundled runtime or extend your bridge with it`)}} else {\n${body}}\n`
+  if (action === 'switch') {
+    if (!targetId) return `${space}${fail('targetId is required for action=switch')}`
+    return guard(
+      `${noBrowser('switchTab')} || ${noBrowser('listTabs')}`,
+      'browser.switchTab / browser.listTabs',
+      `await browser.switchTab(${j(targetId)})\n${done(`, switched: ${j(targetId)}`)}`,
+    )
+  }
+  if (action === 'open') {
+    return guard(
+      `${noBrowser('listTabs')} || typeof ego === 'undefined' || typeof ego.createTab !== 'function'`,
+      'ego.createTab / browser.listTabs',
+      `const __created = await ego.createTab(${j(url || 'about:blank')})\n${done(`, created: __created && __created.targetId || null`)}`,
+    )
+  }
+  if (action === 'close') {
+    if (!targetId) return `${space}${fail('targetId is required for action=close')}`
+    return guard(
+      `${noBrowser('closeTab')} || ${noBrowser('listTabs')}`,
+      'browser.closeTab / browser.listTabs',
+      `await browser.closeTab(${j(targetId)})\n${done(`, closed: ${j(targetId)}`)}`,
+    )
+  }
+  if (action !== 'list') return `${space}${fail(`unknown action: ${action}`)}`
+  return guard(noBrowser('listTabs'), 'browser.listTabs', done(''))
+}
+
+/** Accepted tab-reuse policies for `ego_navigate`. */
+export const NAVIGATE_REUSE_MODES = ['origin', 'exact', 'none'] as const
+export type NavigateReuse = (typeof NAVIGATE_REUSE_MODES)[number]
+
+/** Default + validation for the `reuse` parameter (unknown values → origin). */
+export function normalizeNavigateReuse(value: unknown): NavigateReuse {
+  const v = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return (NAVIGATE_REUSE_MODES as readonly string[]).includes(v) ? (v as NavigateReuse) : 'origin'
+}
+
+/**
+ * ego_navigate script builder.
+ *
+ * Split out so the generated heredoc is unit-testable (same reason as
+ * `tabsScript`). Three policies:
+ *
+ * - `origin` (default): an open tab on the same host is activated and
+ *   navigated IN PLACE. This is the ZCode `browsers.open(url)` behaviour and
+ *   stops a same-site navigation from hijacking an unrelated active tab.
+ * - `exact`: only an already-open exact URL is reused (switch, no reload).
+ * - `none`: always navigate the active tab (the pre-0.9.13 behaviour).
+ *
+ * Do NOT wire this to the runtime's `openOrReuseTab({ match: 'origin' })`: that
+ * helper switches to the same-origin tab but does NOT navigate it, so a
+ * same-site different path would silently stay on the old page.
+ */
+export const navigateScript = (opts: {
+  url: string
+  reuse?: string
+  wait?: boolean
+  timeout?: number
+  tab?: string
+  space: string | number
+}): string => {
+  const url = opts.url
+  if (url === '') {
+    return (
+      `${useSpace(opts.space)}` +
+      `console.log('${SENTINEL}' + JSON.stringify({ ok: false, code: 'INVALID_ARGS', ` +
+      `error: 'ego_navigate: url is required' }))\n`
+    )
+  }
+  const reuse = normalizeNavigateReuse(opts.reuse)
+  const wait = opts.wait !== false
+  const timeout =
+    typeof opts.timeout === 'number' && Number.isFinite(opts.timeout) && opts.timeout > 0
+      ? Math.round(opts.timeout)
+      : 20_000
+  const goto = `page.goto(${j(url)}, { wait: ${wait}, timeout: ${timeout} })`
+  if (reuse === 'none') {
+    return (
+      `${useSpace(opts.space)}${ensureRealTab(opts.tab ?? '')}` +
+      `const __url = ${j(url)}\n` +
+      `await ${goto}\n` +
+      `const pginfo = await page.info()\n` +
+      `console.log('${SENTINEL}' + JSON.stringify({ ok: true, reused: 'none', navigated: true, page: pginfo }))\n`
+    )
+  }
+  const originBranch =
+    reuse === 'origin'
+      ? `} else if (__reuse === 'origin') {\n` +
+        `  let __host = ''\n` +
+        `  try { __host = new URL(__url).host } catch { __host = '' }\n` +
+        `  const __same = __host === '' ? undefined : __tabs.find(t => {\n` +
+        `    try { return new URL(t.url).host === __host } catch { return false }\n` +
+        `  })\n` +
+        `  if (__same) {\n` +
+        `    if (__same.active !== true) await browser.switchTab(__same.targetId)\n` +
+        `    await ${goto}\n` +
+        `    __reused = 'origin'\n` +
+        `  }\n`
+      : ''
+  return (
+    `${useSpace(opts.space)}${ensureRealTab(opts.tab ?? '')}` +
+    `const __url = ${j(url)}\n` +
+    `const __reuse = ${j(reuse)}\n` +
+    `const __stripHash = (value) => String(value || '').split('#')[0]\n` +
+    `let __reused = 'none'\n` +
+    `const __exact = __tabs.find(t => __stripHash(t.url) === __stripHash(__url))\n` +
+    `if (__exact) {\n` +
+    `  if (__exact.active !== true) await browser.switchTab(__exact.targetId)\n` +
+    `  __reused = 'exact'\n` +
+    `${originBranch}` +
+    (reuse === 'origin' ? '}\n' : '}\n') +
+    `if (__reused === 'none') await ${goto}\n` +
+    `const pginfo = await page.info()\n` +
+    `console.log('${SENTINEL}' + JSON.stringify({ ok: true, reused: __reused, navigated: __reused !== 'exact', page: pginfo }))\n`
+  )
+}
+
+/**
+ * selectOption with value → label → index fallback.
+ *
+ * `selectOption` matches option VALUES; a caller passing the visible label
+ * ("Two" for `<option value="2">Two</option>`) used to fail with
+ * `could not find option "Two"` even though the tool documented label support.
+ * Try the value first (cheap, the common case), then the label, then — for a
+ * numeric argument — the index.
+ */
+export const selectOptionScript = (selector: string, value: unknown): string =>
+  `const __sel = ${j(selector)}\n` +
+  `const __v = ${j(value ?? '')}\n` +
+  `const __pick = async (v) => {\n` +
+  `  try { return await page.locator(__sel).selectOption(v) } catch (__e) {\n` +
+  `    if (typeof v === 'string') { try { return await page.locator(__sel).selectOption({ label: v }) } catch {} }\n` +
+  `    if (typeof v === 'number') { try { return await page.locator(__sel).selectOption({ index: v }) } catch {} }\n` +
+  `    throw __e\n` +
+  `  }\n` +
+  `}\n` +
+  `const __list = Array.isArray(__v) ? __v : [__v]\n` +
+  `let __picked = []\n` +
+  `try { __picked = await page.locator(__sel).selectOption(__v) } catch { __picked = [] }\n` +
+  `if (!Array.isArray(__picked) || __picked.length === 0) {\n` +
+  `  for (const __one of __list) { const __r = await __pick(__one); __picked = Array.isArray(__r) ? __r : [__r] }\n` +
+  `}\n` +
+  `console.log('${SENTINEL}' + JSON.stringify({ ok: true, select: __sel, values: __picked }))\n`
 function renderText(_args: unknown, value: unknown): unknown[] {
   const v = value as Record<string, unknown> | null
   if (
@@ -650,6 +1512,27 @@ function renderText(_args: unknown, value: unknown): unknown[] {
     return [{ type: 'text', text: v.text }]
   }
   return [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+}
+/**
+ * Renderer for structured tool values: a failed domain result is shown as one
+ * short actionable block (code / actionSent / retry / hint) instead of a raw
+ * JSON dump, so the model sees the recovery path without parsing fields.
+ */
+function renderEgoToolText(args: unknown, value: unknown): unknown[] {
+  const v = value as Record<string, unknown> | null
+  if (v !== null && typeof v === 'object' && v.ok === false && typeof v.code === 'string') {
+    const error = typeof v.error === 'string' && v.error !== '' ? ` ${v.error}` : ''
+    return [
+      {
+        type: 'text',
+        text:
+          `error [${v.code}]${error}\n` +
+          `actionSent: ${String(v.actionSent)} | retry: ${String(v.retry)}\n` +
+          `hint: ${typeof v.hint === 'string' ? v.hint : ''}`,
+      },
+    ]
+  }
+  return renderText(args, value)
 }
 const commonOutputSchema = {
   type: 'object',
@@ -676,6 +1559,29 @@ interface EgoToolOptions {
   parameters: Record<string, unknown>
   buildScript: (args: Record<string, unknown>) => string
   afterExecute?: (args: Record<string, unknown>, value: unknown) => void
+  /**
+   * Post-process the canonical tool value before it is rendered. Used by
+   * `ego_snapshot` to turn a full tree into a diff; must be pure with respect
+   * to the arguments (it may read/update plugin state such as the snapshot
+   * cache, but must not do I/O or spawn anything).
+   */
+  transformValue?: (
+    args: Record<string, unknown>,
+    value: unknown,
+    context: { sessionId?: string; spaceKey: string },
+  ) => unknown
+  /**
+   * Optional one-line reminder appended to a successful value. Used by the
+   * interaction tools to carry the "observe before repeating" rule at the
+   * moment it matters instead of paying for it in every prompt.
+   */
+  successHint?: (args: Record<string, unknown>, value: unknown) => string | undefined
+  /** Files this call produced, surfaced as session deliverables. */
+  deliverFiles?: (args: Record<string, unknown>, value: unknown) => DeliverableFile[]
+}
+
+function observeEgoTool<T>(cfg: EgoRuntimeConfig, name: string, args: Record<string, unknown>, run: () => Promise<T> | T): Promise<T> {
+  return cfg.observeTool ? cfg.observeTool(name, args, run) : Promise.resolve().then(run)
 }
 
 function defineEgoTool(ctx: EgoContext, cfg: EgoRuntimeConfig, opts: EgoToolOptions): ToolHandle {
@@ -685,29 +1591,70 @@ function defineEgoTool(ctx: EgoContext, cfg: EgoRuntimeConfig, opts: EgoToolOpti
     parameters: opts.parameters,
     output: {
       schema: commonOutputSchema,
-      render: renderText,
+      render: renderEgoToolText,
     },
     timeoutMs: TOOL_TIMEOUT_MS,
     execute: async (args: Record<string, unknown>, exec: ToolExec) =>
-      withEgoLock(async () => {
-        // Signal the client to auto-open the sidebar Tab on the first ego_*
-        // tool call. markEgoToolCall() bumps a host-side counter surfaced via
-        // /api/ego/spaces; the LivePreviewController transitions on 0 → >0 and
-        // calls betterSidebar.openTab(). Idempotent: the client's transition
-        // guard means only the first call per session opens the Tab.
-        markEgoToolCall(callingSessionId(exec))
-        // Stale-space recovery (browser restart wiped the space table) is
-        // handled inside runWithStaleSpaceRetry; the cold-start retry is one
-        // level deeper.
-        const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => opts.buildScript(args))
-        if (!result.ok) throw new Error(result.error)
-        if (typeof opts.afterExecute === 'function') opts.afterExecute(args, result.value)
-        // Value is JSON.parse output of our own payload — fits the tool JSON contract.
-        return result.value
-      }),
-    presentCall: () => ({
+      withEgoLock(() => observeEgoTool(cfg, opts.name, args, async () => {
+        // Scope the whole call to its session: space resolution, the tab
+        // cursor and afterExecute hooks all read pendingSessionId.
+        const sessionId = callingSessionId(exec)
+        pendingSessionId = sessionId
+        try {
+          // Signal the client to auto-open the sidebar Tab on the first ego_*
+          // tool call. markEgoToolCall() bumps a host-side counter surfaced via
+          // /api/ego/spaces; the LivePreviewController transitions on 0 → >0 and
+          // calls betterSidebar.openTab(). Idempotent: the client's transition
+          // guard means only the first call per session opens the Tab.
+          markEgoToolCall(sessionId)
+          // Stale-space recovery (browser restart wiped the space table) is
+          // handled inside runWithStaleSpaceRetry; the cold-start retry is one
+          // level deeper.
+          // The tab pin and the viewport are applied around buildScript only,
+          // because both belong to the page tool that is about to run: the pin
+          // is this space's remembered target, and the viewport must be applied
+          // AFTER ensureRealTab() has switched to a tab (cdp has no session
+          // before that). The script reports back the target it actually used.
+          const spaceKey = scopedTargetKey(sessionId, str(args.space, cfg.defaultSpace))
+          const buildScript = () => {
+            pendingTargetPin = cfg.targetTracker.get(spaceKey)
+            pendingViewport = cfg
+            try {
+              return opts.buildScript(args)
+            } finally {
+              pendingTargetPin = undefined
+              pendingViewport = undefined
+            }
+          }
+          const result = await runWithStaleSpaceRetry(ctx, cfg, exec, buildScript)
+          // Domain failure is a canonical value, not an exception: the renderer
+          // shows code/actionSent/retry/hint so the model can recover instead of
+          // blindly replaying a non-idempotent action.
+          if (!result.ok) return failureValue(opts.name, result.error ?? 'ego-browser call failed')
+          recordPinnedTarget(cfg.targetTracker, spaceKey, result.stdout)
+          const value =
+            typeof opts.transformValue === 'function'
+              ? opts.transformValue(args, result.value, { sessionId, spaceKey })
+              : result.value
+          const hint = typeof opts.successHint === 'function' ? opts.successHint(args, value) : undefined
+          const finalValue =
+            hint !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value)
+              ? { ...(value as Record<string, unknown>), hint }
+              : value
+          if (typeof opts.afterExecute === 'function') opts.afterExecute(args, finalValue)
+          if (typeof opts.deliverFiles === 'function') {
+            deliverToSession(ctx, exec, opts.deliverFiles(args, finalValue))
+          }
+          // Value is JSON.parse output of our own payload (or a pure transform of
+          // it) — fits the tool JSON contract.
+          return finalValue
+        } finally {
+          pendingSessionId = undefined
+        }
+      })),
+    presentCall: (args: unknown) => ({
       card: 'generic',
-      title: opts.name,
+      title: toolCallTitle(opts.name, args),
       kind: 'other',
       rawInput: null,
     }),
@@ -720,12 +1667,16 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
   // entry + user-layer overrides) feeds `chromePath` + cast settings into cfg
   // via getters so every spawn reads the latest value without re-registration.
   const settingKeys = [
-    'chromePath', 'captureBackend', 'streamProfile', 'cdpFps', 'cdpQuality',
+    'chromePath', 'useMockKeychain', 'captureBackend', 'streamProfile', 'cdpFps', 'cdpQuality',
     'cdpMaxWidth', 'cdpBackstopIntervalMs', 'ffmpegFps', 'ffmpegMaxWidth', 'ffmpegBitrateKbps',
     'ffmpegEncoder', 'ffmpegPath', 'githubMirror', 'egoCliArgs', 'chromeArgs',
     'castFpsCap', 'screencastQuality', 'screencastMaxWidth', 'backstopIntervalMs',
     'idleTimeoutMin',
     'disableFrameRelay',
+    'tuiAutoOpenPanel',
+    'residentExecutor',
+    'residentIdleMin',
+    'rulesPrompt',
   ]
   const entry = Object.fromEntries(settingKeys.filter((key) => config[key] !== undefined).map((key) => [key, config[key]]))
   // DSH 0.1.7：可注册的 settings 命名空间被换成了 loader 条目上的配置文档，用户
@@ -749,7 +1700,13 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     /* ignore */
   })
 
-  const spaceTracker = createActiveSpaceTracker((config.defaultSpace as string | number | undefined) ?? DEFAULT_SPACE)
+  // One tracker per DSH session (lazily). The scope flag is read live, so the
+  // setting can be flipped without rebuilding anything; a session that already
+  // selected a space keeps it.
+  const spaceTracker = createSessionScopedSpaceTracker(
+    (config.defaultSpace as string | number | undefined) ?? DEFAULT_SPACE,
+    () => resolveConfig(bridge.source() as RawConfig).sessionScopedSpaces,
+  )
   const cfg: EgoRuntimeConfig = {
     egoBin:
       typeof config.egoBin === 'string' && config.egoBin !== ''
@@ -757,6 +1714,7 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
         : DEFAULT_EGO_BIN,
     configuredDefaultSpace: (config.defaultSpace as string | number | undefined) ?? DEFAULT_SPACE,
     spaceTracker,
+    targetTracker: createTargetTracker(),
     get defaultSpace() { return this.spaceTracker.current() },
     maxOutputBytes: (config.maxOutputBytes as number | undefined) ?? DEFAULT_MAX_OUTPUT_BYTES,
     graceMs: (config.graceMs as number | undefined) ?? DEFAULT_GRACE_MS,
@@ -781,13 +1739,64 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     // edits take effect on the next spawn / next browser cold start.
     get egoCliArgs() { return resolveConfig(bridge.source() as RawConfig).egoCliArgs },
     get chromeArgs() { return resolveConfig(bridge.source() as RawConfig).chromeArgs },
+    // #93: read on every spawn via resolveEgoEnv, so a settings toggle applies to
+    // the next browser cold start without a host restart.
+    get useMockKeychain() { return resolveConfig(bridge.source() as RawConfig).useMockKeychain },
+    // Live getters: the viewport prelude is rebuilt for every call, so a GUI
+    // edit takes effect on the next ego_* call without a restart.
+    get viewportWidth() { return resolveConfig(bridge.source() as RawConfig).viewportWidth },
+    get viewportHeight() { return resolveConfig(bridge.source() as RawConfig).viewportHeight },
+    get deviceScaleFactor() { return resolveConfig(bridge.source() as RawConfig).deviceScaleFactor },
     get isolateSpaces() { return resolveConfig(bridge.source() as RawConfig).isolateSpaces },
+    get sessionScopedSpaces() { return resolveConfig(bridge.source() as RawConfig).sessionScopedSpaces },
     get idleTimeoutMin() { return resolveConfig(bridge.source() as RawConfig).idleTimeoutMin },
     // Live getter: cast-server reads this on EVERY /api/ego/* request, so the
     // settings card toggle takes effect without a host restart.
     get disableFrameRelay() { return resolveConfig(bridge.source() as RawConfig).disableFrameRelay },
+    get tuiAutoOpenPanel() { return resolveConfig(bridge.source() as RawConfig).tuiAutoOpenPanel },
+    // #56: resident executor (opt-in) and its idle window. Both are read on
+    // every call, so toggling the setting takes effect on the next ego_* call.
+    get residentExecutor() { return resolveConfig(bridge.source() as RawConfig).residentExecutor },
+    get residentIdleMin() { return resolveConfig(bridge.source() as RawConfig).residentIdleMin },
+    // Live getter: the rules section reads it on every assembly pass, so toggling
+    // the setting takes effect without re-registering the section.
+    get rulesPrompt() { return resolveConfig(bridge.source() as RawConfig).rulesPrompt },
+  }
+  const browserState = new BrowserStateStore()
+  const tui = installTui(ctx, browserState)
+  installBrowserPanel(ctx, cfg, browserState, tui, {
+    createTransport: () => ({ readBrowserState, readTaskSpaceGroups, ensureWorker: makeEnsureWorker(ctx, cfg, ffmpegManager), get: proxyFrom, post: proxyPost }),
+    openAgentWindow: () => openAgentWindow(ctx, cfg),
+  })
+  cfg.onColdStartFailure = () => tui.toast('Agent Browser could not start after retrying. Run ego_doctor for details.', 'error')
+  cfg.observeTool = async (name, args, run) => {
+    const token = browserState.startTool(name, safeLocatorSummary(name, args))
+    try {
+      const value = await run()
+      const result = value as { ok?: boolean; error?: unknown } | null
+      const error = typeof result?.error === 'string' ? result.error : undefined
+      browserState.finishTool(token, { ok: result?.ok !== false, error })
+      return value
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      browserState.finishTool(token, { ok: false, error: message })
+      throw error
+    }
   }
   const reg = (tool: ToolHandle): void => {
+    // One wrapper for every ego_* tool: record that this process/session has
+    // used the browser (the native rules prompt turns on after this), then add
+    // the observation wrapper for the standalone tools that skip the browser
+    // lock.
+    const execute = tool.execute
+    tool.execute = (args, exec) => {
+      noteEgoToolUse(callingSessionId(exec as ToolExec | undefined))
+      return execute(args, exec)
+    }
+    if (['ego_cli', 'ego_script', 'ego_help', 'ego_doctor'].includes(tool.name)) {
+      const noted = tool.execute
+      tool.execute = (args, exec) => observeEgoTool(cfg, tool.name, args as Record<string, unknown>, () => noted(args, exec))
+    }
     const dispose = ctx.tools.register(tool) as unknown as () => void
     // Cordis lifecycle: unregister the tool when the plugin unmounts.
     ctx.effect?.(() => dispose)
@@ -797,6 +1806,13 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
   registerLoginImport(ctx, cfg, reg)
   registerActionTools(ctx, cfg, reg)
   registerHelpAndDoctor(ctx, cfg, reg)
+  // Native operating rules (no skill): a system-prompt section that stays empty
+  // until this process has seen an ego_* call. Feature-detected, so a host
+  // without the systemPrompt service is unaffected; `rulesPrompt=false` keeps
+  // the section registered but renders an empty string.
+  rulesSectionRegistered = registerEgoRulesSection(ctx, {
+    isEnabled: () => resolveConfig(bridge.source() as RawConfig).rulesPrompt,
+  })
   // Realtime watch-panel host routes (/api/ego/*). Guarded: only meaningful
   // when the host exposes an HTTP server (web surface); headless safe-no-op.
   // The host service is `webServer` on the web shell (current runner). We only
@@ -821,6 +1837,7 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
         ffmpegManager,
         () => openAgentWindow(ctx, cfg),
         (opts) => importLoginCookies(opts, { subprocess: ctx.subprocess }),
+        () => residentDiagnostics(cfg) as unknown as Record<string, unknown>,
       )
     } catch (err) {
       ctx.logger?.warn?.(
@@ -878,8 +1895,18 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
               ? (e.LOCALAPPDATA || `${home}\\AppData\\Local`) + '\\ego-lite-linux'
               : `${e.XDG_STATE_HOME || `${home}/.local/state`}/ego-lite-linux`)
           const { readFile } = await import('node:fs/promises')
+          let reapedPid: number | undefined
           try {
-            await readFile(`${stateDir}/browser.json`, 'utf8')
+            const stateText = await readFile(`${stateDir}/browser.json`, 'utf8')
+            if (tui.hasToast()) {
+              try {
+                const pid = JSON.parse(stateText).pid
+                if (Number.isInteger(pid) && pid > 0) {
+                  process.kill(pid, 0)
+                  reapedPid = pid
+                }
+              } catch { /* Only announce a confirmed live browser being stopped. */ }
+            }
           } catch {
             return // no state file → no browser → nothing to reap
           }
@@ -896,7 +1923,14 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
             },
             graceMs: 8_000,
           })
-          handle.done.catch(() => null)
+          void handle.done.then(outcome => {
+            if (outcome.exitCode !== 0 || reapedPid === undefined || !tui.hasToast()) return
+            try { process.kill(reapedPid, 0) } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+                tui.toast('Agent Browser stopped after the idle timeout.', 'success')
+              }
+            }
+          }).catch(() => null)
         } catch {
           // never let the reaper throw
         }
@@ -904,6 +1938,10 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     }, 60_000)
     return () => clearInterval(timer)
   }, 'ego-browser: idle reaper')
+  // #56: stop the resident --serve process when the plugin unmounts. The
+  // browser itself is stopped by the teardown effect below; the resident is
+  // only a stdio peer and must not outlive the plugin.
+  ctx.effect?.(() => () => stopResidentTransport(), 'ego-browser: resident executor')
   // Graceful teardown: stop the persistent browser when the plugin unmounts.
   // CRITICAL: this must be fire-and-forget, NOT awaited. Awaiting `--stop`
   // (which asks the browser to graceful-close, ~seconds) stalls the host process
@@ -959,6 +1997,10 @@ function registerEgoStatus(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
             available: { type: 'boolean', required: true },
             path: { type: 'string' },
             exitCode: { type: 'integer' },
+            resident: { type: 'object', additionalProperties: true },
+            rulesSummary: { type: 'string' },
+            rulesPrompt: { type: 'object', additionalProperties: true },
+            help: { type: 'string' },
           },
         },
         render: renderText,
@@ -968,8 +2010,8 @@ function registerEgoStatus(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
       // budget so it does not report "unavailable" merely because the backing
       // browser was still warming up.
       timeoutMs: 25_000,
-      execute: async () =>
-        withEgoLock(async () => {
+      execute: async (args: Record<string, unknown>) =>
+        withEgoLock(() => observeEgoTool(cfg, 'ego_status', args, async () => {
           try {
             const handle = ctx.subprocess.spawn({
               argv: [process.execPath, cfg.egoBin, '--status'],
@@ -989,6 +2031,13 @@ function registerEgoStatus(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
               available: outcome.exitCode === 0 && out !== '',
               path: cfg.egoBin,
               exitCode: outcome.exitCode,
+              resident: residentDiagnostics(cfg),
+              rulesSummary: STATUS_RULES_SUMMARY,
+              rulesPrompt: {
+                enabled: cfg.rulesPrompt,
+                registered: rulesSectionRegistered,
+              },
+              help: 'ego_help discipline / errors',
             }
           } catch (err) {
             return {
@@ -999,10 +2048,10 @@ function registerEgoStatus(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
               error: describeSpawnFailure(err),
             }
           }
-        }),
-      presentCall: () => ({
+        })),
+      presentCall: (args: unknown) => ({
         card: 'generic',
-        title: 'ego_status',
+        title: toolCallTitle('ego_status', args),
         kind: 'other',
         rawInput: null,
       }),
@@ -1031,8 +2080,8 @@ function registerAuthFlush(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
         render: renderText,
       },
       timeoutMs: 10_000,
-      execute: async () =>
-        withEgoLock(async () => {
+      execute: async (args: Record<string, unknown>) =>
+        withEgoLock(() => observeEgoTool(cfg, 'ego_auth_flush', args, async () => {
           try {
             const { readFile } = await import('node:fs/promises')
             // Mirror the ego-cast worker's state-dir discovery so the flush
@@ -1081,10 +2130,10 @@ function registerAuthFlush(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
           } catch (err) {
             return { ok: false, error: String((err as Error)?.message || err) }
           }
-        }),
-      presentCall: () => ({
+        })),
+      presentCall: (args: unknown) => ({
         card: 'generic',
-        title: 'ego_auth_flush',
+        title: toolCallTitle('ego_auth_flush', args),
         kind: 'other',
         rawInput: null,
       }),
@@ -1092,16 +2141,84 @@ function registerAuthFlush(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: T
   )
 }
 /** `ego_login_import` — copy login cookies from the system browser (issue #46). */
+/**
+ * #69 policy: `ego_login_import` is unsafe on Windows because the import boots
+ * the REAL profile through a junction alias and hard-kills the instance. Chrome
+ * App-Bound Encryption (127+) is what makes the data-loss path possible (and
+ * the cookie read fail), so the guard covers every ABE-capable build, not only
+ * the 155 build where the damage was first observed. Linux/macOS use a different
+ * profile-handoff path and stay enabled. The env flag remains a manual override.
+ *
+ * Exported for tests.
+ */
+export function loginImportPolicy({
+  platform,
+  chromeMajor,
+  force,
+}: {
+  platform: NodeJS.Platform
+  chromeMajor: number | null
+  force: boolean
+}): { allowed: boolean; reason?: string } {
+  if (force) return { allowed: true }
+  if (platform !== 'win32') return { allowed: true }
+  if (chromeMajor === null) {
+    return {
+      allowed: false,
+      reason:
+        'could not determine the installed Chrome version on Windows; refusing to risk the source profile (set EGO_LINUX_LOGIN_IMPORT_FORCE=1 to override)',
+    }
+  }
+  if (chromeMajor >= 127) {
+    return {
+      allowed: false,
+      reason: `Chrome ${chromeMajor} on Windows uses App-Bound Encryption (127+), which makes the current import path both unable to read cookies and potentially destructive to the source profile (#69). Set EGO_LINUX_LOGIN_IMPORT_FORCE=1 to override.`,
+    }
+  }
+  return { allowed: true }
+}
+
+/** Is the manual override set? */
+export function loginImportForced(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.EGO_LINUX_LOGIN_IMPORT_FORCE ?? '')
+}
+
+/**
+ * Best-effort major version of the Chrome-family binary the import would use.
+ *
+ * Windows: Chrome keeps one `<major>.<minor>.<build>.<patch>` directory under
+ * the `Application` directory next to chrome.exe — cheap and reliable. Elsewhere
+ * ask the binary itself (`--version`), which is what the platform expects. Any
+ * failure returns null; the policy treats null conservatively on Windows.
+ * Exported for tests.
+ */
+export function detectChromeMajorVersion(binPath: string | null | undefined): number | null {
+  if (!binPath) return null
+  try {
+    if (process.platform === 'win32') {
+      const versions = readdirSync(dirname(binPath))
+        .filter((entry) => /^\d+\.\d+\.\d+\.\d+$/.test(entry))
+        .map((entry) => Number(entry.split('.')[0]))
+        .filter((major) => Number.isInteger(major) && major > 0)
+      return versions.length === 0 ? null : Math.max(...versions)
+    }
+    const out = execFileSync(binPath, ['--version'], { encoding: 'utf8', timeout: 5000 })
+    const match = String(out).match(/(\d+)\.\d+\.\d+/)
+    return match ? Number(match[1]) : null
+  } catch {
+    return null
+  }
+}
 function registerLoginImport(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool: ToolHandle) => void): void {
   reg(
     defineTool({
       name: 'ego_login_import',
       description:
-        'Import login cookies from the system browser (Chrome/Edge/Brave) into the agent browser, so sites open already logged in. Works via a throwaway headless instance of the REAL system browser (CDP passthrough — no offline decryption; survives Chrome App-Bound Encryption). Run with dryRun=true first to see what is importable, then import with an explicit domains list (e.g. ["bilibili.com"]). The agent browser must be running (call ego_status first). Imported logins persist in the on-disk profile across restarts. Cookie values are never shown — only domain names and counts.',
+        'Import login cookies from the system browser into the agent browser, so sites open already logged in, with two SAFE routes (#69): (1) source="extension" — load the companion extension/ folder once in Chrome/Edge, keep the browser open, run this with explicit domains and click Export in the extension popup; cookies are read through the browser\'s own cookies API and POSTed to a loopback receiver (token file: <stateDir>/login-extension-token). This works on modern Chrome/Edge (including Windows 127+ ABE). (2) source="chrome"|"edge"|"brave"|"auto" — the source browser must be closed; the tool copies only Local State + the Cookies DB to a throwaway profile and reads it headless. On Chrome/Edge 127+ (App-Bound Encryption) that copy reads 0 cookies and the tool reports it explicitly; the real profile is never booted or modified. dryRun=true reports what would be imported. The agent browser must be running (call ego_status first). Imported logins persist in the on-disk profile. Cookie values are never shown — only domain names and counts.',
       parameters: {
         source: {
           type: 'string',
-          description: 'chrome | edge | brave | auto (default: auto = first detected browser).',
+          description: 'extension | chrome | edge | brave | auto (default: auto = first detected browser). Use "extension" for modern Chrome/Edge without closing it.',
         },
         domains: {
           type: 'json',
@@ -1135,21 +2252,46 @@ function registerLoginImport(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
             matched: { type: 'integer' },
             written: { type: 'integer' },
             domains: { type: 'json' },
+            warning: { type: 'string' },
             closedSource: { type: 'boolean' },
-            restoredFromBackup: { type: 'boolean' },
+            disabled: { type: 'boolean' },
             error: { type: 'string' },
           },
         },
         render: renderText,
       },
-      timeoutMs: 60_000,
+      timeoutMs: 180_000,
       execute: async (args: Record<string, unknown>) =>
-        withEgoLock(async () => {
+        withEgoLock(() => observeEgoTool(cfg, 'ego_login_import', args, async () => {
           try {
-            const domains = Array.isArray(args.domains) ? (args.domains as unknown[]).map(String) : undefined
+            const domains = asStringArray(args.domains)
             const source = typeof args.source === 'string' && args.source !== '' ? args.source : 'auto'
-            if (!['chrome', 'edge', 'brave', 'auto'].includes(source)) {
-              return { ok: false, error: `invalid source "${source}" — expected chrome|edge|brave|auto` }
+            if (!['chrome', 'edge', 'brave', 'auto', 'extension'].includes(source)) {
+              return { ok: false, error: `invalid source "${source}" — expected chrome|edge|brave|auto|extension` }
+            }
+            // #69 (A): the extension bridge is side-effect-free and works on
+            // modern Chrome/Edge, so it bypasses the Windows-ABE guard.
+            if (source === 'extension') {
+              return await importLoginCookiesFromExtension({
+                domains,
+                dryRun: args.dryRun === true,
+                timeoutMs: 120_000,
+              })
+            }
+            // Scoped #69 guard: Windows + Chrome/Edge 127+ (App-Bound
+            // Encryption) is refused — see loginImportPolicy above.
+            const guardBinary = cfg.chromePath || findChromeBinary()
+            const policy = loginImportPolicy({
+              platform: process.platform,
+              chromeMajor: detectChromeMajorVersion(guardBinary),
+              force: loginImportForced(),
+            })
+            if (!policy.allowed) {
+              return {
+                ok: false,
+                disabled: true,
+                error: `ego_login_import is disabled here: ${policy.reason}`,
+              }
             }
             return await importLoginCookies(
               {
@@ -1164,10 +2306,10 @@ function registerLoginImport(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           } catch (err) {
             return { ok: false, error: String((err as Error)?.message || err) }
           }
-        }),
-      presentCall: () => ({
+        })),
+      presentCall: (args: unknown) => ({
         card: 'generic',
-        title: 'ego_login_import',
+        title: toolCallTitle('ego_login_import', args),
         kind: 'other',
         rawInput: null,
       }),
@@ -1190,11 +2332,6 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
       opts.afterExecute?.(args, result)
     },
   })
-  const spaceParam = {
-    type: 'string',
-    description:
-      'Task-space name or numeric id; defaults to the most recently opened or explicitly selected space.',
-  }
   reg(
     t({
       name: 'ego_space_open',
@@ -1253,13 +2390,18 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_snapshot',
       description:
-        'Read the current page as text: the full-page semantic tree annotated with [ref=N, loc=...] selectors that ego_click / ego_fill can target. This is the main observation tool for any browser task.',
+        'Read the current page as text: the full-page semantic tree annotated with [ref=N, loc=...] selectors that ego_click / ego_fill can target. This is the main observation tool for any browser task. refs are re-created by every snapshot — always act from the newest one. Set diff=true to get only what changed since the previous snapshot in this task space (cheaper after the first observation); diff mode never returns actionable refs, so take a full snapshot before acting.',
       parameters: {
         space: spaceParam,
         scope: {
           type: 'string',
           description:
             "snapshot scope: 'full_page' (default) or 'only_within_viewport'.",
+        },
+        diff: {
+          type: 'boolean',
+          description:
+            'Compare with the previous snapshot in this session/space/scope and return added/removed/changed lines instead of the full tree. The first diff call returns the full tree as the baseline.',
         },
       },
       buildScript: (args) => {
@@ -1284,13 +2426,25 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           `  : { ok: true, text, tries }))\n`
         )
       },
+      transformValue: (args, value, context) => {
+        const payload = value as { ok?: unknown; text?: unknown; tries?: unknown } | null
+        if (payload === null || payload.ok !== true || typeof payload.text !== 'string') return value
+        const key = `${context.sessionId ?? '-'}:${String(
+          args.space ?? cfg.defaultSpace,
+        )}:${str(args.scope, 'full_page')}`
+        const tries = typeof payload.tries === 'number' ? payload.tries : undefined
+        return snapshotCache.observe(key, payload.text, {
+          diff: bool(args.diff, false),
+          tries,
+        })
+      },
     }),
   )
   reg(
     t({
       name: 'ego_navigate',
       description:
-        'Open a URL in the task space, or switch to the existing tab for it. Always prefer reusing existing open tabs before opening duplicate URLs. Waits for document load. Returns resulting page info.',
+        'Open a URL in the task space. By default an open tab on the SAME HOST is reused and navigated in place (reuse="origin"); reuse="exact" only switches when that exact URL is open, reuse="none" always navigates the active tab. Waits for document load. Do not navigate again to a URL that is already open.',
       parameters: {
         url: {
           type: 'string',
@@ -1305,44 +2459,31 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           type: 'number',
           description: 'Load wait timeout in ms (default 20000).',
         },
+        reuse: {
+          type: 'string',
+          description:
+            'Tab reuse policy: "origin" (default) reuses a same-host tab and navigates it in place; "exact" only reuses the exact URL; "none" always navigates the active tab.',
+        },
+        tab: tabParam,
         space: spaceParam,
       },
-      buildScript: (args) => {
-        const u = str(args.url, '')
-        // Schema marks url required, but never silently navigate to a
-        // hard-coded example page on a non-conforming empty value — report
-        // back an actionable failure instead.
-        if (u === '') {
-          return `console.log('${SENTINEL}' + JSON.stringify({ ok: false, reused: false, page: null, reason: 'ego_navigate: url is required' }))\n`
-        }
-        // Reuse the current tab in this task space (select a real tab, then
-        // navigate IN PLACE via page.goto) instead of opening a new tab every
-        // time. This keeps the agent's tab count small across a task. If a
-        // tab already shows the exact URL, we switch to it; otherwise we
-        // navigate the active tab so we don't pile up tabs.
-        // NOTE: ensureRealTab() already declares `__tabs`, so reuse it.
-        return (
-          `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-          `const __existing = __tabs.find(t => t.url.split('#')[0] === ${j(
-            u.split('#')[0],
-          )})\n` +
-          `const tab = __existing ? await browser.switchTab(__existing.targetId) : await page.goto(${j(
-            u,
-          )}, { wait: ${bool(args.wait, true)}, timeout: ${num(
-            args.timeout,
-            20_000,
-          )} })\n` +
-          `const pginfo = await page.info()\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, reused: !!__existing, page: pginfo }))\n`
-        )
-      },
+      buildScript: (args) =>
+        navigateScript({
+          url: str(args.url, ''),
+          reuse: str(args.reuse, 'origin'),
+          wait: bool(args.wait, true),
+          timeout: num(args.timeout, 20_000),
+          tab: str(args.tab, ''),
+          space: str(args.space, cfg.defaultSpace),
+        }),
     }),
   )
   reg(
     t({
       name: 'ego_click',
+      successHint: () => ACTION_SUCCESS_HINT,
       description:
-        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=N value from ego_snapshot, or viewport coordinates.',
+        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=N value from the LATEST ego_snapshot, or viewport coordinates. On a timeout or missing target, re-snapshot and rebuild the locator; do not replay the same selector. See ego_help discipline.',
       parameters: {
         selector: {
           type: 'string',
@@ -1405,8 +2546,9 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
   reg(
     t({
       name: 'ego_fill',
+      successHint: () => ACTION_SUCCESS_HINT,
       description:
-        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=N from ego_snapshot.',
+        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=N from the LATEST ego_snapshot. On a timeout or missing target, re-snapshot instead of retrying the same selector.',
       parameters: {
         selector: {
           type: 'string',
@@ -1469,7 +2611,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         space: spaceParam,
       },
       buildScript: (args) => {
-        const params = args.params
+        const params = parseJsonArg(args.params)
         const call =
           params !== undefined && params !== null
             ? `await cdp(${j(str(args.method, ''))}, ${j(params)})`
@@ -1487,7 +2629,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_screenshot',
       description:
-        'Capture a screenshot of the current page (or of a single element if selector is given). Returns the file path of the saved PNG, which you can then read with a vision/image tool.',
+        'Capture a screenshot of the current page (or of a single element if selector is given). Returns the file path of the saved PNG, which you can then read with a vision/image tool. Take screenshots only when visual evidence is actually needed (layout/rendering, user asked for one, or the target is not in the semantic tree); do not snapshot and screenshot by default.',
       parameters: {
         selector: {
           type: 'string',
@@ -1498,20 +2640,85 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           type: 'string',
           description: 'Optional absolute output path for the PNG.',
         },
+        fullPage: {
+          type: 'boolean',
+          description:
+            'Capture the whole scrollable page instead of the viewport (page screenshots only; ignored for element screenshots).',
+        },
+        clip: {
+          type: 'object',
+          additionalProperties: false,
+          description:
+            'Capture a viewport-region (page screenshots only). Coordinates are CSS pixels of the current viewport.',
+          properties: {
+            x: { type: 'number', required: true },
+            y: { type: 'number', required: true },
+            width: { type: 'number', required: true },
+            height: { type: 'number', required: true },
+          },
+        },
+        deliver: {
+          type: 'boolean',
+          description:
+            'Surface the PNG as a deliverable card in the conversation (default true). Set false to keep it a bare path.',
+        },
+        hideCursor: {
+          type: 'boolean',
+          description:
+            'Hide the agent cursor overlay while capturing (default true), then restore it. Set false to include the cursor in the PNG.',
+        },
         space: spaceParam,
       },
       buildScript: (args) => {
         const sel = str(args.selector, '')
         const pth = str(args.path, '')
+        const hideCursor = args.hideCursor !== false
+        const fullPage = args.fullPage === true
+        const clip = args.clip as
+          | { x?: unknown; y?: unknown; width?: unknown; height?: unknown }
+          | undefined
+        const hasClip =
+          clip !== undefined &&
+          typeof clip.x === 'number' &&
+          typeof clip.y === 'number' &&
+          typeof clip.width === 'number' &&
+          typeof clip.height === 'number'
+        if (clip !== undefined && !hasClip) {
+          throw new Error(
+            'ego_screenshot: clip requires numeric x, y, width and height',
+          )
+        }
+        if (sel !== '' && (fullPage || hasClip)) {
+          throw new Error(
+            'ego_screenshot: fullPage/clip only apply to page screenshots, not element screenshots (omit selector)',
+          )
+        }
+        const options: string[] = []
+        if (pth !== '') options.push(`path: ${j(pth)}`)
+        if (fullPage) options.push('fullPage: true')
+        if (hasClip) {
+          options.push(
+            `clip: { x: ${clip!.x}, y: ${clip!.y}, width: ${clip!.width}, height: ${clip!.height} }`,
+          )
+        }
+        const shotOpts = options.length > 0 ? `{ ${options.join(', ')} }` : ''
         const shot =
           sel !== ''
-            ? `await page.locator(${j(sel)}).screenshot(${pth ? `{ path: ${j(pth)} }` : ''})`
-            : `await page.screenshot(${pth ? `{ path: ${j(pth)} }` : ''})`
+            ? `await page.locator(${j(sel)}).screenshot(${shotOpts})`
+            : `await page.screenshot(${shotOpts})`
         return (
           `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-          `const path = ${shot}\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, path }))\n`
+          `${hideCursor ? `try { if (ego && ego.hideCursor) await ego.hideCursor() } catch {}\nawait new Promise(r => setTimeout(r, 60))\n` : ''}` +
+          `let path\n` +
+          `try { path = ${shot} } finally { ${hideCursor ? `try { if (ego && ego.showCursor) await ego.showCursor() } catch {}` : ''} }\n` +
+          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, path, fullPage: ${fullPage} }))\n`
         )
+      },
+      deliverFiles: (args, value) => {
+        const file = (value as { path?: unknown } | null)?.path
+        if (args.deliver === false || typeof file !== 'string' || file === '') return []
+        const selector = str(args.selector, '')
+        return [{ path: file, description: selector === '' ? 'Screenshot' : `Screenshot of ${selector}` }]
       },
     }),
   )
@@ -1529,6 +2736,47 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         `let __hc = null\n` +
         `try { __hc = await page.evaluate(${j(HUMAN_CHECK_PROBE)}).catch(() => null); } catch { __hc = null }\n` +
         `console.log('${SENTINEL}' + JSON.stringify({ ok: true, page: pginfo, humanCheck: __hc }))\n`,
+    }),
+  )
+  reg(
+    t({
+      name: 'ego_tabs',
+      description:
+        'List, switch, open, or close agent-browser tabs. Use it to keep tab hygiene: list the open pages, switch to one, open a new tab for a URL, or close scratch tabs. list also reports task spaces with their ownership (agent/user) and recent tab titles — never close or take over a user-owned space. Tab ids are stable target ids (also returned by ego_space_open / ego_navigate). After an action that may open a popup/new tab, run action="list" before deciding; never act on a targetId from memory.',
+      parameters: {
+        action: {
+          type: 'string',
+          description: "'list' (default) | 'switch' | 'open' | 'close'.",
+        },
+        targetId: {
+          type: 'string',
+          description: 'Tab target id for action=switch / action=close.',
+        },
+        url: {
+          type: 'string',
+          description: "URL for action=open (default: 'about:blank').",
+        },
+        space: spaceParam,
+      },
+      buildScript: (args) =>
+        tabsScript({
+          action: str(args.action, 'list'),
+          targetId: str(args.targetId, ''),
+          url: str(args.url, ''),
+          space: str(args.space, cfg.defaultSpace),
+        }),
+      // Tab switches must move the per-space cursor too, otherwise the next
+      // page tool would re-pin the tab this call just left.
+      afterExecute: (args, value) => {
+        const v = value as { switched?: unknown; created?: unknown } | null
+        const target = str(v?.switched, '') || str(v?.created, '')
+        if (target !== '') {
+          cfg.targetTracker.set(
+            scopedTargetKey(currentSessionId(), str(args.space, cfg.defaultSpace)),
+            target,
+          )
+        }
+      },
     }),
   )
   reg(
@@ -1594,7 +2842,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_wait_for_url',
       description:
-        'Wait until the page navigates to a URL matching a substring / glob / regex. Use to catch login redirects or pagination.',
+        'Wait until the page navigates to a URL matching a substring / glob / regex. Use to catch login redirects or pagination. IMPORTANT: it only observes navigations that happen DURING this call — if the navigation already finished in a previous ego_* call, read ego_page_info instead. Matching is Playwright semantics: a full URL or a ** glob ("**/search**"); a bare substring does not match. The result always carries the current URL.',
       parameters: {
         pattern: {
           type: 'string',
@@ -1612,14 +2860,23 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         const p = str(args.pattern, '').trim()
         if (p === '')
           return `console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, reason: 'ego_wait_for_url: pattern is required' }))\n`
+        // Two-phase: read the current URL first (the navigation may already have
+        // completed before this call — the classic false negative in #71), then
+        // wait for a FUTURE one. The pre-check is deliberately conservative: it
+        // only accepts substring matches for glob-free patterns, so it never
+        // claims a glob/regex was reached without the real wait doing the work.
         return (
           `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-          `const __ok = await page.waitForURL(${j(p)}, { timeout: ${num(
+          `const __u0 = await page.url()\n` +
+          `const __p = ${j(p)}\n` +
+          `const __isPattern = /[*?[\\\\]]/.test(__p) || __p.startsWith('/')\n` +
+          `const __already = !__isPattern && __u0.includes(__p)\n` +
+          `const __ok = __already || await page.waitForURL(__p, { timeout: ${num(
             args.timeout,
             10000,
           )} }).catch(() => false)\n` +
           `const __u = await page.url()\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: !!__ok, reached: !!__ok, url: __u }))\n`
+          `console.log('${SENTINEL}' + JSON.stringify({ ok: !!__ok, reached: !!__ok, url: __u, matchedCurrent: __already, hint: __ok ? undefined : 'waitForURL only sees FUTURE navigations: issue the wait in the same ego_script as the action that navigates, and pass a full URL or a ** glob (a bare substring does not match).' }))\n`
         )
       },
     }),
@@ -1628,7 +2885,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_wait_for_response',
       description:
-        'Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission.',
+        'Wait for a network response matching a URL/glob/regex and return it. Optionally return the body (text or JSON) — ideal for scraping API responses or confirming a submission. By default it also matches responses that already finished during the CURRENT document load (includeBuffered), because "wait for the response of the page I just opened" is the common case; set includeBuffered=false for strict future-only semantics. Across separate ego_* calls only future responses can be seen — trigger the request and the wait in the same ego_script. On timeout the result carries the current URL and a hint instead of throwing.',
       parameters: {
         url: {
           type: 'string',
@@ -1645,20 +2902,34 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           description:
             "Return the response body: 'none' (default) | 'text' | 'json'.",
         },
+        includeBuffered: {
+          type: 'boolean',
+          description:
+            'Also match responses that already completed during the current document load (default true). Set false to wait only for future responses.',
+        },
         space: spaceParam,
       },
       buildScript: (args) => {
         const u = str(args.url, '').trim()
         const mode = str(args.body, 'none')
         const wantBody = mode === 'text' || mode === 'json'
+        // A timeout must not throw: the tool's job is to report "not reached"
+        // with context (current URL) so the caller can decide, not to blow up
+        // the whole ego_* call (#71).
         return (
           `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-          `const __res = await page.waitForResponse(${j(u)}, { timeout: ${num(
+          `let __res = null, __err = null\n` +
+          `try { __res = await page.waitForResponse(${j(u)}, { timeout: ${num(
             args.timeout,
             10000,
-          )} })\n` +
-          `${wantBody ? `const __body = ${mode === 'json' ? 'await __res.json().catch(()=>null)' : 'await __res.text().catch(()=>null)'}\n` : ''}` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, url: __res.url(), status: __res.status()${wantBody ? ', body: __body' : ''} }))\n`
+          )}, includeBuffered: ${bool(args.includeBuffered, true)} }) } catch (e) { __err = String(e && e.message || e) }\n` +
+          `if (!__res) {\n` +
+          `  const __u = await page.url().catch(() => null)\n` +
+          `  console.log('${SENTINEL}' + JSON.stringify({ ok: false, reached: false, url: __u, error: __err, hint: 'no matching response arrived during this call. Include the wait in the same ego_script as the request; a cached response produces no network event (add a cache-busting query); the url pattern is a full URL or glob/regex, not a bare substring.' }))\n` +
+          `} else {\n` +
+          `${wantBody ? `  const __body = ${mode === 'json' ? 'await __res.json().catch(()=>null)' : 'await __res.text().catch(()=>null)'}\n` : ''}` +
+          `  console.log('${SENTINEL}' + JSON.stringify({ ok: true, reached: true, url: __res.url(), status: __res.status()${wantBody ? ', body: __body' : ''} }))\n` +
+          `}\n`
         )
       },
     }),
@@ -1666,6 +2937,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
   reg(
     t({
       name: 'ego_key',
+      successHint: () => ACTION_SUCCESS_HINT,
       description:
         "Press a keyboard key or shortcut combination on the current page, e.g. 'Enter', 'Tab', 'Control+a', 'Escape', 'ArrowDown'. Useful for forms, shortcuts and navigation. Pass `text` to type a string of characters instead (keyboard.type).",
       parameters: {
@@ -1782,6 +3054,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
   reg(
     t({
       name: 'ego_select',
+      successHint: () => ACTION_SUCCESS_HINT,
       description:
         'Choose an option in a <select> dropdown by value, label, or index (a single value or an array for multi-select).',
       parameters: {
@@ -1799,12 +3072,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
       },
       buildScript: (args) =>
         `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-        `await page.locator(${j(str(args.selector, ''))}).selectOption(${j(
-          args.value ?? '',
-        )})\n` +
-        `console.log('${SENTINEL}' + JSON.stringify({ ok: true, select: ${j(
-          str(args.selector, ''),
-        )} }))\n`,
+        selectOptionScript(str(args.selector, ''), parseJsonArg(args.value) ?? ''),
     }),
   )
   reg(
@@ -1830,8 +3098,9 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         space: spaceParam,
       },
       buildScript: (args) => {
-        const pts = Array.isArray(args.points)
-          ? (args.points as unknown[]).map(Number).filter((n) => Number.isFinite(n))
+        const rawPoints = parseJsonArg(args.points)
+        const pts = Array.isArray(rawPoints)
+          ? (rawPoints as unknown[]).map(Number).filter((n) => Number.isFinite(n))
           : []
         const hasEl =
           str(args.from, '') !== '' && str(args.to, '') !== ''
@@ -1937,6 +3206,11 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           type: 'number',
           description: 'How long to wait for the download in ms (default 30000).',
         },
+        deliver: {
+          type: 'boolean',
+          description:
+            'Surface the downloaded file as a deliverable card in the conversation (default true). Set false to keep it a bare path.',
+        },
         space: spaceParam,
       },
       buildScript: (args) => {
@@ -1965,11 +3239,19 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           `console.log('${SENTINEL}' + JSON.stringify({ ok: true, path: __final, suggestedFilename: __name, url: __url }))\n`
         )
       },
+      deliverFiles: (args, value) => {
+        const v = value as { path?: unknown; suggestedFilename?: unknown } | null
+        const file = v?.path
+        if (args.deliver === false || typeof file !== 'string' || file === '') return []
+        const name = typeof v?.suggestedFilename === 'string' ? v.suggestedFilename : ''
+        return [{ path: file, description: name === '' ? 'Download' : `Download: ${name}` }]
+      },
     }),
   )
   reg(
     t({
       name: 'ego_check',
+      successHint: () => ACTION_SUCCESS_HINT,
       description:
         'Check (tick) or uncheck a checkbox/radio element. Does nothing if already in the desired state.',
       parameters: {
@@ -1991,7 +3273,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_dialog',
       description:
-        'Accept or dismiss a native browser dialog (alert/confirm/prompt), optionally supplying text for a prompt. Use right after the action that triggers the dialog.',
+        'Accept or dismiss a native browser dialog (alert/confirm/prompt), optionally supplying text for a prompt. This tool only reaches a dialog that is blocking the page RIGHT NOW — a dialog fired by an earlier ego_* call has already been auto-dismissed across the call boundary. To accept a dialog triggered by a click, do both in one call: page.once("dialog", d => d.accept()); await page.click(selector). If a dialog is blocking the page, page.evaluate/snapshot calls hang until it is handled.',
       parameters: {
         accept: { type: 'boolean', description: 'true=Accept/OK (default), false=Dismiss/Cancel.' },
         text: { type: 'string', description: 'Text to type into a prompt dialog.' },
@@ -2005,12 +3287,17 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         } }`
         // Do NOT run any page.evaluate here: while a dialog is showing the page
         // JS is paused, so a Runtime.evaluate would hang. handleJavaScriptDialog
-        // is a CDP command and works even under a blocking dialog.
+        // is a CDP command and works even under a blocking dialog. The URL read
+        // is therefore only attempted on the failure path (no dialog => the page
+        // is not blocked and evaluate is safe), where it tells the caller what
+        // page the dialog "was not on".
         return (
           `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
           `const __r = await cdp("Page.handleJavaScriptDialog", ${params}).catch((e) => ({ error: String(e) }))\n` +
           `const __ok = !!(__r && !__r.error)\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, handled: __ok, accept: ${accept}, error: __r?.error ?? null }))\n`
+          `let __u = null\n` +
+          `if (!__ok) { try { __u = await page.url() } catch {} }\n` +
+          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, handled: __ok, accept: ${accept}, error: __r?.error ?? null, url: __u, hint: __ok ? undefined : 'no dialog was blocking the page. Dialogs do not survive the call that triggered them — trigger and handle in one ego_script: page.once("dialog", d => d.accept()); await page.click(...)' }))\n`
         )
       },
     }),
@@ -2030,9 +3317,10 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
         space: spaceParam,
       },
       buildScript: (args) => {
+        const headers = parseJsonArg(args.headers)
         const opts: Record<string, unknown> = {
           method: str(args.method, 'GET'),
-          headers: args.headers && typeof args.headers === 'object' ? args.headers : {},
+          headers: headers && typeof headers === 'object' ? headers : {},
           timeout: num(args.timeout, 20000),
         }
         if (str(args.body, '') !== '') opts.body = str(args.body, '')
@@ -2064,8 +3352,10 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
             type: 'string',
             required: true,
             description:
-              'Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log(JSON.stringify(...)) for a parseable sentinel payload.',
+              "Full JS script body for the heredoc; ego-browser helpers are preloaded. End with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)",
           },
+          tab: tabParam,
+          space: spaceParam,
         },
         output: {
           schema: {
@@ -2076,26 +3366,55 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
               stdout: { type: 'string', required: true },
               stderr: { type: 'string' },
               result: { type: 'json' },
+              code: { type: 'string' },
+              actionSent: { type: 'boolean' },
+              retry: { type: 'string' },
+              hint: { type: 'string' },
+              error: { type: 'string' },
             },
           },
-          render: renderText,
+          render: renderEgoToolText,
         },
         timeoutMs: TOOL_TIMEOUT_MS,
         execute: async (args: Record<string, unknown>, exec: ToolExec) => {
-          markEgoToolCall(callingSessionId(exec))
-          const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => str(args.script, ''))
-          if (!result.ok) throw new Error(result.error)
-          const parsed = parseSentinel(result.stdout)
-          return {
-            ok: true,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            result: parsed ?? null,
+          const sessionId = callingSessionId(exec)
+          pendingSessionId = sessionId
+          try {
+            markEgoToolCall(sessionId)
+            const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () =>
+              rawScriptPrelude(cfg, str(args.tab, ''), str(args.space, cfg.defaultSpace)) + str(args.script, ''),
+            )
+            if (!result.ok) {
+              // Same failure contract as the structured tools: the escape hatch
+              // must not be the one place where the model sees a bare string.
+              return {
+                ...failureValue('ego_cli', result.error ?? 'ego_cli call failed'),
+                stdout: stripTargetMarkers(result.stdout),
+                stderr: result.stderr,
+              }
+            }
+            recordPinnedTarget(
+              cfg.targetTracker,
+              scopedTargetKey(sessionId, str(args.space, cfg.defaultSpace)),
+              result.stdout,
+            )
+            const stdout = stripTargetMarkers(result.stdout)
+            const parsed = parseSentinel(stdout)
+            return {
+              ok: true,
+              stdout,
+              stderr: result.stderr,
+              // result.value carries the plugin's fallback (last JSON line) when
+              // the script forgot the sentinel — keep it visible here too (#71).
+              result: parsed ?? result.value ?? null,
+            }
+          } finally {
+            pendingSessionId = undefined
           }
         },
-        presentCall: () => ({
+        presentCall: (args: unknown) => ({
           card: 'generic',
-          title: 'ego_cli',
+          title: toolCallTitle('ego_cli', args),
           kind: 'other',
           rawInput: null,
         }),
@@ -2130,7 +3449,7 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
       },
       timeoutMs: 15_000,
       execute: async (args: Record<string, unknown>, exec: ToolExec) =>
-        withEgoLock(async () => {
+        withEgoLock(() => observeEgoTool(cfg, 'ego_captcha', args, async () => {
           markEgoToolCall(callingSessionId(exec))
           const result = await runWithStaleSpaceRetry(
             ctx,
@@ -2147,15 +3466,111 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
             detected: !!hc?.detected,
             kind: hc?.kind ?? null,
           }
-        }),
-      presentCall: () => ({ card: 'generic', title: 'ego_captcha', kind: 'other', rawInput: null }),
+        })),
+      presentCall: (args: unknown) => ({ card: 'generic', title: toolCallTitle('ego_captcha', args), kind: 'other', rawInput: null }),
+    } as unknown as DefineToolOpts),
+  )
+  reg(
+    defineTool({
+      name: 'ego_wait_for_human',
+      description:
+        'Hand the page to the human for a CAPTCHA / login / 2FA / confirmation, then wait until it is cleared. Say what you need in the conversation FIRST ("solve the challenge in the agent browser window, I will wait"), then call this. It polls the page until the challenge disappears — and, when `selector` is given, until that selector exists — returning { needed, resolved, waitedMs }. A timeout is not an error: resolved=false means "still not done", so report back and call again. This is a deliberate blocking wait; do not route it through approval flows, which auto-reject under policy "never".',
+      parameters: {
+        reason: {
+          type: 'string',
+          description: "Why the wait is needed: captcha | login | 2fa | confirm (free text is fine).",
+        },
+        timeoutSec: {
+          type: 'number',
+          description: 'How long to wait in seconds (default 60, clamped to 5–110).',
+        },
+        pollMs: {
+          type: 'number',
+          description: 'Polling interval in ms (default 1500, clamped to 250–10000).',
+        },
+        selector: {
+          type: 'string',
+          description:
+            'Optional selector that must also exist before returning (e.g. a post-login element). Omitting it waits only for the challenge to clear.',
+        },
+        space: { type: 'string', description: 'Task-space name or numeric id; defaults to this session’s space.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            ok: { type: 'boolean', required: true },
+            needed: { type: 'boolean', required: true },
+            resolved: { type: 'boolean', required: true },
+            waitedMs: { type: 'number', required: true },
+          },
+        },
+        render: renderText,
+      },
+      timeoutMs: TOOL_TIMEOUT_MS,
+      execute: async (args: Record<string, unknown>, exec: ToolExec) =>
+        withEgoLock(() => observeEgoTool(cfg, 'ego_wait_for_human', args, async () => {
+          {
+            markEgoToolCall(callingSessionId(exec))
+            const timeoutMs = Math.min(110_000, Math.max(5_000, num(args.timeoutSec, 60) * 1000))
+            const pollMs = Math.min(10_000, Math.max(250, num(args.pollMs, 1500)))
+            const selector = str(args.selector, '')
+            const spaceKey = String(str(args.space, cfg.defaultSpace))
+            const build = () => {
+              pendingTargetPin = cfg.targetTracker.get(spaceKey)
+              pendingViewport = cfg
+              try {
+                return waitForHumanScript(str(args.space, cfg.defaultSpace), {
+                  timeoutMs,
+                  pollMs,
+                  selector,
+                })
+              } finally {
+                pendingTargetPin = undefined
+                pendingViewport = undefined
+              }
+            }
+            const result = await runWithStaleSpaceRetry(ctx, cfg, exec, build)
+            if (!result.ok) {
+              return {
+                ok: false,
+                needed: true,
+                resolved: false,
+                waitedMs: 0,
+                reason: str(args.reason, 'confirm'),
+                error: result.error,
+              }
+            }
+            recordPinnedTarget(cfg.targetTracker, spaceKey, result.stdout)
+            const p = (parseSentinel(result.stdout) || {}) as Record<string, unknown>
+            const resolved = !!p.resolved
+            return {
+              ok: true,
+              needed: !!p.needed,
+              resolved,
+              waitedMs: typeof p.waitedMs === 'number' ? p.waitedMs : 0,
+              polls: typeof p.polls === 'number' ? p.polls : 0,
+              detected: !!p.detected,
+              kind: (p.kind as string | null) ?? null,
+              url: (p.url as string | null) ?? null,
+              reason: str(args.reason, 'confirm'),
+              ...(resolved
+                ? {}
+                : {
+                    hint: 'still waiting after the timeout. Make sure the user knows which window to use (the agent browser window / watch panel), say what to click, then call ego_wait_for_human again.',
+                  }),
+            }
+          }
+        })),
+      presentCall: (args: unknown) => ({ card: 'generic', title: toolCallTitle('ego_wait_for_human', args), kind: 'other', rawInput: null }),
     } as unknown as DefineToolOpts),
   )
   reg(
     defineTool({
       name: 'ego_help',
       description:
-        'Query the built-in ego-browser tool guide. `topic` may be a category (overview/tools/navigate/observe/input/keyboard-mouse/form/wait/network/login/script/doctor) or a specific tool name (e.g. ego_click). Returns the matching usage notes. Call this when unsure which eyebrow tool to use.',
+        'Query the built-in ego-browser guide. `topic` may be a category (overview/tools/navigate/tabs/observe/input/keyboard-mouse/form/wait/network/download/captcha/login/login-import/script/doctor/discipline/errors/screenshots/gui-test) or a specific tool name (e.g. ego_click). `topic=list` lists what this host offers. Read `discipline` before a multi-step task, `errors` when a tool reports a failure code, and `gui-test` for black-box UI testing.',
       parameters: {
         topic: {
           type: 'string',
@@ -2178,20 +3593,26 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
       timeoutMs: 10_000,
       execute: async (args: Record<string, unknown>) => {
         const q = str(args.topic, '').trim().toLowerCase()
-        const key = Object.prototype.hasOwnProperty.call(EGO_HELP_INDEX, q) ? q : ''
-        const text = key
-          ? EGO_HELP_INDEX[key]!
-          : (q
-              ? `未找到 topic "${q}"。可用: ` +
-                Object.keys(EGO_HELP_INDEX)
-                  .filter((k) => k !== 'overview')
-                  .join(', ') +
-                '\n\noverview: ' +
-                EGO_HELP_INDEX.overview
-              : EGO_HELP_INDEX.overview)
+        const env = { platform: process.platform }
+        if (q === 'list') {
+          return { ok: true, topic: 'list', text: renderEgoHelpList(env) }
+        }
+        const entry = Object.prototype.hasOwnProperty.call(EGO_HELP_DOCS, q)
+          ? EGO_HELP_DOCS[q]
+          : undefined
+        if (entry !== undefined) {
+          const text = isEgoHelpVisible(q, env)
+            ? entry.text
+            : `${entry.text}\n\n（当前平台不可用：该主题仅在 macOS / Windows 提供）`
+          return { ok: true, topic: q, text }
+        }
+        const available = Object.keys(EGO_HELP_DOCS).filter((name) => isEgoHelpVisible(name, env))
+        const text = q
+          ? `未找到 topic "${q}"。可用: ${available.filter((name) => name !== 'overview').join(', ')}\n\noverview: ${EGO_HELP_DOCS.overview!.text}`
+          : EGO_HELP_DOCS.overview!.text
         return { ok: true, topic: q || 'overview', text }
       },
-      presentCall: () => ({ card: 'generic', title: 'ego_help', kind: 'other', rawInput: null }),
+      presentCall: (args: unknown) => ({ card: 'generic', title: toolCallTitle('ego_help', args), kind: 'other', rawInput: null }),
     } as unknown as DefineToolOpts),
   )
   reg(
@@ -2214,13 +3635,16 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
         // vendored runtime
         lines.push(`egoBin: ${cfg.egoBin}`)
         try { lines.push(`egoBin exists: ${existsSync(cfg.egoBin)}`) } catch { lines.push('egoBin exists: n/a') }
+        const egoBinCheck = validateEgoBinPath(cfg.egoBin)
+        lines.push(`egoBin kind: ${egoBinCheck.ok ? 'node-script' : 'invalid'}`)
+        if (!egoBinCheck.ok) lines.push(`egoBin warning: ${egoBinCheck.reason}`)
         // Chrome candidates
         const chrome = findChromeBinary()
         const configured = cfg.chromePath
         if (configured) {
           lines.push(`browser binary: ${configured} (from settings)`)
         } else {
-          lines.push(`browser binary: ${chrome || '(none found — set chromePath in settings, or set EGO_LINUX_CHROME, or install Chrome/Edge/Brave)'}`)
+          lines.push(`browser binary: ${chrome || '(none found — set chromePath in settings, or set EGO_LINUX_CHROME, or install Chrome/Edge/Brave; on Termux/Android: pkg install chromium)'}`)
         }
         // User-configured extra CLI args (effective after filtering). ego-CLI
         // args take effect on the next ego_* call; Chrome args only on the next
@@ -2230,6 +3654,11 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
         const chrArgs = filterArgs(cfg.chromeArgs ?? '', CHROME_BLOCKED)
         lines.push(`egoCliArgs (effective): ${cliArgs.length ? cliArgs.join(' ') : '(none)'}`)
         lines.push(`chromeArgs (effective, next cold start): ${chrArgs.length ? chrArgs.join(' ') : '(none)'}`)
+        // #93: macOS 27 + Chrome 156 only persists cookies with --use-mock-keychain.
+        lines.push(`useMockKeychain (macOS cookie fix): ${cfg.useMockKeychain ? 'on' : 'off'}`)
+        if (process.platform === 'darwin' && !cfg.useMockKeychain) {
+          lines.push('  hint: if task-space logins vanish after a browser restart, enable "macOS cookie fix" (issue #93)')
+        }
         // state dir + runtime state
         const isWin = process.platform === 'win32'
         const e = process.env
@@ -2266,7 +3695,7 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
         lines.push('npm/node: ' + process.version)
         return { ok: true, report: lines.join('\n') }
       },
-      presentCall: () => ({ card: 'generic', title: 'ego_doctor', kind: 'other', rawInput: null }),
+      presentCall: (args: unknown) => ({ card: 'generic', title: toolCallTitle('ego_doctor', args), kind: 'other', rawInput: null }),
     } as unknown as DefineToolOpts),
   )
   reg(
@@ -2274,15 +3703,17 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
       const def = defineTool({
         name: 'ego_script',
         description:
-          'Run an arbitrary `ego-browser nodejs` heredoc script in ONE invocation (same runtime/API as ego_cli: page/…locator/browser/taskSpaces/site/fetch/cdp preloaded), and return structured {ok, stdout, stderr, result, durationMs, timedOut}. Use for a full multi-step browser task as a single script.',
+          'Run an arbitrary `ego-browser nodejs` heredoc script in ONE invocation (same runtime/API as ego_cli: page/…locator/browser/taskSpaces/site/fetch/cdp preloaded), and return structured {ok, stdout, stderr, result, durationMs, timedOut}. Use for a full multi-step browser task as a single script. NOTE: `page` is the ego runtime page facade, NOT Playwright — it has goto/reload/info/url/title/locator/getBy*/waitFor*/evaluate/screenshot/snapshot/drainEvents/keyboard/mouse but no fill/click/type/press; use ego_fill/ego_click or page.locator(...). page.goto() does not return a Playwright Response; get status via ego_wait_for_response or page.info().',
         parameters: {
           script: {
             type: 'string',
             required: true,
             description:
-              'Full JS script body; end with console.log(JSON.stringify(...)) for a parseable sentinel payload.',
+              "Full JS script body; end with console.log('@@DSH_RESULT@@' + JSON.stringify({...})) — the literal @@DSH_RESULT@@ sentinel is required. (A trailing plain JSON line is accepted as a fallback, with result.fallback=true.)",
           },
           timeoutMs: { type: 'integer', description: 'Per-run timeout in ms (default plugin grace).' },
+          tab: tabParam,
+          space: spaceParam,
         },
         output: {
           schema: {
@@ -2295,36 +3726,61 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
               result: { type: 'json' },
               durationMs: { type: 'integer' },
               timedOut: { type: 'boolean' },
+              code: { type: 'string' },
+              actionSent: { type: 'boolean' },
+              retry: { type: 'string' },
+              hint: { type: 'string' },
               error: { type: 'string' },
             },
           },
-          render: renderText,
+          render: renderEgoToolText,
         },
         timeoutMs: TOOL_TIMEOUT_MS,
         execute: async (args: Record<string, unknown>, exec: ToolExec) => {
-          markEgoToolCall(callingSessionId(exec))
-          // Honor the documented per-run timeout override (integer ms). Falls
-          // back to the plugin's default grace when absent/invalid.
-          const timeoutMs =
-            typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
-              ? args.timeoutMs
-              : undefined
-          const start = Date.now()
-          const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () => str(args.script, ''), timeoutMs)
-          const durationMs = Date.now() - start
-          if (!result.ok)
-            return { ok: false, stdout: result.stdout, stderr: result.stderr, durationMs, timedOut: false, error: result.error }
-          const parsed = parseSentinel(result.stdout)
-          return {
-            ok: true,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            result: parsed ?? null,
-            durationMs,
-            timedOut: false,
+          const sessionId = callingSessionId(exec)
+          pendingSessionId = sessionId
+          try {
+            markEgoToolCall(sessionId)
+            // Honor the documented per-run timeout override (integer ms). Falls
+            // back to the plugin's default grace when absent/invalid.
+            const timeoutMs =
+              typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
+                ? args.timeoutMs
+                : undefined
+            const start = Date.now()
+            const result = await runWithStaleSpaceRetry(ctx, cfg, exec, () =>
+              rawScriptPrelude(cfg, str(args.tab, ''), str(args.space, cfg.defaultSpace)) + str(args.script, ''), timeoutMs)
+            const durationMs = Date.now() - start
+            if (!result.ok)
+              return {
+                ...failureValue('ego_script', result.error ?? 'ego_script call failed'),
+                stdout: stripTargetMarkers(result.stdout),
+                stderr: result.stderr,
+                durationMs,
+                timedOut: false,
+              }
+            recordPinnedTarget(
+              cfg.targetTracker,
+              scopedTargetKey(sessionId, str(args.space, cfg.defaultSpace)),
+              result.stdout,
+            )
+            const stdout = stripTargetMarkers(result.stdout)
+            const parsed = parseSentinel(stdout)
+            return {
+              ok: true,
+              stdout,
+              stderr: result.stderr,
+              // result.value carries the plugin's fallback (last JSON line) when
+              // the script forgot the sentinel — keep it visible here too (#71).
+              result: parsed ?? result.value ?? null,
+              durationMs,
+              timedOut: false,
+            }
+          } finally {
+            pendingSessionId = undefined
           }
         },
-        presentCall: () => ({ card: 'generic', title: 'ego_script', kind: 'other', rawInput: null }),
+        presentCall: (args: unknown) => ({ card: 'generic', title: toolCallTitle('ego_script', args), kind: 'other', rawInput: null }),
       } as unknown as DefineToolOpts)
       return def
     })(),
