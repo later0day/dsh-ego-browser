@@ -35,7 +35,8 @@
  * 加工具：在 registerActionTools 里 reg(t({...}))，并同步 EGO_HELP_INDEX，跑 npm run build。
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { existsSync, readdirSync } from 'node:fs'
+import { chmodSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
@@ -60,7 +61,7 @@ import { registerRemoteUiTrust } from './remote-ui-trust.ts'
 import { ResidentProcess, ResidentNotRunningError, type ResidentFrame } from './resident.ts'
 import { getSharedFfmpegInstallationManager } from './ffmpeg-installation.ts'
 import { SENTINEL, j, str, num, bool, readAll, SAFE_FN, parseJsonArg, asStringArray } from './util.ts'
-import type { EgoContext, RawConfig, ResolvedConfig, SubprocessService, ToolExec, WebServerLike } from './types.ts'
+import type { AttachmentStoreLike, EgoContext, ImageAttachmentRefLike, RawConfig, ResolvedConfig, SubprocessService, ToolExec, WebServerLike } from './types.ts'
 
 export const name = 'ego-browser'
 // Platform-aware host services: the web shell exposes `webServer`, other Web
@@ -109,6 +110,13 @@ const STATUS_RULES_SUMMARY = [
 const snapshotCache = new SnapshotCache(32)
 /** Whether the host accepted the native rules prompt section. */
 let rulesSectionRegistered = false
+/**
+ * Host attachment store, captured through a service inject. Direct
+ * `ctx.attachments` access is guarded by Cordis ("without inject") and throws;
+ * an optional inject callback is the supported way to observe the service when
+ * the host provides one.
+ */
+let attachmentsStore: AttachmentStoreLike | undefined
 /**
  * Appended to interaction results so the "cheapest observation" rule arrives
  * exactly when a repeated action would otherwise be tempting.
@@ -326,6 +334,25 @@ function withEgoLock<T>(fn: () => Promise<T> | T): Promise<T> {
 const BUNDLED_WRAPPER = fileURLToPath(
   new URL('../bin/ego-chrome-wrapper.sh', import.meta.url),
 )
+/**
+ * Self-heal the bundled wrapper's executable bit.
+ *
+ * npm/tar extraction (and some proot/Android filesystems) can drop mode 755 to
+ * 600; spawning it then fails with EACCES before Chrome is ever reached
+ * (issue #98). Try to restore it eagerly and report through ego_doctor.
+ *
+ * @returns true when the wrapper exists and is executable after the attempt.
+ */
+export function ensureWrapperExecutable(path: string = BUNDLED_WRAPPER): boolean {
+  try {
+    const mode = statSync(path).mode
+    if ((mode & 0o111) !== 0) return true
+    chmodSync(path, 0o755)
+    return (statSync(path).mode & 0o111) !== 0
+  } catch {
+    return false
+  }
+}
 const IS_WIN = process.platform === 'win32'
 const IS_DARWIN = process.platform === 'darwin'
 const AUTO_ADAPT_OFF = /^(0|false|no)$/i.test(
@@ -527,7 +554,14 @@ export function resolveEgoEnv(cfg: Partial<ResolvedConfig>, { platform = process
   // wrapper execs the real binary with --no-sandbox (EGO_LINUX_CHROME takes a
   // bare path, so a wrapper is required). Never override a user-set value.
   if (env.EGO_LINUX_CHROME === undefined && isPosixRoot(platform) && chrome) {
+    ensureWrapperExecutable()
     env.EGO_LINUX_CHROME = BUNDLED_WRAPPER
+    // Keep the wrapper and ego_doctor on the same resolved binary (issue #98:
+    // the CLI found /usr/local/bin/chromium but the wrapper only scanned a
+    // fixed list).
+    if (env.EGO_LINUX_CHROME_BIN === undefined && chrome !== BUNDLED_WRAPPER) {
+      env.EGO_LINUX_CHROME_BIN = chrome
+    }
   }
   // Windows: no --no-sandbox needed (Windows Chrome has no sandbox gate), and
   // the bundled wrapper is a POSIX shell script that cannot run here. Pass the
@@ -1484,6 +1518,100 @@ export const navigateScript = (opts: {
  * Try the value first (cheap, the common case), then the label, then — for a
  * numeric argument — the index.
  */
+/**
+ * ego_click script builder.
+ *
+ * Split out so the generated heredoc is unit-testable (same pattern as
+ * tabsScript/navigateScript). Three input modes, all at the SAME point:
+ *
+ * - default: the pre-existing mouse click/dblclick path (byte-for-byte).
+ * - `touch:true`: CDP touchStart/touchEnd (H5 games and mobile-first pages that
+ *   ignore mouse events). No touchmove is ever emitted, so a tap cannot drag or
+ *   scroll the page.
+ * - `holdMs>0`: press, wait, release at the same point (mouse down/up or touch
+ *   start/end). Still no movement; dragging remains ego_drag's job.
+ *
+ * Touch with a selector uses the element center and is meant for main-document
+ * elements; for iframe content pass viewport x/y coordinates.
+ */
+export const clickScript = (opts: {
+  selector?: string
+  label?: string
+  x?: number
+  y?: number
+  double?: boolean
+  touch?: boolean
+  holdMs?: number
+  space: string | number
+}): string => {
+  const sel = opts.selector ?? ''
+  const x = opts.x
+  const y = opts.y
+  if (sel === '' && !(typeof x === 'number' && typeof y === 'number')) {
+    throw new Error(
+      'ego_click: provide either `selector` (CSS/xpath/loc/ref from ego_snapshot) or both `x` and `y` viewport coordinates',
+    )
+  }
+  const dbl = opts.double === true
+  const touch = opts.touch === true
+  const holdMs = opts.holdMs ?? 0
+  if (typeof holdMs !== 'number' || !Number.isFinite(holdMs) || holdMs < 0 || holdMs > 5000) {
+    throw new Error('ego_click: holdMs must be a number between 0 and 5000')
+  }
+  const taps = dbl ? 2 : 1
+  const point =
+    sel !== ''
+      ? `await page.elementCenter(${j(sel)})`
+      : `{ x: ${x}, y: ${y} }`
+  const betweenTaps = taps > 1 ? `  await new Promise(r => setTimeout(r, 120))\n` : ''
+  const pageInfo =
+    `const pginfo = await page.info()\n` +
+    `console.log('${SENTINEL}' + JSON.stringify({ ok: true, double: ${dbl}, touch: ${touch}, holdMs: ${holdMs}, page: pginfo }))\n`
+
+  if (touch) {
+    const hold = holdMs > 0 ? `  await new Promise(r => setTimeout(r, ${holdMs}))\n` : ''
+    return (
+      `${useSpace(opts.space)}${ensureRealTab()}` +
+      `const __p = ${point}\n` +
+      `for (let __i = 0; __i < ${taps}; __i++) {\n` +
+      `  await cdp('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: __p.x, y: __p.y }] })\n` +
+      hold +
+      `  await cdp('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })\n` +
+      betweenTaps +
+      `}\n` +
+      pageInfo
+    )
+  }
+
+  if (holdMs > 0) {
+    return (
+      `${useSpace(opts.space)}${ensureRealTab()}` +
+      `const __p = ${point}\n` +
+      `for (let __i = 0; __i < ${taps}; __i++) {\n` +
+      `  await page.mouse.move(__p.x, __p.y)\n` +
+      `  await page.mouse.down()\n` +
+      `  await new Promise(r => setTimeout(r, ${holdMs}))\n` +
+      `  await page.mouse.up()\n` +
+      betweenTaps +
+      `}\n` +
+      pageInfo
+    )
+  }
+
+  const labelOpt =
+    (opts.label ?? '') !== '' ? `{ label: ${j(opts.label ?? '')} }` : ''
+  const action =
+    sel !== ''
+      ? dbl
+        ? `await page.locator(${j(sel)}).dblclick(${labelOpt})`
+        : `await page.locator(${j(sel)}).click(${labelOpt})`
+      : dbl
+        ? `await page.mouse.dblclick(${x}, ${y})`
+        : `await page.mouse.click(${x}, ${y})`
+  return `${useSpace(opts.space)}${ensureRealTab()}${action}\n${pageInfo}`
+}
+
+
 export const selectOptionScript = (selector: string, value: unknown): string =>
   `const __sel = ${j(selector)}\n` +
   `const __v = ${j(value ?? '')}\n` +
@@ -1534,6 +1662,55 @@ function renderEgoToolText(args: unknown, value: unknown): unknown[] {
   }
   return renderText(args, value)
 }
+/**
+ * Model-visible renderer for `ego_screenshot`: an inline image block when the
+ * host saved the PNG as an attachment, otherwise the normal text/JSON render.
+ * Pure: it only reads the canonical value.
+ */
+export function renderScreenshot(args: Record<string, unknown>, value: unknown): unknown[] {
+  const v = value as
+    | { ok?: unknown; path?: unknown; attachment?: ImageAttachmentRefLike }
+    | null
+  if (v !== null && v.ok === true && v.attachment !== undefined) {
+    return [
+      { type: 'image', attachment: v.attachment },
+      { type: 'text', text: `screenshot saved: ${typeof v.path === 'string' ? v.path : ''}` },
+    ]
+  }
+  return renderEgoToolText(args, value)
+}
+
+/**
+ * Save a screenshot PNG through the host attachment service so the renderer can
+ * return an image block. Feature-detected: without an attachment service (TUI /
+ * headless / older host) the value keeps only the path, exactly as before.
+ */
+export async function attachScreenshot(
+  ctx: EgoContext,
+  args: Record<string, unknown>,
+  value: unknown,
+): Promise<unknown> {
+  const v = value as { ok?: unknown; path?: unknown } | null
+  if (v === null || v.ok !== true || typeof v.path !== 'string' || v.path === '') return value
+  if (args.inline === false) return value
+  const store = (() => {
+    if (attachmentsStore !== undefined) return attachmentsStore
+    try {
+      return ctx.get?.('attachments') as AttachmentStoreLike | undefined
+    } catch {
+      return undefined
+    }
+  })()
+  if (store === null || typeof store?.saveImage !== 'function') return value
+  try {
+    const data = await readFile(v.path)
+    const attachment = await store.saveImage({ data, mediaType: 'image/png' })
+    return { ...v, attachment }
+  } catch (error) {
+    // Inline is a convenience, never a reason for the screenshot to fail.
+    return { ...v, inlineError: error instanceof Error ? error.message : String(error) }
+  }
+}
 const commonOutputSchema = {
   type: 'object',
   additionalProperties: true,
@@ -1561,15 +1738,21 @@ interface EgoToolOptions {
   afterExecute?: (args: Record<string, unknown>, value: unknown) => void
   /**
    * Post-process the canonical tool value before it is rendered. Used by
-   * `ego_snapshot` to turn a full tree into a diff; must be pure with respect
-   * to the arguments (it may read/update plugin state such as the snapshot
-   * cache, but must not do I/O or spawn anything).
+   * `ego_snapshot` to turn a full tree into a diff and by `ego_screenshot` to
+   * save the PNG as a host attachment. May be async; the value it returns is
+   * what the renderer and the session log see.
    */
   transformValue?: (
     args: Record<string, unknown>,
     value: unknown,
     context: { sessionId?: string; spaceKey: string },
-  ) => unknown
+  ) => unknown | Promise<unknown>
+  /**
+   * Optional model-visible renderer. Must stay pure (no I/O): it reads only
+   * `args` and the already-computed canonical value. Defaults to
+   * `renderEgoToolText`.
+   */
+  render?: (args: Record<string, unknown>, value: unknown) => unknown[]
   /**
    * Optional one-line reminder appended to a successful value. Used by the
    * interaction tools to carry the "observe before repeating" rule at the
@@ -1591,7 +1774,7 @@ function defineEgoTool(ctx: EgoContext, cfg: EgoRuntimeConfig, opts: EgoToolOpti
     parameters: opts.parameters,
     output: {
       schema: commonOutputSchema,
-      render: renderEgoToolText,
+      render: opts.render ?? renderEgoToolText,
     },
     timeoutMs: TOOL_TIMEOUT_MS,
     execute: async (args: Record<string, unknown>, exec: ToolExec) =>
@@ -1634,7 +1817,7 @@ function defineEgoTool(ctx: EgoContext, cfg: EgoRuntimeConfig, opts: EgoToolOpti
           recordPinnedTarget(cfg.targetTracker, spaceKey, result.stdout)
           const value =
             typeof opts.transformValue === 'function'
-              ? opts.transformValue(args, result.value, { sessionId, spaceKey })
+              ? await opts.transformValue(args, result.value, { sessionId, spaceKey })
               : result.value
           const hint = typeof opts.successHint === 'function' ? opts.successHint(args, value) : undefined
           const finalValue =
@@ -1663,6 +1846,10 @@ function defineEgoTool(ctx: EgoContext, cfg: EgoRuntimeConfig, opts: EgoToolOpti
 
 // ── plugin entry ────────────────────────────────────────────────────────────
 export function apply(ctx: EgoContext, config: RawConfig = {}): void {
+  // Self-heal the bundled wrapper's exec bit before the first spawn: npm/tar
+  // extraction on some proot/Android hosts drops it to 600 and Chrome then
+  // fails with EACCES before any tool runs (issue #98).
+  if (!IS_WIN) ensureWrapperExecutable()
   // Install the settings bridge first: the live config source (composition
   // entry + user-layer overrides) feeds `chromePath` + cast settings into cfg
   // via getters so every spawn reads the latest value without re-registration.
@@ -1763,6 +1950,13 @@ export function apply(ctx: EgoContext, config: RawConfig = {}): void {
     get rulesPrompt() { return resolveConfig(bridge.source() as RawConfig).rulesPrompt },
   }
   const browserState = new BrowserStateStore()
+  // Capture the optional host attachment store for inline screenshots. The
+  // callback only runs on hosts that provide the service; TUI/headless hosts
+  // simply never get it and screenshots keep returning a path.
+  ctx.inject?.(['attachments'], (actx) => {
+    const store = (actx as unknown as { attachments?: AttachmentStoreLike }).attachments
+    if (store !== undefined) attachmentsStore = store
+  })
   const tui = installTui(ctx, browserState)
   installBrowserPanel(ctx, cfg, browserState, tui, {
     createTransport: () => ({ readBrowserState, readTaskSpaceGroups, ensureWorker: makeEnsureWorker(ctx, cfg, ffmpegManager), get: proxyFrom, post: proxyPost }),
@@ -2390,7 +2584,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_snapshot',
       description:
-        'Read the current page as text: the full-page semantic tree annotated with [ref=N, loc=...] selectors that ego_click / ego_fill can target. This is the main observation tool for any browser task. refs are re-created by every snapshot — always act from the newest one. Set diff=true to get only what changed since the previous snapshot in this task space (cheaper after the first observation); diff mode never returns actionable refs, so take a full snapshot before acting.',
+        'Read the current page as text: the full-page semantic tree annotated with [ref=N, loc=...] selectors that ego_click / ego_fill can target. This is the main observation tool for any browser task. refs are re-created by every snapshot — always act from the newest one. Set diff=true to get only what changed since the previous snapshot in this task space (cheaper after the first observation); diff mode never returns actionable refs, so take a full snapshot before acting. Canvas/WebGL/custom-drawn content has no semantic nodes: use ego_screenshot for it. Elements inside a cross-origin iframe do appear with a ref — click/fill them by ref, because CSS selectors only search the main document.',
       parameters: {
         space: spaceParam,
         scope: {
@@ -2483,7 +2677,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
       name: 'ego_click',
       successHint: () => ACTION_SUCCESS_HINT,
       description:
-        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=N value from the LATEST ego_snapshot, or viewport coordinates. On a timeout or missing target, re-snapshot and rebuild the locator; do not replay the same selector. See ego_help discipline.',
+        'Click an element in the current page. Target with a CSS selector, an xpath=.../loc=.../ref=N value from the LATEST ego_snapshot, or viewport coordinates. On a timeout or missing target, re-snapshot and rebuild the locator; do not replay the same selector. For elements inside a cross-origin iframe use the snapshot ref (CSS selectors only search the main document). Set touch=true for touch-first H5/mobile pages that ignore mouse clicks; holdMs presses and holds at the same point (no movement, so it never drags). See ego_help discipline.',
       parameters: {
         selector: {
           type: 'string',
@@ -2508,39 +2702,29 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           description:
             'Double-click instead of single-click. Useful for opening files/rows or triggering dblclick handlers.',
         },
+        touch: {
+          type: 'boolean',
+          description:
+            'Use touch input (touchStart/touchEnd) instead of mouse for this click. Needed by touch-first H5 games; no touchmove is emitted, so it cannot drag or scroll.',
+        },
+        holdMs: {
+          type: 'number',
+          description:
+            'Press and hold for this many milliseconds (0-5000, default 0) at the same point, then release. No pointer movement is emitted; use ego_drag for dragging.',
+        },
         space: spaceParam,
       },
-      buildScript: (args) => {
-        const sel = str(args.selector, '')
-        const x = args.x as number | undefined
-        const y = args.y as number | undefined
-        if (sel === '' && !(typeof x === 'number' && typeof y === 'number')) {
-          throw new Error(
-            'ego_click: provide either `selector` (CSS/xpath/loc/ref from ego_snapshot) or both `x` and `y` viewport coordinates',
-          )
-        }
-        const dbl = bool(args.double, false)
-        let action
-        if (sel !== '') {
-          const labelOpt =
-            str(args.label, '') !== ''
-              ? `{ label: ${j(str(args.label, ''))} }`
-              : ''
-          action = dbl
-            ? `await page.locator(${j(sel)}).dblclick(${labelOpt})`
-            : `await page.locator(${j(sel)}).click(${labelOpt})`
-        } else {
-          action = dbl
-            ? `await page.mouse.dblclick(${x}, ${y})`
-            : `await page.mouse.click(${x}, ${y})`
-        }
-        return (
-          `${useSpace(str(args.space, cfg.defaultSpace))}${ensureRealTab()}` +
-          `${action}\n` +
-          `const pginfo = await page.info()\n` +
-          `console.log('${SENTINEL}' + JSON.stringify({ ok: true, double: ${dbl}, page: pginfo }))\n`
-        )
-      },
+      buildScript: (args) =>
+        clickScript({
+          selector: str(args.selector, ''),
+          label: str(args.label, ''),
+          x: args.x as number | undefined,
+          y: args.y as number | undefined,
+          double: bool(args.double, false),
+          touch: bool(args.touch, false),
+          holdMs: num(args.holdMs, 0),
+          space: str(args.space, cfg.defaultSpace),
+        }),
     }),
   )
   reg(
@@ -2548,7 +2732,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
       name: 'ego_fill',
       successHint: () => ACTION_SUCCESS_HINT,
       description:
-        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=N from the LATEST ego_snapshot. On a timeout or missing target, re-snapshot instead of retrying the same selector.',
+        'Type text into an input field. Target with a CSS selector, xpath=..., loc=..., or ref=N from the LATEST ego_snapshot. On a timeout or missing target, re-snapshot instead of retrying the same selector. For inputs inside a cross-origin iframe use the snapshot ref (CSS selectors only search the main document).',
       parameters: {
         selector: {
           type: 'string',
@@ -2629,7 +2813,7 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
     t({
       name: 'ego_screenshot',
       description:
-        'Capture a screenshot of the current page (or of a single element if selector is given). Returns the file path of the saved PNG, which you can then read with a vision/image tool. Take screenshots only when visual evidence is actually needed (layout/rendering, user asked for one, or the target is not in the semantic tree); do not snapshot and screenshot by default.',
+        'Capture a screenshot of the current page (or of a single element if selector is given). Returns the PNG as an inline image (default) plus the saved file path. Take screenshots only when visual evidence is actually needed (layout/rendering, user asked for one, canvas/custom-drawn content, or the target is not in the semantic tree); do not snapshot and screenshot by default.',
       parameters: {
         selector: {
           type: 'string',
@@ -2661,6 +2845,11 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           type: 'boolean',
           description:
             'Surface the PNG as a deliverable card in the conversation (default true). Set false to keep it a bare path.',
+        },
+        inline: {
+          type: 'boolean',
+          description:
+            'Return the PNG as an inline image in the tool result so you can see it immediately (default true). Set false when you only need the file path.',
         },
         hideCursor: {
           type: 'boolean',
@@ -2714,6 +2903,8 @@ function registerActionTools(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (tool:
           `console.log('${SENTINEL}' + JSON.stringify({ ok: true, path, fullPage: ${fullPage} }))\n`
         )
       },
+      transformValue: (args, value) => attachScreenshot(ctx, args, value),
+      render: renderScreenshot,
       deliverFiles: (args, value) => {
         const file = (value as { path?: unknown } | null)?.path
         if (args.deliver === false || typeof file !== 'string' || file === '') return []
@@ -3645,6 +3836,12 @@ function registerHelpAndDoctor(ctx: EgoContext, cfg: EgoRuntimeConfig, reg: (too
           lines.push(`browser binary: ${configured} (from settings)`)
         } else {
           lines.push(`browser binary: ${chrome || '(none found — set chromePath in settings, or set EGO_LINUX_CHROME, or install Chrome/Edge/Brave; on Termux/Android: pkg install chromium)'}`)
+        }
+        if (!IS_WIN) {
+          const wrapperExec = ensureWrapperExecutable()
+          lines.push(`wrapper: ${BUNDLED_WRAPPER}`)
+          lines.push(`wrapper executable: ${wrapperExec ? 'yes' : 'no (chmod 755 failed; set EGO_LINUX_CHROME_BIN)'}`)
+          if (chrome) lines.push(`wrapper chrome: ${process.env.EGO_LINUX_CHROME_BIN || chrome}`)
         }
         // User-configured extra CLI args (effective after filtering). ego-CLI
         // args take effect on the next ego_* call; Chrome args only on the next

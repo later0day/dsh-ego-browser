@@ -87,6 +87,21 @@ export interface WebServerLike {
   register?(opts: RegisterRouteOptions): () => void
 }
 
+/** Serializable reference returned by the host attachment service. */
+export interface ImageAttachmentRefLike {
+  attachmentId: string
+  mediaType: string
+  bytes: number
+  width: number
+  height: number
+  name?: string
+}
+
+/** Structural subset of the host `ctx.attachments` service used by ego_screenshot. */
+export interface AttachmentStoreLike {
+  saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<ImageAttachmentRefLike>
+}
+
 export interface HttpServerLike {
   get?(path: string, handler: RouteHandler): unknown
   post?(path: string, handler: RouteHandler): unknown

@@ -2,6 +2,29 @@
 
 所有对用户可见的变更集中在各版本号下。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本语义遵循 [SemVer](http://semver.org/)。
 
+## [0.9.14] - 2026-11-10 — 视觉观测与触摸操作增强（DEV1 开发中，未发布）
+
+### 新增
+- **`ego_screenshot` 默认内联图片**：截图同时返回 `{ path, attachment }`，渲染为 image block，模型当轮即可看到画面，不再需要额外 `read_image`。依赖宿主 `ctx.attachments.saveImage()`；没有附件服务（TUI/无头/旧宿主）或保存失败时自动退回“仅路径”，不影响截图本身。新增 `inline:false` 可只保留路径。
+- **`ego_click` 新增 `touch` / `holdMs`**：`touch:true` 发 touchStart/touchEnd（4399 等 touch-first H5 游戏）；`holdMs` 在同一坐标按下→等待→抬起。两种模式都不发送 move，因此不会拖动页面或滚动；默认鼠标路径完全不变，拖拽仍只属于 `ego_drag`。
+- **Canvas / iframe 观测边界写入文档**：`ego_snapshot` 描述与 `ego_help discipline/screenshots` 明确——Canvas/WebGL/自定义绘制内容不在语义树中，必须用 `ego_screenshot`；跨域 iframe 内元素用 snapshot 的 `ref` 点击/填写，CSS selector 只搜索主文档。
+
+### 验证
+- 实机确认：4399 跨域 age iframe 内的 `#btn_login` 通过 `ref` 点击成功（弹出登录框），说明 iframe 交互无需新增 frame 工具。
+- 单元测试新增：截图在附件服务可用时返回 image block、`inline:false` 与无附件服务时自动降级。
+
+### 修复
+- 首次实机测试发现直接访问 `ctx.attachments` 会被 Cordis 的 inject 保护拒绝（`cannot get property "attachments" without inject`）。改为 `ctx.inject(['attachments'], ...)` 捕获服务 + `ctx.get` 兜底；TUI/无头宿主仍自动退回“仅路径”。
+- **安全：snapshot 不再回显密码框明文**。`input[type=password]` 的 `value` 统一输出 `••••••`，避免浏览器自动填充把真实密码写进语义树、模型上下文和会话日志；文本/普通输入仍正常显示。已用本地页面实机验证（`pwMasked=true`，无明文）。
+- **人机协作规则**：规则段与 `ego_help discipline` 新增“登录/人机验证/支付/年龄确认 → 先告诉用户，用 `ego_wait_for_human` 等待；不要猜密码、不要绕过访问控制”。
+- **#98 Android proot 环境适配**：插件启动时自愈 `bin/ego-chrome-wrapper.sh` 的执行位（npm/tar 解压可能掉成 600）；wrapper 优先使用插件解析出的 `EGO_LINUX_CHROME_BIN`，并增加 PATH `command -v` 兜底，修复“`ego_doctor` 找到 `/usr/local/bin/chromium` 但 wrapper 找不到”的不一致；`ego_doctor` 输出 wrapper 路径、执行位与最终浏览器。
+
+### 测试
+- 全量：**433 passed / 8 skipped**；typecheck 通过。
+- 新增 `tests/click-script.test.ts`（9）：默认鼠标路径不变、`touch` 只发 touchStart/touchEnd、`holdMs` 同点按下/抬起、非法 `holdMs` 拒绝、全程无 move。
+- 新增 `tests/wrapper.test.ts`（3，Windows 跳过执行位用例）：wrapper 脚本契约、执行位自愈、缺失文件降级。
+- `scripts/smoke-0.9.13.mjs`：真实 vendored runtime + 本地页面，**31/31 通过**（截图内联在无附件服务的 fake ctx 下按预期退回路径）。
+
 ## [0.9.13] - 2026-11-09 — 浏览器操作能力增强 & 观察窗 UI 重做
 
 ### 新增
