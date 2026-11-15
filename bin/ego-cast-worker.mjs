@@ -4794,7 +4794,7 @@ async function selectEncoder(path, requested, spawn$1 = defaultSpawn, capture = 
 		"h264_qsv",
 		"h264_amf",
 		"libx264"
-	] : process.platform === "darwin" ? ["h264_videotoolbox", "libx264"] : [
+	] : platform$1 === "darwin" ? ["h264_videotoolbox", "libx264"] : [
 		"h264_nvenc",
 		"h264_vaapi",
 		"h264_qsv",
@@ -4817,7 +4817,8 @@ async function selectEncoder(path, requested, spawn$1 = defaultSpawn, capture = 
 				source: capture.source,
 				fps: capture.fps,
 				maxWidth: capture.maxWidth,
-				encoder
+				encoder,
+				platform: platform$1
 			}) : [
 				"-f",
 				"lavfi",
