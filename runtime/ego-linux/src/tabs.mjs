@@ -28,7 +28,7 @@ export function createTabsApi(cdp, { port, getScope }) {
   }
 
   return {
-    async listTabs() {
+    async listTabs(options = {}) {
       const { targetInfos = [] } = await cdp.call("Target.getTargets");
       let pages = targetInfos.filter(
         (target) => target.type === "page" && !target.url.startsWith("devtools://"),
@@ -49,12 +49,15 @@ export function createTabsApi(cdp, { port, getScope }) {
       // Spaces without a context — the fallback path, and spaces re-adopted
       // after a restart — fall back to the tracked target ids, which are exact
       // for tabs the shim opened.
-      const scope = getScope ? await getScope() : null;
+      const scope = !options.all && getScope ? await getScope() : null;
       if (scope) {
         const scoped = pages.filter((target) =>
           scope.browserContextId
             ? target.browserContextId === scope.browserContextId
-            : scope.targetIds.has(target.targetId),
+            : scope.targetIds.has(target.targetId) ||
+              // A page opened by target=_blank / window.open() never goes
+              // through createTab(), but its opener is already tracked (#104).
+              (target.openerId && scope.targetIds.has(target.openerId)),
         );
         // Never hand back an empty list: a space mid-navigation, or one whose
         // only tab the user just closed, must not look like a browser with no
@@ -94,10 +97,11 @@ export function createTabsApi(cdp, { port, getScope }) {
     // browserContextId places the tab in a task space's own cookie jar; without
     // one the tab lands in the default context, which is the pre-context
     // behaviour and still correct for spaces that have no context.
-    async createTab(url = "about:blank", browserContextId = undefined) {
+    async createTab(url = "about:blank", browserContextId = undefined, options = {}) {
       const { targetId } = await cdp.call("Target.createTarget", {
         url,
         ...(browserContextId ? { browserContextId } : {}),
+        ...(options.newWindow ? { newWindow: true } : {}),
       });
       if (!targetId) throw new Error("Target.createTarget returned no targetId");
       // Make it the active tab, matching the native behaviour where a freshly

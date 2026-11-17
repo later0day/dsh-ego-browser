@@ -72,6 +72,12 @@ export async function createEgoShim({ headless = false } = {}) {
     // --- Tabs ---------------------------------------------------------------
     listTabs: tabs.listTabs,
     createTab: (url) => taskSpaces.createTabInSelectedSpace(tabs, url),
+  createWindow: (url) => {
+    // A panel user explicitly asked for a new window; let the runtime's
+    // activation guard through for this script process only.
+    process.env.EGO_LINUX_RAISE_WINDOW = "1";
+    return taskSpaces.createTabInSelectedSpace(tabs, url, { newWindow: true });
+  },
 
     // --- Observation --------------------------------------------------------
     // Reading is most of what an agent does, and none of it dispatches pointer
@@ -127,6 +133,11 @@ export async function createEgoShim({ headless = false } = {}) {
     // so this reads as `await ego.highlight("free shipping")`.
     highlight: (target, options) => cursor.highlight(target, options),
     clearHighlight: () => cursor.clearHighlight(),
+    // Screenshot support: hide the DOM cursor overlay for one capture, then
+    // restore it. The browser window keeps its cursor for the human; only the
+    // captured PNG is clean (#96).
+    hideCursor: () => cursor.hide(),
+    showCursor: () => cursor.show(),
 
     // --- App-lifecycle: no-ops on Linux -------------------------------------
     async getBrowserVersion() {

@@ -30,7 +30,7 @@ import { STATE_DIR, TASK_SPACE_FILE } from "./paths.mjs";
  * Each heredoc is a fresh Node process, so state lives in a file, not memory.
  */
 
-const EMPTY = { spaces: [], selectedId: null, nextId: 1, closedSpaces: [] };
+const EMPTY = { spaces: [], selectedId: null, nextId: 1, closedSpaces: [], orphans: {} };
 
 /**
  * How many idle-closed spaces to remember.
@@ -39,6 +39,52 @@ const EMPTY = { spaces: [], selectedId: null, nextId: 1, closedSpaces: [] };
  * enough that the state file cannot grow without bound.
  */
 const REMEMBERED_CLOSURES = 20;
+
+/**
+ * How long a page target must stay unclaimed before it is treated as an orphan.
+ *
+ * reconcile() runs before most space operations, so a target created by a tool
+ * exists for a moment before its space registers it. The same window covers a
+ * person opening a tab by hand in the agent window. Two minutes is the same
+ * patience pruneAbandoned gives a just-created space.
+ */
+const ORPHAN_GRACE_MS = 120000;
+
+/**
+ * Which live page targets belong to no space.
+ *
+ * Two-phase deliberately: a target seen orphaned once is remembered in
+ * `seenAt`, and only closed once it has STAYED orphaned past a grace period.
+ * The grace covers the window between a tool creating a tab and registering it
+ * in a space, and the window where a person opened a tab by hand to take a look
+ * at something. Blank and chrome:// targets are never candidates — a tab is
+ * about:blank for a moment on every navigation.
+ *
+ * This is the reconcile half of issue #67: the reaper no longer resurrects old
+ * tabs (stopBrowser drops Default/Sessions), and tabs that still slip in
+ * through a crash-restore or a hand-opened window are eventually swept.
+ *
+ * Exported for tests; reconcile() is the only production caller.
+ */
+export function selectOrphans(live, spaces, seenAt, now, graceMs) {
+  const claimed = new Set();
+  for (const space of spaces) {
+    for (const id of space.targetIds || []) claimed.add(id);
+  }
+  const orphans = [];
+  const next = {};
+  for (const [targetId, target] of live) {
+    if (claimed.has(targetId)) continue;
+    const url = target && typeof target.url === "string" ? target.url : "";
+    if (url === "" || url === "about:blank") continue;
+    if (url.startsWith("chrome://") || url.startsWith("devtools://")) continue;
+    const firstSeen =
+      typeof seenAt[targetId] === "number" ? seenAt[targetId] : now;
+    next[targetId] = firstSeen;
+    if (now - firstSeen >= graceMs) orphans.push(targetId);
+  }
+  return { orphans, next };
+}
 
 export function createTaskSpacesApi(cdp) {
   /**
@@ -293,6 +339,42 @@ export function createTaskSpacesApi(cdp) {
     if (await pruneAbandoned(state, live)) changed = true;
     if (await pruneIdle(state)) changed = true;
 
+    // Orphan tabs (issue #67): page targets no space claims — crash-restored
+    // pages, or tabs opened by hand in the agent window. Two-phase with a grace
+    // period, so a tab that is mid-creation or being inspected is not closed on
+    // sight. Closed ids leave a trail in closedSpaces like idle-closed spaces do.
+    const orphanNow = Date.now();
+    const orphanPlan = selectOrphans(
+      live,
+      state.spaces,
+      state.orphans || {},
+      orphanNow,
+      ORPHAN_GRACE_MS,
+    );
+    if (orphanPlan.orphans.length > 0) {
+      const urls = orphanPlan.orphans
+        .map((id) => live.get(id)?.url)
+        .filter(Boolean);
+      for (const id of orphanPlan.orphans) {
+        await cdp.call("Target.closeTarget", { targetId: id }).catch(() => {});
+      }
+      const closures = state.closedSpaces || [];
+      closures.unshift({
+        name: "(orphan tab)",
+        urls,
+        closedAt: orphanNow,
+        idleMinutes: 0,
+      });
+      state.closedSpaces = closures.slice(0, REMEMBERED_CLOSURES);
+      changed = true;
+    }
+    const nextOrphans = { ...orphanPlan.next };
+    for (const id of orphanPlan.orphans) delete nextOrphans[id];
+    if (JSON.stringify(nextOrphans) !== JSON.stringify(state.orphans || {})) {
+      state.orphans = nextOrphans;
+      changed = true;
+    }
+
     const surviving = state.spaces.filter((space) => space.targetIds.length > 0);
     if (surviving.length !== state.spaces.length) {
       // Losing its last tab is how a space ends when the user closes tabs by
@@ -462,10 +544,27 @@ export function createTaskSpacesApi(cdp) {
     async createTaskSpace(name) {
       const state = await readState();
       const browserContextId = await createSeededContext();
+      // A brand-new space used to open about:blank and leave the watch panel /
+      // page_info pointing at it until the first navigation (#103). When the
+      // persistent profile already has a real page, seed the new space's tab
+      // with the same URL instead; it is still an independent tab, but it has
+      // content immediately.
+      let initialUrl = "about:blank";
+      try {
+        const { targetInfos = [] } = await cdp.call("Target.getTargets");
+        const liveReal = targetInfos.find(
+          (target) =>
+            target.type === "page" &&
+            /^https?:\/\//.test(String(target.url || "")),
+        );
+        if (liveReal?.url) initialUrl = liveReal.url;
+      } catch {
+        // Fall back to about:blank; the next navigation still works.
+      }
       let targetId;
       try {
         ({ targetId } = await cdp.call("Target.createTarget", {
-          url: "about:blank",
+          url: initialUrl,
           ...(browserContextId ? { browserContextId } : {}),
         }));
       } catch (err) {
@@ -473,8 +572,9 @@ export function createTaskSpacesApi(cdp) {
         if (browserContextId) await disposeContext(browserContextId);
         throw err;
       }
-      await cdp.call("Target.activateTarget", { targetId }).catch(() => {});
-
+      // The blank anchor exists so a first navigation can reuse it; activating
+      // it here is what makes a newly-created space steal the watch panel and
+      // the OS foreground before it has any content (#103).
       const space = {
         id: state.nextId,
         taskId: state.nextId,
@@ -616,7 +716,7 @@ export function createTaskSpacesApi(cdp) {
       };
     },
 
-    async createTabInSelectedSpace(tabs, url) {
+    async createTabInSelectedSpace(tabs, url, options = {}) {
       const state = await readState();
       const space = state.spaces.find(
         (candidate) => candidate.id === effectiveSelectedId(state),
@@ -631,7 +731,7 @@ export function createTaskSpacesApi(cdp) {
       // about:blank for a moment during every navigation, so matching on the url
       // alone would hijack a tab that is already carrying work. "Never held a
       // page" is only true of a space that has not started yet.
-      const anchor = space && !space.lastContentAt ? await blankAnchor(space) : null;
+      const anchor = space && !space.lastContentAt && !options.newWindow ? await blankAnchor(space) : null;
       if (anchor && url && url !== "about:blank") {
         const { sessionId } = await cdp.call("Target.attachToTarget", {
           targetId: anchor,
@@ -646,7 +746,7 @@ export function createTaskSpacesApi(cdp) {
       // space's jar rather than the first tab being isolated and the rest not.
       let result;
       try {
-        result = await tabs.createTab(url, space?.browserContextId);
+        result = await tabs.createTab(url, space?.browserContextId, options);
       } catch (error) {
         // Browser contexts die with the browser, but the selected space's id
         // outlives it in the state file. Chrome then rejects the create with
@@ -659,7 +759,7 @@ export function createTaskSpacesApi(cdp) {
         }
         space.browserContextId = null;
         space.restored = true;
-        result = await tabs.createTab(url);
+        result = await tabs.createTab(url, undefined, options);
       }
       if (space && result.targetId) {
         space.targetIds.push(result.targetId);
