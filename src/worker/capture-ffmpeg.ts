@@ -76,13 +76,13 @@ export async function selectEncoder(path: string, requested: string, spawn: Spaw
   if (requested === 'software') return 'libx264'
   const candidates = requested !== 'auto' ? [requested] : platform === 'win32'
     ? ['h264_mf', 'h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264']
-    : process.platform === 'darwin' ? ['h264_videotoolbox', 'libx264'] : ['h264_nvenc', 'h264_vaapi', 'h264_qsv', 'libx264']
+    : platform === 'darwin' ? ['h264_videotoolbox', 'libx264'] : ['h264_nvenc', 'h264_vaapi', 'h264_qsv', 'libx264']
   for (const encoder of candidates) {
     const encoderArgs = encoder === 'h264_mf'
       ? ['-c:v', encoder, '-hw_encoding', '1', '-scenario', 'display_remoting']
       : ['-c:v', encoder]
     const inputArgs = platform === 'win32' && capture?.source
-      ? buildCaptureInput({ source: capture.source, fps: capture.fps, maxWidth: capture.maxWidth, encoder })
+      ? buildCaptureInput({ source: capture.source, fps: capture.fps, maxWidth: capture.maxWidth, encoder, platform })
       : ['-f', 'lavfi', '-i', 'color=size=64x64:rate=1']
     const probe = await runProbe(path, ['-hide_banner', '-loglevel', 'error', ...inputArgs, '-frames:v', '1', ...encoderArgs, '-f', 'null', '-'], spawn, 2000)
     if (probe.ok) return encoder

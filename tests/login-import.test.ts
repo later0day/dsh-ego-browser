@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   chromiumCandidates,
@@ -50,7 +51,7 @@ describe("profilesFromLocalState", () => {
     });
     const profiles = profilesFromLocalState(json, "C:\\UD");
     expect(profiles).toHaveLength(2);
-    expect(profiles[0]).toEqual({ dir: "C:\\UD\\Default", dirName: "Default", name: "Person 1" });
+    expect(profiles[0]).toEqual({ dir: join("C:\\UD", "Default"), dirName: "Default", name: "Person 1" });
     expect(profiles[1].name).toBe("Work");
   });
 
