@@ -442,6 +442,16 @@ pnpm run build   # tsdown 三 bundle：lib/index.js + lib/client.js + bin/ego-ca
 
 插件本体 GPL-3.0-only。内置 `runtime/` 为 ego-lite 的 MIT 代码。FFmpeg **不随本仓库或 npm 包分发**，仅在用户主动启用 FFmpeg 后端时由安装器下载到用户缓存；其 GPL-3.0-or-later 义务仅及于该独立下载的二进制，源码获取方式见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## Fork 定制（later0day 部署分支）
+
+本分支 `dsh-0.2.1-rc.2-compat` 在上游 v0.15.2 之上携带部署方定制，合并上游时需要 3-way merge 保留：
+
+- **`EGO_CAST_CDP_URL`**（`src/worker-client.ts`）：指向外部已运行的浏览器 CDP 端点（如 `http://127.0.0.1:9222`），cast worker 观察该浏览器而非自带 Chrome；配合 cloak 容器使用。
+- **`DSH_TRUST_REMOTE_UI`**（`src/remote-ui-trust.ts`，默认关闭）：公网 IP UI 上开启 host settings 持久化——注入 `__DSH_TRANSPORT__.ownsHost`。仅在自己掌控的部署上开启。
+- **`devDependencies` 里的 `link:../../deepseek-harness/...`**：开发时把 dsh-settings/dsh-tools 指向本地 harness 检出。
+- 构建产物（`lib/`、`bin/`）在每次合并后必须 `pnpm run build` 重新生成。
+- 推送到 fork 用 workflow-scopeless PAT：`.github/workflows/*` 保持在 fork blob（上游的 workflow 变更不带入，见各 merge 提交说明）。
+
 ## 供应链与权限说明
 
 为目录收录与审查提供的确定性事实：
