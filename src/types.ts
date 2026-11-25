@@ -143,6 +143,8 @@ export interface ResolvedConfig {
   isolateSpaces: boolean
   /** True = each DSH session gets its own task space; false = one shared space. */
   sessionScopedSpaces: boolean
+  /** Tool surface: full (default) or a compact lite profile. */
+  toolProfile: 'full' | 'lite'
   /** Minutes without an ego_* call before the backing browser is auto-stopped. 0 = off. */
   idleTimeoutMin: number
   /** True = the live frame relay (ego-cast worker + cast routes) is turned off entirely. */
@@ -155,6 +157,10 @@ export interface ResolvedConfig {
   residentIdleMin: number
   /** Inject the compact browser rules section into the system prompt after the first ego_* call. */
   rulesPrompt: boolean
+  /** Write per-session JSONL tool-call trajectories; default off. */
+  trajectory: boolean
+  /** Include raw ego_fill/ego_key text in trajectories; default off. */
+  recordText: boolean
   chromePath: string
   /** macOS only: pass `--use-mock-keychain` to Chrome so cookies flush to disk (issue #93). */
   useMockKeychain: boolean

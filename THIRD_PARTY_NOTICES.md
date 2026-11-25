@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+The ego-browser plugin itself is licensed under **GPL-3.0-only**; see LICENSE. The vendored components below keep their original licenses.
+
 This plugin **vendors** (embeds) the following open-source components from the
 [CitroLabs/ego-lite](https://github.com/CitroLabs/ego-lite) project (MIT License),
 including the Linux port work in [PR #234](https://github.com/citrolabs/ego-lite/pull/234)
@@ -13,6 +15,12 @@ including the Linux port work in [PR #234](https://github.com/citrolabs/ego-lite
 | BtbN FFmpeg builds (optional download) | https://github.com/BtbN/FFmpeg-Builds | GPL-3.0-or-later for the selected GPL build |
 | `ffmpeg-static` macOS release assets (optional download) | https://github.com/eugeneware/ffmpeg-static | GPL-3.0-or-later; upstream binaries originate from Evermeet/OSXExperts |
 | FFmpeg | https://ffmpeg.org/ | GPL-3.0-or-later for the selected builds |
+
+## 分发范围 / Distribution scope
+
+本仓库与 npm 包包含 **GPL-3.0-only** 的插件本体，以及 **MIT** 许可的内置 ego-lite 运行时（`runtime/`）。
+FFmpeg 不在分发物内：仅在用户主动启用 FFmpeg 后端时，由安装器按需下载到用户缓存，
+因此 GPL-3.0-or-later 的义务只及于该独立下载的二进制，不传导到本项目的分发物。
 
 ## FFmpeg distribution notice
 

@@ -74,6 +74,125 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			}
 		}
 
+		// ── Host control plane: DSH Remote channel, not plugin HTTP routes ──
+		//
+		// The panel's host-side facts (executor diagnostics, login-bridge health
+		// and the worker's watch/capture status) come from ONE Typert Remote
+		// service — `egoBrowser/status` — reached through `connection.rpc`, the
+		// same authenticated channel every first-party Remote call uses. No timer
+		// drives it: refreshHostStatus() runs on mount, on `connection/reset`, on
+		// window focus, and whenever the cast worker pushes a `spaces` frame, so
+		// the panel tracks the host instead of polling it.
+		//
+		// `egoBrowser/watch` does the same for the watch lease (start / switch /
+		// stop). Both endpoints are owned by src/remote.ts on the host.
+		var EGO_REMOTE_NAMESPACE = 'egoBrowser'
+		var EGO_RPC_TIMEOUT_MS = 2000
+		var HOST_STATUS_THROTTLE_MS = 4000
+		var LOGIN_PAIR_WINDOW_MS = 20000
+		var egoConnection = null
+		var hostStatusStore = createSnapshotStore({ executor: null, login: null, watch: null, loaded: false })
+		var useHostStatus = bindSnapshotSelector(hostStatusStore)
+		var hostStatusInFlight = null
+		var hostStatusLastAt = 0
+
+		/** Call one `egoBrowser/*` Remote endpoint; null when the channel is unavailable. */
+		function egoRpc(endpoint, args) {
+			var connection = egoConnection
+			if (!connection || !connection.rpc || typeof connection.rpc.call !== 'function') return Promise.resolve(null)
+			var call
+			try {
+				call = connection.rpc.call('/api', EGO_REMOTE_NAMESPACE + '/' + endpoint, { args: args || {} })
+					.then(function (result) { return result && result.ok === true ? result.value : null })
+					.catch(function () { return null })
+			} catch (e) { return Promise.resolve(null) }
+			// A missing/undispatched plugin service must not leave the panel
+			// waiting forever before it can open the SSE stream or fall back to
+			// the compatibility watch route.
+			return new Promise(function (resolve) {
+				var settled = false
+				var timer = window.setTimeout(function () {
+					if (settled) return
+					settled = true
+					resolve(null)
+				}, EGO_RPC_TIMEOUT_MS)
+				call.then(function (value) {
+					if (settled) return
+					settled = true
+					window.clearTimeout(timer)
+					resolve(value)
+				}, function () {
+					if (settled) return
+					settled = true
+					window.clearTimeout(timer)
+					resolve(null)
+				})
+			})
+		}
+
+		/**
+		 * Refresh the host-status snapshot. Throttled unless forced: the worker's
+		 * `spaces` push arrives every ~500 ms, and one Remote call per frame would
+		 * be worse than the polling this replaces.
+		 */
+		function refreshHostStatus(force?: boolean) {
+			if (hostStatusInFlight) return hostStatusInFlight
+			if (force !== true && Date.now() - hostStatusLastAt < HOST_STATUS_THROTTLE_MS) return Promise.resolve(null)
+			hostStatusLastAt = Date.now()
+			hostStatusInFlight = egoRpc('status', {}).then(function (value) {
+				hostStatusInFlight = null
+				if (!value) return null
+				hostStatusStore.update(function (s) {
+					s.executor = value.executor || null
+					s.login = value.login || null
+					s.watch = value.watch || null
+					s.loaded = true
+				})
+				// The host is authoritative for relay state. A focus/reset
+				// snapshot must be able to RE-ENABLE a relay that was disabled
+				// earlier, so apply both edges through the listeners instead of
+				// only latching "off" on a disabled watch payload.
+				if (typeof value.relay === 'boolean') frameRelaySet(value.relay !== true)
+				return value
+			}, function () { hostStatusInFlight = null; return null })
+			return hostStatusInFlight
+		}
+
+		/** One watch-lease transition (`start` | `switch` | `stop`). */
+		function egoWatch(action, body) {
+			var request: Record<string, unknown> = { action: action }
+			if (body && typeof body.clientId === 'string' && body.clientId !== '') request.clientId = body.clientId
+			if (body && typeof body.targetId === 'string' && body.targetId !== '') request.targetId = body.targetId
+			if (body && Number.isFinite(body.maxWidth) && body.maxWidth > 0) request.maxWidth = body.maxWidth
+			if (body && body.activate === true) request.activate = true
+			// The wire field is the host method's parameter name (see src/remote.ts).
+			return egoRpc('watch', { egoWatchRequest: request }).then(function (value) {
+				if (value) return value
+				// Compatibility fallback for hosts that do not dispatch a
+				// plugin-owned Typert Remote service. It is one lease transition,
+				// not a polling loop; when the Remote works this branch never runs.
+				return fetchEgo('/api/ego/watch-fallback', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify(request),
+				}).then(function (res) {
+					return res.json().catch(function () { return { ok: false } })
+				}).catch(function () { return { ok: false } })
+			})
+		}
+
+		/**
+		 * The bridge reports `paired` as "the extension talked to us in the last
+		 * 20 s". Without a poller the snapshot has to carry that freshness stamp
+		 * itself, so a stale snapshot cannot claim a pairing that went quiet.
+		 */
+		function loginPaired(login) {
+			if (!login || login.paired !== true) return false
+			var seen = Number(login.lastSeenAt)
+			if (!Number.isFinite(seen) || seen <= 0) return true
+			return Date.now() - seen < LOGIN_PAIR_WINDOW_MS
+		}
+
 		// 'betterSidebar' must NOT be declared here: hosts without
 		// dsh-better-sidebar have no such service, and the module loader keeps
 		// any row that statically injects it pending forever — which blocks the
@@ -90,6 +209,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			isolateSpacesHint: 'Disabled: use persistent disk profile, logins stay across restarts. Enabled: memory-only sandbox per task.',
 			isolateSpacesOff: 'Disabled (persistent profile, keep logins)',
 			isolateSpacesOn: 'Enabled (isolated memory sandbox)',
+			toolProfile: 'Tool profile',
+			toolProfileHint: 'Full registers every ego_* tool. Lite registers a compact core set to reduce context; use ego_script for the rest.',
+			toolProfileFull: 'Full (all tools)',
+			toolProfileLite: 'Lite (core tools only)',
 		idleTimeoutMin: 'Idle auto-stop (minutes)',
 		idleTimeoutMinHint: 'Stop the backing browser after N minutes without an ego_* call (0 = off). It cold-starts on the next call (~2-4s). Watching the panel does not count as activity.',
 		disableFrameRelay: 'Disable live frame relay',
@@ -140,6 +263,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			isolateSpacesHint: '默认关闭：使用磁盘持久化 Profile，任务中登录的账号跨电脑重启永久保留；开启后使用内存临时沙盒隔离，任务结束不落盘。',
 			isolateSpacesOff: '关闭（持久化登录态，跨电脑重启不丢失）',
 			isolateSpacesOn: '开启（严格沙盒隔离，任务结束不落盘）',
+			toolProfile: '工具精简模式',
+			toolProfileHint: 'Full 注册全部 ego_* 工具；Lite 只注册核心工具集以减少上下文，其余能力可走 ego_script。',
+			toolProfileFull: '完整（全部工具）',
+			toolProfileLite: '精简（仅核心工具）',
 		idleTimeoutMin: '空闲自动回收（分钟）',
 		idleTimeoutMinHint: 'N 分钟没有任何 ego_* 调用后自动关闭后台浏览器进程（0 = 关闭）。下次调用自动冷启动（约 2-4 秒）。观看观察窗不算活动。',
 		disableFrameRelay: '禁用画面回传',
@@ -195,6 +322,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			pinned: 'Pinned',
 			realtime: 'Live',
 			noScreenshot: '(no screenshot — about:blank or browser not rendering)',
+			captureUnavailable: 'Live view is not available',
+			captureHint: 'The agent browser window may be minimized or closed. ego_* tools still work.',
+			captureRestore: 'Restore window',
+			captureRetry: 'Reconnect',
 			noActivePages: 'No active browser pages',
 			noActiveHint: 'Pages will appear here as the agent browses with ego_*',
 			openExternal: 'Open real page',
@@ -238,6 +369,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			chromeLoginClose: 'Close',
 			noUrl: 'No URL to open',
 			closeTab: 'Close tab',
+			newWindow: 'New window',
+			back: 'Back',
+			forward: 'Forward',
+			go: 'Go',
 			newTab: '(new tab)',
 			history: 'Browsing history',
 			historyHide: 'Hide history',
@@ -277,6 +412,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			pinned: '已固定查看',
 			realtime: '正在实时浏览',
 			noScreenshot: '（暂无截图 — about:blank 或浏览器未渲染）',
+			captureUnavailable: '实时画面暂不可用',
+			captureHint: 'agent 浏览器窗口可能已最小化或关闭；ego_* 工具仍然可用。',
+			captureRestore: '恢复窗口',
+			captureRetry: '重新连接',
 			noActivePages: '暂无活跃浏览器页',
 			noActiveHint: '当 agent 开始用 ego_* 操作网页时，这里会实时显示',
 			openExternal: '⧉ 打开真实页',
@@ -320,6 +459,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			chromeLoginClose: '关闭',
 			noUrl: '无可打开的地址',
 			closeTab: '关闭标签',
+			newWindow: '新建窗口',
+			back: '后退',
+			forward: '前进',
+			go: '访问',
 			newTab: '(新标签页)',
 			history: '历史浏览轨迹',
 			historyHide: '收起历史轨迹',
@@ -365,9 +508,9 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 		// client honest about it: while the relay is OFF the panel opens NO pull
 		// connection at all (no EventSource on /api/ego/stream, no /api/ego/video
 		// fetch) and renders an explicit disabled state instead of reconnect-looping.
-		// The value arrives from two places: /ego/api/get|set (the settings card) and
-		// the `frameRelay` flag the host attaches to /api/ego/spaces and
-		// /api/ego/watch/status (the flag the panels read right before connecting).
+		// The value arrives from three places: /ego/api/get|set (the settings card),
+		// the `frameRelay` flag the host attaches to /api/ego/spaces, and the watch
+		// state inside the `egoBrowser/status` snapshot (src/remote.ts).
 		var frameRelayDisabled = false
 		var frameRelayListeners = []
 		function frameRelaySet(disabled) {
@@ -513,7 +656,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				status: 'idle',        // 'idle' | 'loading' | 'ready'
 				available: false,      // true after a successful /ego/api/get
 				writable: false,       // false when settings service is absent
-				draft: { isolateSpaces: false, disableFrameRelay: false, residentExecutor: false, residentIdleMin: '30', idleTimeoutMin: '0', chromePath: '', useMockKeychain: false, captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '1280', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
+				draft: { isolateSpaces: false, toolProfile: 'full', disableFrameRelay: false, residentExecutor: false, residentIdleMin: '30', idleTimeoutMin: '0', chromePath: '', useMockKeychain: false, captureBackend: 'auto', streamProfile: 'balanced', cdpFps: '20', cdpQuality: '55', cdpMaxWidth: '1280', cdpBackstopIntervalMs: '3000', ffmpegFps: '20', ffmpegMaxWidth: '1280', ffmpegBitrateKbps: '4000', ffmpegEncoder: 'auto', ffmpegPath: '', githubMirror: '', egoCliArgs: '', chromeArgs: '' },
 				ffmpegStatus: { state: 'checking', canDownload: false, canSelectFfmpeg: false },
 				dirty: false,
 				applyState: { kind: 'idle' }, // 'idle' | 'saving' | 'saved' | 'error'
@@ -563,6 +706,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 					s.writable = true
 			s.draft = {
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
+				toolProfile: config.toolProfile === 'lite' ? 'lite' : 'full',
 				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === 'true' || config.disableFrameRelay === 1 || config.disableFrameRelay === '1',
 				residentExecutor: config.residentExecutor === true || config.residentExecutor === 'true' || config.residentExecutor === 1 || config.residentExecutor === '1',
@@ -695,6 +839,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				s.applyState = { kind: 'saved' }
 			s.draft = {
 				isolateSpaces: config.isolateSpaces === true || config.isolateSpaces === 'true' || config.isolateSpaces === 1 || config.isolateSpaces === '1',
+				toolProfile: config.toolProfile === 'lite' ? 'lite' : 'full',
 				idleTimeoutMin: String(config.idleTimeoutMin ?? 0),
 				disableFrameRelay: config.disableFrameRelay === true || config.disableFrameRelay === 'true' || config.disableFrameRelay === 1 || config.disableFrameRelay === '1',
 				residentExecutor: config.residentExecutor === true || config.residentExecutor === 'true' || config.residentExecutor === 1 || config.residentExecutor === '1',
@@ -936,6 +1081,18 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 							],
 							disabled: busy,
 							onEdit: function (v) { controller.edit('isolateSpaces', v === 'true') },
+						}),
+						h(SettingsField, {
+							id: 'plugin-config-ego-browser-toolprofile',
+							label: t('toolProfile'),
+							hint: t('toolProfileHint'),
+							value: state.draft.toolProfile || 'full',
+							options: [
+								{ value: 'full', label: t('toolProfileFull') },
+								{ value: 'lite', label: t('toolProfileLite') },
+							],
+							disabled: busy,
+							onEdit: function (v) { controller.edit('toolProfile', v) },
 						}),
 						h(SettingsField, {
 							id: 'plugin-config-ego-browser-disableframerelay',
@@ -1238,15 +1395,8 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 
 		const SPACES_ROUTE = egoRoute('/api/ego/spaces')
 		const EGO_CLOSE_ROUTE = egoRoute('/api/ego/close')
-		const WATCH_START_ROUTE = egoRoute('/api/ego/watch/start')
-		const WATCH_SWITCH_ROUTE = egoRoute('/api/ego/watch/switch')
-		const WATCH_STOP_ROUTE = egoRoute('/api/ego/watch/stop')
-		const WATCH_STATUS_ROUTE = egoRoute('/api/ego/watch/status')
 		const VIDEO_ROUTE = egoRoute('/api/ego/video')
 
-		function postJson(path, body) {
-			return fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then(function (res) { return res.json().catch(function () { return {} }) })
-		}
 
 		function createKeyboardProxy(send) {
 			var input = document.createElement('textarea')
@@ -1517,6 +1667,21 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 		var getOptionalService = function (name) {
 			try { return typeof ctx.get === 'function' ? ctx.get(name) : undefined } catch (e) { return undefined }
 		}
+		// Host status wiring: capture the Remote connection once, seed one
+		// snapshot, then refresh only on push-shaped triggers (reconnect and
+		// window focus; the panel's SSE 'spaces' handler adds the third).
+		egoConnection = getOptionalService('connection') || null
+		void refreshHostStatus(true)
+		ctx.effect(function () {
+			var off = ctx.on('connection/reset', function () { void refreshHostStatus(true) })
+			return function () { off() }
+		}, 'ego-browser: host status invalidation')
+		ctx.effect(function () {
+			if (typeof window === 'undefined') return
+			var onFocus = function () { void refreshHostStatus(true) }
+			window.addEventListener('focus', onFocus)
+			return function () { window.removeEventListener('focus', onFocus) }
+		}, 'ego-browser: host status focus refresh')
 		var betterSidebarService = getOptionalService('betterSidebar')
 		// The one live panel. Replacing it disposes the previous mount, so the
 		// fallback can be upgraded to the native sidebar when its services appear.
@@ -1721,6 +1886,32 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
   border-radius: 50%; font-size: var(--ego-fs-meta); opacity: .5; margin-left: 1px;
 }
 .dsh-ego-side-tabclose:hover { background: var(--ego-hover); color: var(--ego-danger); opacity: 1; }
+.dsh-ego-side-newtab {
+  flex: 0 0 auto; width: 24px; height: 24px; margin: 2px 0 3px auto;
+  border: 0; border-radius: 6px; background: transparent; color: var(--ego-text-2);
+  font-size: 19px; line-height: 20px; cursor: pointer; position: sticky; right: 0;
+}
+.dsh-ego-side-newtab:hover { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-nav {
+  display: flex; align-items: center; gap: 4px; padding: 5px 10px;
+  background: var(--ego-toolbar); border-bottom: 1px solid var(--ego-border-soft);
+  flex-shrink: 0;
+}
+.dsh-ego-side-navbtn {
+  flex: 0 0 auto; min-width: 26px; height: 28px; padding: 0 6px;
+  border: 1px solid transparent; border-radius: 7px; background: transparent;
+  color: var(--ego-text-2); font-size: 17px; cursor: pointer;
+}
+.dsh-ego-side-navbtn:hover:not(:disabled) { background: var(--ego-hover); color: var(--ego-text); }
+.dsh-ego-side-navbtn:disabled { opacity: .35; cursor: default; }
+.dsh-ego-side-address {
+  flex: 1 1 auto; min-width: 60px; height: 28px; padding: 0 9px;
+  border: 1px solid var(--ego-border-soft); border-radius: 7px;
+  background: var(--ego-surface); color: var(--ego-text);
+  font: inherit; font-size: var(--ego-fs-meta); outline: none;
+}
+.dsh-ego-side-address:focus { border-color: var(--ego-accent); }
+.dsh-ego-side-go { min-width: 34px; font-size: var(--ego-fs-meta); color: var(--ego-accent); }
 
 /* ---- main body ---- */
 .dsh-ego-side-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; background: var(--ego-surface); display: flex; flex-direction: column; }
@@ -1798,6 +1989,16 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 }
 .dsh-ego-side-preset-item:hover { background: var(--ego-hover); }
 .dsh-ego-side-stage { position: relative; display: flex; align-items: center; justify-content: center; flex: 1; min-height: 0; overflow: hidden; }
+.dsh-ego-side-capture-error {
+  position: absolute; inset: 12px; z-index: 20;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  padding: 16px; text-align: center;
+  background: color-mix(in srgb, var(--ego-surface) 92%, transparent);
+  border: 1px solid var(--ego-border); border-radius: var(--ego-radius-l);
+}
+.dsh-ego-side-capture-title { font-size: var(--ego-fs-body); font-weight: 600; color: var(--ego-text); }
+.dsh-ego-side-capture-msg { max-width: 36em; font-size: var(--ego-fs-meta); color: var(--ego-text-2); line-height: 1.5; word-break: break-word; }
+.dsh-ego-side-capture-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
 .dsh-ego-side-resize { position: absolute; z-index: 10; background: transparent; }
 .dsh-ego-side-resize-right { top: 0; bottom: 0; right: 0; width: 12px; cursor: col-resize; }
 .dsh-ego-side-resize-bottom { left: 0; right: 0; bottom: 0; height: 12px; cursor: row-resize; }
@@ -1908,6 +2109,21 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
   box-shadow: var(--ego-stage-shadow);
 }
 .dsh-ego-side-livebox .dsh-ego-side-liveimg { border: 0; box-shadow: none; border-radius: 0; }
+.dsh-ego-side-ghost {
+  position: absolute; z-index: 5; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+  border-radius: 50%; border: 2px solid #4da3ff; pointer-events: none;
+  box-shadow: 0 0 0 4px rgba(77, 163, 255, .14);
+  background: rgba(77, 163, 255, .18);
+  will-change: transform, opacity;
+  contain: layout paint;
+  animation: dsh-ego-ghost-pulse 1.6s ease-out forwards;
+}
+.dsh-ego-side-ghost.hover { width: 12px; height: 12px; margin: -6px 0 0 -6px; border-color: #8fb9ff; }
+@keyframes dsh-ego-ghost-pulse {
+  0% { transform: scale(.55); opacity: .95; }
+  22% { transform: scale(1); opacity: .9; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
 .dsh-ego-side-liveimg-semantic { opacity: 0; }
 .dsh-ego-side-livebuf {
   position: absolute; inset: 0; width: 100%; height: 100%;
@@ -2038,6 +2254,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				historyOpen: false,
 				zoomHint: null,
 				wiringStale: false,
+				ghost: null,
 				backend: 'cdp', streamState: 'idle', streamMessage: '', streamGeneration: 0, streamMime: 'video/mp4; codecs="avc1.42E01E"',
 				// Mirrors the settings switch: the Tab shows the disabled state
 				// (and opens no stream) while the frame relay is off.
@@ -2199,10 +2416,12 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				self._syncWatch(target)
 			}, 700)
 		}
-		LivePreviewController.prototype._requestWatch = function (route, body) {
+		// Watch-lease transitions go through the Remote `egoBrowser/watch`
+		// endpoint (src/remote.ts) instead of three plugin HTTP routes.
+		LivePreviewController.prototype._requestWatch = function (action, body) {
 			if (this.watchRequest) return null
 			var self = this
-			this.watchRequest = postJson(route, body).finally(function () { self.watchRequest = null })
+			this.watchRequest = egoWatch(action, body).finally(function () { self.watchRequest = null })
 			return this.watchRequest
 		}
 		LivePreviewController.prototype._applyCaptureStatus = function (status) {
@@ -2216,15 +2435,28 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			this.backend = nextBackend; this.streamState = nextState; this.streamMessage = status.message || status.code || ''; this.streamGeneration = nextGeneration; this.streamMime = status.mime || this.streamMime
 			if (generationChanged || this.backend !== 'ffmpeg') this._destroyVideo()
 			this._recompute()
+			if (nextState === 'failed' && !this.captureRetryTimer && this.visible && !this.disposed) {
+				var self = this
+				this.captureRetryTimer = window.setTimeout(function () {
+					self.captureRetryTimer = null
+					if (self.disposed || !self.visible) return
+					// A failed target does not recover by itself. Drop the watch
+					// marker so the next spaces refresh starts a fresh capture on
+					// the current active target instead of keeping a frozen frame.
+					self.watchStarted = false
+					self.watchTargetId = null
+					self.refresh()
+				}, 1200)
+			}
 		}
-		LivePreviewController.prototype._syncWatch = function (targetId) {
+		LivePreviewController.prototype._syncWatch = function (targetId, activate) {
 			if (this.disposed || !this.visible || !targetId) return
 			var self = this
 			if (this.watchStopTimer) { window.clearTimeout(this.watchStopTimer); this.watchStopTimer = null }
-			var route = this.watchStarted ? WATCH_SWITCH_ROUTE : WATCH_START_ROUTE
-			if (this.watchStarted && this.watchTargetId === targetId) return
-			var body = { clientId: this.clientId, targetId: targetId, maxWidth: this.maxWidthHint }
-			var request = this._requestWatch(route, body)
+			var action = this.watchStarted ? 'switch' : 'start'
+			if (this.watchStarted && this.watchTargetId === targetId && activate !== true) return
+			var body = { clientId: this.clientId, targetId: targetId, maxWidth: this.maxWidthHint, ...(activate === true ? { activate: true } : {}) }
+			var request = this._requestWatch(action, body)
 			if (!request) { this.watchRequest.finally(function () { self._syncWatch(targetId) }); return }
 			request.then(function (status) {
 				self.watchStarted = status && status.ok !== false
@@ -2234,17 +2466,15 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				self._applyCaptureStatus(status)
 				if (!self.visible) self._stopWatch(true)
 			}).catch(function () {})
-			if (!this.watchRenewTimer) this.watchRenewTimer = window.setInterval(function () {
-				if (self.visible && self.watchTargetId) { var renewal = self._requestWatch(WATCH_START_ROUTE, { clientId: self.clientId, targetId: self.watchTargetId, maxWidth: self.maxWidthHint }); if (renewal) renewal.then(function (status) { self._applyCaptureStatus(status) }).catch(function () {}) }
-			}, 5000)
+			// The worker renews watch leases while the SSE stream is open; no
+			// per-panel 5s polling timer is needed here.
 		}
 		LivePreviewController.prototype._stopWatch = function (immediate) {
 			var self = this
-			if (this.watchRenewTimer) { window.clearInterval(this.watchRenewTimer); this.watchRenewTimer = null }
 			var stop = function () {
 				self.watchStopTimer = null
 				self.watchStarted = false; self.watchTargetId = null
-				postJson(WATCH_STOP_ROUTE, { clientId: self.clientId }).catch(function () {})
+				egoWatch('stop', { clientId: self.clientId }).catch(function () {})
 			}
 			if (immediate) stop()
 			else { if (this.watchStopTimer) window.clearTimeout(this.watchStopTimer); this.watchStopTimer = window.setTimeout(stop, 1500) }
@@ -2392,6 +2622,43 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 		LivePreviewController.prototype._renderEmpty = function () {
 			if (this.lastList.length === 0) this._processSpaces([])
 		}
+		LivePreviewController.prototype._showGhost = function (payload) {
+			if (!payload || !Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return
+			var self = this
+			this.ghostSeq = (this.ghostSeq || 0) + 1
+			var seq = this.ghostSeq
+			var vw = Number.isFinite(payload.w) && payload.w > 0 ? payload.w : null
+			var vh = Number.isFinite(payload.h) && payload.h > 0 ? payload.h : null
+			var left = null
+			var top = null
+			// The live image uses object-fit: contain, so viewport coordinates
+			// are not percentages of the box: a letterboxed frame would shift
+			// every point. Measure the displayed content rect instead.
+			try {
+				var box = this.liveImg && this.liveImg.parentElement
+				var rect = box ? box.getBoundingClientRect() : null
+				if (rect && rect.width > 0 && rect.height > 0 && vw && vh) {
+					var scale = Math.min(rect.width / vw, rect.height / vh)
+					var contentW = vw * scale
+					var contentH = vh * scale
+					left = ((rect.width - contentW) / 2 + payload.x * scale) / rect.width * 100
+					top = ((rect.height - contentH) / 2 + payload.y * scale) / rect.height * 100
+				}
+			} catch (e) { /* fall back to raw viewport percentage */ }
+			var ghost = {
+				x: payload.x,
+				y: payload.y,
+				left: left === null ? (vw ? Math.max(0, Math.min(1, payload.x / vw)) * 100 : 50) : left,
+				top: top === null ? (vh ? Math.max(0, Math.min(1, payload.y / vh)) * 100 : 50) : top,
+				kind: payload.kind === 'click' ? 'click' : 'hover',
+				seq: seq,
+			}
+			this.store.update(function (s) { s.ghost = ghost })
+			window.setTimeout(function () {
+				if (seq !== self.ghostSeq) return
+				self.store.update(function (s) { s.ghost = null })
+			}, 1600)
+		}
 		LivePreviewController.prototype._processSpaces = function (spaces) {
 			if (this.disposed) return
 			this.lastList = Array.isArray(spaces) ? spaces : []
@@ -2425,16 +2692,18 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			if (busy !== this.lastSawActive) this.lastSawActive = busy
 			this._recompute()
 		}
-		// Open the pull streams UNLESS the frame relay is disabled. The host's
-		// /api/ego/watch/status is authoritative (`frameRelay:false`), so a stale
-		// client flag can never open a stream the host refuses to serve; when the
-		// relay is off this opens NO EventSource and the Tab renders the disabled
-		// state instead of reconnect-looping.
+		// Open the pull streams UNLESS the frame relay is disabled. The host
+		// snapshot (`egoBrowser/status` → `watch`) is authoritative: its
+		// `frameRelay:false` flag means the host refuses to serve a stream, so a
+		// stale client flag can never open one. When the snapshot is unavailable
+		// (no Remote channel) the stream is attempted anyway — the host route
+		// answers the refusal itself.
 		LivePreviewController.prototype.openStream = function () {
 			if (this.disposed || !this.visible || frameRelayDisabled) return
 			var self = this
-			fetch(WATCH_STATUS_ROUTE, { cache: 'no-store' }).then(function (res) { return res.ok ? res.json() : null }).then(function (status) {
+			refreshHostStatus(true).then(function (snapshot) {
 				if (self.disposed || !self.visible || frameRelayDisabled) return
+				var status = snapshot && snapshot.watch
 				if (frameRelayOff(status)) { self.closeStream(); self._destroyVideo(); self._recompute(); return }
 				self._applyCaptureStatus(status)
 				self._connectStream()
@@ -2469,6 +2738,10 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 						// worker broadcasts this every keepalive tick (~500ms)
 						// and on tab churn, replacing the old polling loop.
 						self._processSpaces(list)
+						// Same push, second purpose: the host snapshot (executor +
+						// login bridge) is re-read on worker activity instead of on
+						// a client timer (throttled inside refreshHostStatus).
+						void refreshHostStatus()
 					}
 				} catch (e) {}
 			})
@@ -2476,6 +2749,9 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				try {
 					self._applyCaptureStatus(JSON.parse(ev.data))
 				} catch (e) {}
+			})
+			this.sse.addEventListener('cursor', function (ev) {
+				try { self._showGhost(JSON.parse(ev.data)) } catch (e) {}
 			})
 			// Debounced reconnect fallback: EventSource auto-reconnects on
 			// error; we also kick off a one-shot /api/ego/spaces fetch so the
@@ -2607,7 +2883,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				this.pinned = null
 			}
 			this._recompute()
-			this._syncWatch(this.selectedTabId || this.currentActiveId)
+			this._syncWatch(this.selectedTabId || this.currentActiveId, true)
 		}
 		LivePreviewController.prototype.closeTab = function (targetId) {
 			var self = this
@@ -2800,11 +3076,20 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			// Calling it with no args → "w is not a function" (w is the minified
 			// selector param). Pass identity selector to get the whole snapshot.
 			var state = useSnapshotRef.current(function (s) { return s })
+			var addressState = React.useState('')
+			var address = addressState[0]
+			var setAddress = addressState[1]
+			var addressEditingRef = React.useRef(false)
+			React.useEffect(function () {
+				if (addressEditingRef.current) return
+				setAddress((state.currentSpace && state.currentSpace.url) || '')
+			}, [state.currentTargetId, state.currentSpace && state.currentSpace.url])
 
 			var imgRef = React.useRef(null)
 			var videoRef = React.useRef(null)
 			var stageRef = React.useRef(null)
 			var rootRef = React.useRef(null)
+			var addressInputRef = React.useRef(null)
 			// Size-sync toggle: unlocked, the live image box drives the REAL agent
 			// browser window size (via the worker's CDP window bounds route).
 			var sizeSyncRef = React.useRef(null)
@@ -2817,56 +3102,57 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			var sizeSyncOn = sizeSyncState[0]
 			var setSizeSyncOn = sizeSyncState[1]
 
-			// #73: executor diagnostics from the host (resident/one-shot, pid,
-			// age, last rebuild reason). Polled slowly; failures are silent.
-			var residentState = React.useState(null)
-			var residentInfo = residentState[0]
-			var setResidentInfo = residentState[1]
+			// #73 + #69: ONE host snapshot, no polling. `hostStatus` carries the
+			// executor diagnostics (#73), the login-bridge health (#69) and the
+			// worker's watch status; refreshHostStatus() is driven by pushes —
+			// panel actions, SSE `spaces` frames, reconnect and window focus.
+			var hostStatus = useHostStatus(function (s) { return s }, null)
+			var residentInfo = hostStatus.executor
+			var login = hostStatus.login
+			var loginExpiryState = React.useState(0)
+			var loginExpiryVersion = loginExpiryState[0]
+			var setLoginExpiryVersion = loginExpiryState[1]
+			// `loginPaired()` is time-derived, but a quiet panel receives no
+			// spaces pushes, so nothing would re-render on expiry. Schedule one
+			// local deadline render (and refresh the host snapshot) per pairing.
 			React.useEffect(function () {
-				var disposed = false
-				var load = function () {
-					fetchEgo('/api/ego/executor', { cache: 'no-store' })
-						.then(function (r) { return r.ok ? r.json() : null })
-						.then(function (json) { if (!disposed && json && json.ok) setResidentInfo(json) })
-						.catch(function () {})
-				}
-				load()
-				var timer = window.setInterval(load, 15000)
-				return function () { disposed = true; window.clearInterval(timer) }
-			}, [])
+				if (!loginPaired(login)) return
+				var seen = Number(login && login.lastSeenAt)
+				var deadline = Number.isFinite(seen) && seen > 0 ? seen + LOGIN_PAIR_WINDOW_MS : Date.now() + LOGIN_PAIR_WINDOW_MS
+				var timer = window.setTimeout(function () {
+					setLoginExpiryVersion(function (v) { return v + 1 })
+					void refreshHostStatus(true)
+				}, Math.max(0, deadline - Date.now()) + 25)
+				return function () { window.clearTimeout(timer) }
+			}, [login && login.lastSeenAt, login && login.paired, loginExpiryVersion])
 
-			// #69 (A) v2: one-click Chrome login-state bridge. The health poll also
-			// starts the host bridge and returns the pairing port / extension path.
-			var chromeLoginState = React.useState({ phase: 'loading', paired: false, busy: false, message: '', code: '', expiresAt: 0, port: 53820, extensionPath: '', tokenPath: '' })
-			var chromeLogin = chromeLoginState[0]
-			var setChromeLogin = chromeLoginState[1]
+			// The bridge's own state rides on that snapshot; only the action
+			// feedback (busy / message / pair code) is local UI state.
+			var chromeUiState = React.useState({ busy: false, message: '', code: '', expiresAt: 0 })
+			var chromeUi = chromeUiState[0]
+			var setChromeUi = chromeUiState[1]
 			var pairOpenState = React.useState(false)
 			var pairOpen = pairOpenState[0]
 			var setPairOpen = pairOpenState[1]
+			var chromeLogin = {
+				phase: login ? (login.ok ? 'ready' : 'error') : 'loading',
+				paired: loginPaired(login),
+				busy: chromeUi.busy,
+				message: chromeUi.message,
+				code: chromeUi.code,
+				expiresAt: chromeUi.expiresAt,
+				port: (login && login.port) || 53820,
+				extensionPath: (login && login.extensionPath) || '',
+				tokenPath: (login && login.tokenPath) || '',
+			}
+			// An OPEN pairing popover means the user is pairing right now, so a
+			// short bounded refresh is legitimate here: it tracks the extension's
+			// own 20 s liveness window and stops the moment the popover closes.
 			React.useEffect(function () {
-				var disposed = false
-				var load = function () {
-					fetchEgo('/api/ego/login-extension/health', { cache: 'no-store' })
-						.then(function (r) { return r.ok ? r.json() : null })
-						.then(function (json) {
-							if (disposed || !json) return
-							setChromeLogin(function (prev) {
-								return {
-									...prev,
-									phase: json.ok ? 'ready' : 'error',
-									paired: !!json.paired,
-									port: json.port || prev.port,
-													extensionPath: json.extensionPath || prev.extensionPath,
-									tokenPath: json.tokenPath || prev.tokenPath,
-								}
-							})
-						})
-						.catch(function () {})
-				}
-				load()
-				var timer = window.setInterval(load, 8000)
-				return function () { disposed = true; window.clearInterval(timer) }
-			}, [])
+				if (!pairOpen) return
+				var timer = window.setInterval(function () { void refreshHostStatus(true) }, 2000)
+				return function () { window.clearInterval(timer) }
+			}, [pairOpen])
 
 			var loginDomainFromUrl = function (url) {
 				try {
@@ -2878,27 +3164,30 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			}
 			var startChromeLogin = function () {
 				if (chromeLogin.busy) return
-				if (!chromeLogin.paired) {
+				// Re-check freshness at click time: the rendered `paired` flag can
+				// be older than the bridge's 20s liveness deadline.
+				if (!loginPaired(login)) {
 					fetchEgo('/api/ego/login-extension/pair-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
 						.then(function (r) { return r.json() })
 						.then(function (json) {
 							if (json && json.ok) {
 								setPairOpen(true)
-								setChromeLogin(function (prev) { return { ...prev, code: json.code || '', expiresAt: json.expiresAt || 0, port: json.port || prev.port, message: '' } })
+								setChromeUi(function (prev) { return { ...prev, code: json.code || '', expiresAt: json.expiresAt || 0, message: '' } })
+								void refreshHostStatus(true)
 							} else {
-								setChromeLogin(function (prev) { return { ...prev, message: (json && json.error) || '无法启动 Chrome 登录桥接' } })
+								setChromeUi(function (prev) { return { ...prev, message: (json && json.error) || '无法启动 Chrome 登录桥接' } })
 							}
 						})
-						.catch(function (err) { setChromeLogin(function (prev) { return { ...prev, message: String((err && err.message) || err) } }) })
+						.catch(function (err) { setChromeUi(function (prev) { return { ...prev, message: String((err && err.message) || err) } }) })
 					return
 				}
 				var url = state.currentSpace && state.currentSpace.url
 				var domain = loginDomainFromUrl(url)
 				if (!domain) {
-					setChromeLogin(function (prev) { return { ...prev, message: wt('chromeLoginNoPage') } })
+					setChromeUi(function (prev) { return { ...prev, message: wt('chromeLoginNoPage') } })
 					return
 				}
-				setChromeLogin(function (prev) { return { ...prev, busy: true, message: wt('chromeLoginWaiting') } })
+				setChromeUi(function (prev) { return { ...prev, busy: true, message: wt('chromeLoginWaiting') } })
 				fetchEgo('/api/ego/login-extension/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ domains: [domain] }) })
 					.then(function (r) { return r.json() })
 					.then(function (json) {
@@ -2911,7 +3200,11 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 								.then(function (status) {
 									if (status && status.state === 'done' && status.report) {
 										var report = status.report
-										setChromeLogin(function (prev) {
+										// The import wrote cookies into the agent browser's
+										// profile: refresh the host snapshot so the panel
+										// reflects it without another user action.
+										void refreshHostStatus(true)
+										setChromeUi(function (prev) {
 											return {
 												...prev,
 												busy: false,
@@ -2921,7 +3214,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 											}
 										})
 									} else if (Date.now() - started > 125000) {
-										setChromeLogin(function (prev) { return { ...prev, busy: false, message: wt('chromeLoginTimeout') } })
+										setChromeUi(function (prev) { return { ...prev, busy: false, message: wt('chromeLoginTimeout') } })
 									} else {
 										window.setTimeout(tick, 800)
 									}
@@ -2930,7 +3223,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 						}
 						window.setTimeout(tick, 500)
 					})
-					.catch(function (err) { setChromeLogin(function (prev) { return { ...prev, busy: false, message: String((err && err.message) || err) } }) })
+					.catch(function (err) { setChromeUi(function (prev) { return { ...prev, busy: false, message: String((err && err.message) || err) } }) })
 			}
 
 			// Aspect-ratio presets: one-shot resizes, independent of the drag
@@ -2989,12 +3282,61 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 					})
 				}).catch(function () { setSizeNotice(wt('actionFailed')) })
 			}
-			var openUrlInPanel = function () {
-				var entered = window.prompt(wt('openUrlPrompt'), (currentSpace && currentSpace.url) || 'https://')
-				if (!entered) return
-				var url = entered.trim()
+			var normalizeAddress = function (value) {
+				var url = String(value || '').trim()
+				if (url === '') return ''
 				if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url
-				panelNavigate(url, false)
+				if (!/^(https?:\/\/|about:blank$)/i.test(url)) return ''
+				return url
+			}
+			var raiseAgentWindow = function () {
+				return fetchEgo('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+					.then(function (r) { return r.json().catch(function () { return null }) })
+					.catch(function () { return null })
+			}
+			var openNewWindow = function (url) {
+				setSizeNotice('')
+				fetchEgo('/api/ego/open-window', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ url: url || 'about:blank' }),
+				}).then(function (r) {
+					return r.json().catch(function () { return null }).then(function (parsed) {
+						if (parsed && parsed.ok === true && parsed.targetId) {
+							setSizeNotice('')
+							controller._syncWatch(parsed.targetId, true)
+							controller.refresh()
+						} else {
+							setSizeNotice((parsed && parsed.error) || wt('actionFailed'))
+						}
+						return parsed
+					})
+				}).catch(function () { setSizeNotice(wt('actionFailed')) })
+			}
+			var submitAddress = function () {
+				var url = normalizeAddress(address)
+				if (url === '') { setSizeNotice(wt('noUrl')); return }
+				addressEditingRef.current = false
+				if (!currentSpace) openNewWindow(url)
+				else panelNavigate(url, false)
+			}
+			var historyAction = function (action) {
+				var targetId = currentSpace && currentSpace.targetId
+				if (!targetId) return
+				setSizeNotice('')
+				fetchEgo('/api/ego/history', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ targetId: targetId, action: action }),
+				}).then(function (r) {
+					return r.json().catch(function () { return null }).then(function (parsed) {
+						if (parsed && parsed.ok === true) { setSizeNotice(''); controller.refresh() }
+						else setSizeNotice((parsed && parsed.error) || wt('actionFailed'))
+					})
+				}).catch(function () { setSizeNotice(wt('actionFailed')) })
+			}
+			var openUrlInPanel = function () {
+				if (addressInputRef.current) addressInputRef.current.focus()
 			}
 			var maximizeWindow = function () {
 				var targetId = currentSpace && currentSpace.targetId
@@ -3304,27 +3646,67 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 			}
 
 			// Tab strip
-			var tabsEl = state.spaces.length > 0
-				? h('div', { className: 'dsh-ego-side-tabs' },
-					state.spaces.map(function (s) {
-						var isActive = s.targetId === state.selectedTabId || (state.selectedTabId === null && s.targetId === state.currentTargetId)
-						return h('div', {
-							key: s.targetId,
-							className: 'dsh-ego-side-tab' + (isActive ? ' active' : ''),
-							title: s.url || '',
-							onClick: function () { controller.selectTab(s.targetId) },
-						},
-							h('span', { className: 'dsh-ego-side-tabdot' }),
-							h('span', { className: 'dsh-ego-side-tabtxt' }, s.title || s.url || wt('newTab')),
-							h('span', {
-								className: 'dsh-ego-side-tabclose',
-								title: wt('closeTab'),
-								onClick: function (e) { e.stopPropagation(); controller.closeTab(s.targetId) },
-							}, '×')
-						)
-					})
-				)
-				: null
+			var tabsEl = h('div', { className: 'dsh-ego-side-tabs' },
+				state.spaces.map(function (s) {
+					var isActive = s.targetId === state.selectedTabId || (state.selectedTabId === null && s.targetId === state.currentTargetId)
+					return h('div', {
+						key: s.targetId,
+						className: 'dsh-ego-side-tab' + (isActive ? ' active' : ''),
+						title: s.url || '',
+						onClick: function () { controller.selectTab(s.targetId) },
+					},
+						h('span', { className: 'dsh-ego-side-tabdot' }),
+						h('span', { className: 'dsh-ego-side-tabtxt' }, s.title || s.url || wt('newTab')),
+						h('span', {
+							className: 'dsh-ego-side-tabclose',
+							title: wt('closeTab'),
+							onClick: function (e) { e.stopPropagation(); controller.closeTab(s.targetId) },
+						}, '×')
+					)
+				}),
+				h('button', {
+					className: 'dsh-ego-side-newtab',
+					type: 'button',
+					title: wt('newWindow'),
+					onClick: function () { openNewWindow('about:blank') },
+				}, '+')
+			)
+
+			// Basic browser controls: history + editable address bar.
+			var navBar = h('div', { className: 'dsh-ego-side-nav' },
+				h('button', {
+					className: 'dsh-ego-side-navbtn', type: 'button', title: wt('back'),
+					disabled: !state.currentSpace && !state.currentTargetId,
+					onClick: function () { historyAction('back') },
+				}, '‹'),
+				h('button', {
+					className: 'dsh-ego-side-navbtn', type: 'button', title: wt('forward'),
+					disabled: !state.currentSpace && !state.currentTargetId,
+					onClick: function () { historyAction('forward') },
+				}, '›'),
+				h('button', {
+					className: 'dsh-ego-side-navbtn', type: 'button', title: wt('refreshHint'),
+					disabled: !state.currentSpace && !state.currentTargetId,
+					onClick: function () { panelNavigate('', true) },
+				}, icon(ICON_REFRESH)),
+				h('input', {
+					ref: addressInputRef,
+					className: 'dsh-ego-side-address',
+					type: 'text',
+					spellCheck: false,
+					autoComplete: 'off',
+					placeholder: 'about:blank',
+					value: address,
+					onFocus: function () { addressEditingRef.current = true },
+					onBlur: function () { addressEditingRef.current = false },
+					onChange: function (e) { setAddress(e.target.value) },
+					onKeyDown: function (e) { if (e.key === 'Enter') { e.preventDefault(); submitAddress() } },
+				}),
+				h('button', {
+					className: 'dsh-ego-side-navbtn dsh-ego-side-go', type: 'button', title: wt('go'),
+					onClick: submitAddress,
+				}, wt('go'))
+			)
 
 			// Main live view
 			var body
@@ -3337,6 +3719,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 					)
 				)
 			} else {
+				var captureError = state.streamState === 'failed'
 				var liveImg = state.backend === 'ffmpeg'
 					? h('video', {
 						ref: bindLiveVideo, key: 'livevideo-' + state.streamGeneration, className: 'dsh-ego-side-liveimg', muted: true, autoPlay: true, playsInline: true,
@@ -3360,6 +3743,16 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 						}),
 						h('img', { ref: bindLiveBufA.current, key: 'livebuf-a', className: 'dsh-ego-side-liveimg dsh-ego-side-livebuf', alt: '', draggable: false, decoding: 'async' }),
 						h('img', { ref: bindLiveBufB.current, key: 'livebuf-b', className: 'dsh-ego-side-liveimg dsh-ego-side-livebuf', alt: '', draggable: false, decoding: 'async' }),
+						state.ghost
+							? h('div', {
+								key: 'ghost-' + state.ghost.seq,
+								className: 'dsh-ego-side-ghost' + (state.ghost.kind === 'hover' ? ' hover' : ''),
+								style: {
+									left: state.ghost.left + '%',
+									top: state.ghost.top + '%',
+								},
+							})
+							: null,
 					)
 					: h('div', { className: 'dsh-ego-side-liveurl' }, state.streamMessage || wt('noScreenshot'))
 
@@ -3378,7 +3771,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 							h('div', { className: 'dsh-ego-side-actionline' },
 								h('div', { className: 'dsh-ego-side-btngroup' },
 									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('openExternal'), onClick: function () { var url = currentSpace.url; if (url && !url.startsWith('about:') && !url.startsWith('chrome://')) window.open(url, '_blank', 'noopener') } }, icon(ICON_OPEN_EXTERNAL), wt('openExternal')),
-									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('raiseWindowHint'), onClick: function () { fetchEgo('/api/ego/raise', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(function (r) { return r.json().catch(function () { return null }) }).catch(function () { return null }) } }, icon(ICON_POPOUT), wt('raiseWindow')),
+									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('raiseWindowHint'), onClick: raiseAgentWindow }, icon(ICON_POPOUT), wt('raiseWindow')),
 									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('refreshHint'), disabled: !currentSpace, onClick: function () { panelNavigate('', true) } }, icon(ICON_REFRESH), wt('refreshPage')),
 									h('button', { className: 'dsh-ego-side-back', type: 'button', title: wt('openUrlHint'), disabled: !currentSpace, onClick: openUrlInPanel }, icon(ICON_LINK), wt('openUrl'))
 								),
@@ -3392,6 +3785,28 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 						),
 						h('div', { className: 'dsh-ego-side-stage' + (sizeSyncOn ? ' dsh-ego-size-unlocked' : ''), ref: stageRef },
 							liveImg,
+							captureError
+								? h('div', { className: 'dsh-ego-side-capture-error', role: 'status' },
+									h('div', { className: 'dsh-ego-side-capture-title' }, wt('captureUnavailable')),
+									h('div', { className: 'dsh-ego-side-capture-msg' }, state.streamMessage || wt('captureHint')),
+									h('div', { className: 'dsh-ego-side-capture-actions' },
+										h('button', {
+											className: 'dsh-ego-side-back', type: 'button', onClick: function () {
+												void raiseAgentWindow().then(function () {
+													controller.refresh()
+													if (currentSpace) controller._syncWatch(currentSpace.targetId, true)
+												})
+											},
+										}, wt('captureRestore')),
+										h('button', {
+											className: 'dsh-ego-side-back', type: 'button', onClick: function () {
+												if (currentSpace) panelNavigate(currentSpace.url || '', false)
+												controller.refresh()
+											},
+										}, wt('captureRetry'))
+									)
+								)
+								: null,
 							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-right', title: wt('resizeHint'), onPointerDown: beginResize('x') }),
 							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-bottom', title: wt('resizeHint'), onPointerDown: beginResize('y') }),
 							h('div', { className: 'dsh-ego-side-resize dsh-ego-side-resize-corner', title: wt('resizeHint'), onPointerDown: beginResize('xy') })
@@ -3404,6 +3819,7 @@ const fetchEgo = function (path: string, init?: RequestInit) { return fetch(egoR
 				header,
 				guides,
 				tabsEl,
+				navBar,
 				currentSpace
 					? h('div', { className: 'dsh-ego-side-pageinfo dsh-ego-side-pageinfo-tabs' },
 						h('span', { className: 'dsh-ego-side-livetitle', title: currentSpace.title || currentSpace.url || '' }, currentSpace.title || currentSpace.url || wt('newTab')),

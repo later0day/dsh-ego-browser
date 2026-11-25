@@ -2,6 +2,143 @@
 
 所有对用户可见的变更集中在各版本号下。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本语义遵循 [SemVer](http://semver.org/)。
 
+## [0.15.2] - 2026-11-23 — GPL-3.0-only 许可证变更
+
+### 变更
+- **项目本体改为 GPL-3.0-only**（`LICENSE`、npm/manifest 元数据与 README）。
+- `runtime/` 内置 ego-lite 组件继续保留原始 MIT 许可；FFmpeg 仍不随包分发，按需下载并单独遵循 GPL-3.0-or-later，详见 `THIRD_PARTY_NOTICES.md`。
+
+### 说明
+已发布的 0.15.1 及更早版本仍按 MIT 授权；本版本起的新发布物使用 GPL-3.0-only。
+
+## [0.15.1] - 2026-11-21 — 安全修复：设置网关鉴权
+
+### 修复
+- **`/ego/api/*` 纳入 DSH 鉴权**：设置网关现在要求与 `/api/ego/*` 相同的 `dsh-auth-*` cookie；无凭据请求返回 401。
+- **执行相关设置仅限本地配置**：`chromePath`、`ffmpegPath`、`chromeArgs`、`egoCliArgs` 不再允许通过 HTTP 设置网关写入（返回 `local-config-only` / 403）；仍可通过 profile 配置文件设置。
+- 新增 `SECURITY.md` 并启用 GitHub Private Vulnerability Reporting。
+
+### 测试
+- 新增未鉴权 get/set 拒绝、执行配置 HTTP 写入拒绝的回归测试；全量 **484 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.15.0] - 2026-11-21 — 工具精简模式
+
+### 新增
+- **`toolProfile: full | lite`**：默认 `full`，保持全部 35 个工具；`lite` 只注册核心工具集，降低工具 schema 的上下文占用。
+- lite 核心集：`ego_status`、`ego_help`、`ego_doctor`、`ego_navigate`、`ego_page_info`、`ego_snapshot`、`ego_read_element`、`ego_click`、`ego_fill`、`ego_key`、`ego_scroll`、`ego_verify`、`ego_wait`、`ego_wait_for_human`、`ego_tabs`、`ego_space_open`、`ego_space_close`、`ego_script`、`ego_replay`、`ego_screenshot`。
+- 未注册的工具仍可通过 `ego_script` 访问底层运行时；切换 profile 需要重新挂载插件。
+- 设置页和 TUI settings section 均加入 Tool profile 选择。
+- **capture 失败态**（#112/#114）：窗口最小化/关闭导致 capture failed 时，面板显示错误状态卡和「恢复窗口 / 重新连接」按钮，不再整块空白。
+
+### 说明
+这是静态注册时裁剪，不是运行时动态加载；真正的“按需加载工具”仍需要 DSH 工具注册层支持，后续单独设计。
+
+### 测试
+- 新增 lite profile 注册测试与 config 默认值测试；全量 **482 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.14.2] - 2026-11-20 — spaces 快返回 + ego_scroll 正确性
+
+### 修复
+- **无浏览器时 `/api/ego/spaces` 不再拉起 worker**（#107/#108）：没有 live worker/browser 时直接返回空列表，避免用户未开 agent 浏览器时反复 spawn worker。
+- **`ensureWorker()` 不再死等**（#108）：worker 启动后立即退出时，等待循环在进程结束的 100ms 内中止，而不是等满 8 秒。
+- **`ego_scroll` 返回稳定后的偏移**（#109/#110）：滚动前读取一次，滚动后轮询到坐标稳定（上限 400ms），返回 `before` / `after` / `moved` / `settled` / `atEnd` / `deltaX` / `deltaY`；`scrollX` / `scrollY` 保持最终位置语义。
+- 合并后重新生成 `lib/index.js`，确保 npm 包包含 scroll 修复。
+
+### 测试
+- 全量 **480 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.14.1] - 2026-11-16 — 观察窗 watch fallback
+
+### 修复
+- **地址栏导航后侧栏停在 `idle / 未接管`**：Remote `egoBrowser/watch` 未返回时增加 2 秒超时，并回退到 `/api/ego/watch-fallback` 的 host 代理；该路径只做一次租约切换，不是轮询。
+- **Remote 调用不再无限等待**：`egoRpc` 统一加超时，避免状态或 watch 调用悬挂时侧栏不打开 SSE/不建立 capture。
+
+### 测试
+- 全量 **471 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.14.0] - 2026-11-16 — 侧栏基础浏览器
+
+### 新增
+- **标签栏 `+` 新建独立窗口**：放在标签栏最右侧，点击直接创建 `about:blank` 的独立 Chrome 窗口并激活；不做菜单，不额外询问 URL。
+- **常驻地址栏**：显示当前页面 URL，可直接编辑、Enter/Go 访问；没有页面时输入 URL 会先创建窗口再访问。
+- **前进/后退/刷新**：新增 `/api/ego/history`，worker 通过 `Page.getNavigationHistory` / `Page.navigateToHistoryEntry` 执行。
+- **用户操作激活真实 Chrome**：新建窗口/切换标签/面板导航走显式激活；模型 `ego_*` 仍保持 #99 不抢前台。
+- **watch lease 不再由 client 轮询续租**：worker 在 SSE 连接打开期间本地 `touchAll()` 续期，面板稳定打开时不再每 5 秒发一次租约请求。
+- 继承 0.13.2 的 lazy Remote、relay 恢复和配对过期修复。
+
+### 测试
+- 新增 `tests/panel-browser-controls.test.ts`、`tests/polling-efficiency.test.ts`；全量 **471 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.13.2] - 2026-11-16 — Remote review follow-up
+
+### 修复
+- **headless 安装不再被 optional peer 拖垮**：`lib/index.js` 不再静态 import `@deepseek-ai/dsh-typert-protocol`；Remote 适配器拆成 `lib/remote.js`，只在 webServer 激活后动态加载，缺 peer 时捕获并降级。
+- **relay 重新启用**：`egoBrowser/status` 的 `relay:true` 通过 `frameRelaySet(false)` 清除旧的 disabled 状态，面板不再永久卡在 disabled。
+- **配对过期**：`lastSeenAt` 到期时安排一次 deadline render，并在点击登录时重新检查 freshness，避免 20s 后仍按“已配对”导入 cookie。
+
+### 说明
+tsdown/rolldown 不能可靠输出标准装饰器语法，因此继续使用 `markRemote` 手工调用上游装饰器工厂；产物中不保留 `@Remote(...)` 语法。
+
+### 测试
+- 全量 **463 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.13.1] - 2026-11-16 — 观察窗稳定性 + DSH Remote 宿主通道
+
+### 修复 / 变更
+- **新窗口/后台 target 冻结**：capture session 启用 `Emulation.setFocusEmulationEnabled`，隐藏 target 也能产生 screencast 帧；实测后台动画页 3 秒 99 帧。
+- **侧栏切换不跟随真实 Chrome**：用户点击侧栏 tab 时传 `activate:true`，worker 直连 CDP 执行 `Target.activateTarget` + `Page.bringToFront`；模型 `ego_*` 仍保持 #99 不抢前台。
+- **capture 会话失效不恢复**：`Session with given id not found` 时清除 session、重新 attach、重试一次；client 收到 failed 时重建 watch lease。
+- **保存密码气泡卡住 screencast**：agent profile 冷启动默认关闭 Chrome 密码管理器（`credentials_enable_service=false`、`profile.password_manager_enabled=false`）；`EGO_LINUX_DISABLE_PASSWORD_MANAGER=0` 可恢复。
+- **观察窗宿主状态改走 DSH Remote**：`GET /api/ego/executor`、`GET /api/ego/login-extension/health`、`GET/POST /api/ego/watch/*` 下线，改由 `egoBrowser/status` + `egoBrowser/watch` 两个 Remote 端点承载；前端通过 `connection.rpc.call('/api', ...)` 复用宿主鉴权/信封/错误码。
+- **状态刷新改为推送驱动**：面板挂载、`connection/reset`、窗口 focus、SSE `spaces` 帧（4s 节流）和用户动作触发；只有配对浮层打开期间保留 2s 自终止刷新。
+
+### 测试
+- 新增 `tests/capture-recovery.test.ts`、`tests/remote-endpoints.test.ts`；typecheck/build 通过。
+
+
+## [0.13.0] - 2026-11-15 — 回放与观察窗幽灵光标
+
+### 新增
+- **`ego_replay`**：读取 `trajectory` JSONL，按顺序通过同一套 ego_* 脚本构建器重新执行；返回逐步骤 ok/error，失败即停（可配置 `stopOnError:false`）。脱敏的 `ego_fill` / `ego_key` 文本跳过，不把 `<redacted>` 当真实输入；回放时忽略旧的 `snapshotId`，由回放过程重新观察。
+- **观察窗幽灵光标（P2-6）**：host 在 `ego_click` / `ego_hover` 后广播 SSE `cursor` 事件，前端在实时画面上叠加带渐隐动画的光标/点击波纹；不改变页面 DOM，也不影响截图。
+
+### 测试
+- 全量：**453 passed / 8 skipped**；typecheck/build 通过。
+- `ego_replay` 与幽灵光标需重启 DSH 后真实浏览器验证。
+
+## [0.12.0] - 2026-11-15 — 轨迹记录 + 原生能力兜底
+
+### 新增
+- **`trajectory` / `recordText` 设置**：开启后每个会话写一份 JSONL 轨迹到 `~/.dsh/plugin-data/ego-browser/trajectories/<session>.jsonl`，记录 tool / args / ok / code / actionSent / durationMs / url / space / snapshotId；默认关闭。
+- **默认脱敏**：`ego_fill` / `ego_key` 的 `text` / `value` 默认写 `<redacted>`，只有 `recordText:true` 才记录原文。
+- **`scripts/replay.mjs`**：读取轨迹 JSONL，校验完整性并输出有序回放计划（`--json` 可交给能执行工具调用的宿主）；失败步骤、非法行会返回非零。真实自动重发仍需宿主工具执行入口。
+- **原生对话框兜底**：检测到 `cua_driver_native__*` 时，`ego_help` 增加 `native` 主题，系统规则提示文件选择/打印/证书/权限弹窗改用桌面工具；不封装、不耦合 CUA 工具。
+
+### 测试
+- 新增 `tests/trajectory.test.ts`：JSONL 字段、脱敏、关闭时不落盘。
+- 新增 `tests/help-topics.test.ts` native 可见性用例。
+- 全量：**453 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.11.0] - 2026-11-15 — 观察成本分级：子树 / 截断 / 续读
+
+### 新增
+- **`ego_snapshot` 作用域裁剪（P1-3）**：`subtreeRef` 只返回指定 ref 的子树；`maxChars` 默认 24000，超出时返回 `truncated:true` + `continuation`；`continuation` 绑定 `snapshotId`，旧代次重新快照会返回 `STALE_REF`。所有裁剪在插件侧完成，不依赖 runtime 扩展。
+
+### 测试
+- 新增 `tests/snapshot-slice.test.ts`：子树缩进裁剪、maxChars 截断、续读游标、非法 ref/越界/格式校验。
+- 全量：**449 passed / 8 skipped**；typecheck/build 通过。
+
+## [0.10.0] - 2026-11-15 — CUA 启发 P0：动作后置断言 + 快照代次
+
+### 新增
+- **`ego_verify`**：1–8 个 `selector` / `text` / `value` / `url` / `count` 谓词 AND 组合，支持 `timeoutMs`、`stableSamples`、`pollMs`。返回 `verdict: satisfied | unsatisfied | unknown`；`unknown`（例如页面被对话框阻塞）永不等于成功。一次 `page.evaluate` 评估全部谓词，页面内轮询，不反复 spawn。
+- **`snapshotId` + `STALE_REF`**：`ego_snapshot` 返回快照代次；`ego_click` / `ego_fill` / `ego_check` / `ego_select` / `ego_hover` / `ego_drag` 可传 `snapshotId`。旧代次在动作发送前 fail-closed：`code:STALE_REF`、`actionSent:false`、`retry:reobserve`。不传 `snapshotId` 时行为不变。
+- `ego_help` 的 tools/errors/observe/discipline 与系统规则同步更新。
+
+### 测试
+- 新增 `tests/verify-snapshot.test.ts`：谓词匹配、URL glob、非法谓词、快照代次推进/diff 保持、STALE_REF 分类。
+- 全量：**445 passed / 8 skipped**；typecheck/build 通过。
+
 ## [0.9.15] - 2026-11-14 — Windows 焦点 / 观察窗 / 弹窗与标签修复（#99–#104）
 
 ### 修复
@@ -206,7 +343,7 @@
 - **macOS 开箱可用（#65、#68）**：两处平台缺口叠在一起，使 macOS 首装第一次调用任意 `ego_*` 工具必然失败。其一，`COMMON_CHROME_BINS` 只列 Linux 路径、`resolveEgoEnv()` 的注入条件也不含 darwin，而 macOS 上 Chrome 不在 `PATH` 里（只在 `.app` bundle 内），于是报 `no Chrome/Chromium binary found`；现在由 `darwinChromeCandidates()` 探测 Chrome / Chromium / Edge / Brave（含 `~/Applications`），并像 win32 一样把结果注入 `EGO_LINUX_CHROME`。其二，填好路径后仍会撞运行时 `ensureXDisplay()`：它只给 win32 留了"有桌面会话、无 X server"的豁免，而 macOS 在这一点上完全同形（GUI 是 Aqua/Quartz，永不导出 `$DISPLAY`，Xvfb 也不存在于该生态），现在同样豁免。`isHeadlessDetected` 保持排除 darwin——把缺 `$DISPLAY` 当成无头正是 #16 的回归。真机验证：macOS arm64 + Chrome 154，冷启动 → navigate → 截图 → `ego_doctor` 全通。
 
 ### 社区
-- macOS 适配（#65/#68）来自社区 PR [#72](https://github.com/Fisfzy/dsh-ego-browser/pull/72)（@syjnzh918），由其基于当时主干提交并附 macOS arm64 真机冷启动验证；本次将其移植到 0.9.1 后的主线上（解冲突、保留后续 win32/no-Xvfb、常驻执行器与观察窗改动，并补回归测试）。
+- macOS 适配（#65/#68）来自社区 PR [#72](https://github.com/omdsh-dev/dsh-ego-browser/pull/72)（@syjnzh918），由其基于当时主干提交并附 macOS arm64 真机冷启动验证；本次将其移植到 0.9.1 后的主线上（解冲突、保留后续 win32/no-Xvfb、常驻执行器与观察窗改动，并补回归测试）。
 
 ## [0.9.1] - 2026-10-23 — 观察窗尺寸同步 / 帧链路性能 / 输入映射修复
 

@@ -236,6 +236,14 @@ const manager = new CaptureManager({
   },
 })
 
+// The panel's SSE connection owns the watch lease while it is open. Renewing
+// from this single worker timer replaces one POST per panel per 5 seconds.
+const watchLeaseKeepAlive = setInterval(() => {
+  if (sseClients.size > 0) manager.touchAll()
+}, 30_000)
+watchLeaseKeepAlive.unref?.()
+
+
 async function readBrowserState(): Promise<{ port?: number } | null> {
   try { return JSON.parse(await import('node:fs/promises').then((fs) => fs.readFile(BROWSER_STATE_FILE, 'utf8'))) as { port?: number } }
   catch { return null }
@@ -284,6 +292,42 @@ async function listTargets(): Promise<Array<{ targetId: string; url: string; tit
   if (!active) return []
   const result = await active.cdp.call('Target.getTargets') as { targetInfos?: Array<{ targetId: string; url: string; title: string; type: string }> }
   return (result.targetInfos || []).filter((target) => target.type === 'page')
+}
+
+/**
+ * A user explicitly picked a tab in the watch panel. Unlike model-initiated
+ * activation (muted by the runtime transport for #99), this should move the
+ * real Chrome tab/window to the target.
+ */
+async function activateWatchedTarget(targetId: string): Promise<void> {
+  if (!active) return
+  await active.cdp.call('Target.activateTarget', { targetId }).catch(() => {})
+  await active.sessions.call(targetId, 'Page.bringToFront').catch(() => {})
+}
+
+/** Read or move through the page's navigation history. */
+async function navigationHistory(targetId: string, action?: 'back' | 'forward'): Promise<Record<string, unknown>> {
+  if (!active) throw new Error('no live browser')
+  const history = await active.sessions.call(targetId, 'Page.getNavigationHistory') as {
+    currentIndex?: number
+    entries?: Array<{ id?: number; url?: string; title?: string }>
+  }
+  const entries = Array.isArray(history.entries) ? history.entries : []
+  const currentIndex = typeof history.currentIndex === 'number' ? history.currentIndex : -1
+  if (action === 'back' || action === 'forward') {
+    const nextIndex = currentIndex + (action === 'back' ? -1 : 1)
+    const entry = entries[nextIndex]
+    if (!entry || typeof entry.id !== 'number') throw new Error(`cannot go ${action}: no history entry`)
+    await active.sessions.call(targetId, 'Page.navigateToHistoryEntry', { entryId: entry.id })
+    return { ok: true, action, currentIndex: nextIndex }
+  }
+  return {
+    ok: true,
+    currentIndex,
+    canGoBack: currentIndex > 0,
+    canGoForward: currentIndex >= 0 && currentIndex < entries.length - 1,
+    entries: entries.slice(0, 50).map((entry) => ({ url: entry.url || '', title: entry.title || '' })),
+  }
 }
 
 async function activeTargetId(): Promise<string | null> {
@@ -597,8 +641,17 @@ async function main(): Promise<void> {
       if (req.method === 'GET' && url.pathname === '/api/watch/status') return sendJson(res, 200, { ok: true, ...manager.status() })
       if (req.method === 'GET' && url.pathname === '/api/video/status') return sendJson(res, 200, { ok: true, ...manager.status(), mime: videoInit?.mime || null })
       if (req.method === 'POST' && url.pathname === '/api/config') { castConfig = normalizeConfig(await readJson(req)); await manager.updateConfig(); return sendJson(res, 200, { ok: true, config: castConfig }) }
-      if (req.method === 'POST' && url.pathname === '/api/watch/start') { if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' }); return sendJson(res, 200, { ok: true, ...await manager.startWatch(await readJson(req) as { clientId: string; targetId: string; backend?: string; maxWidth?: number }) }) }
-      if (req.method === 'POST' && url.pathname === '/api/watch/switch') return sendJson(res, 200, { ok: true, ...await manager.switchWatch(await readJson(req) as { clientId: string; targetId: string; maxWidth?: number }) })
+      if (req.method === 'POST' && url.pathname === '/api/watch/start') {
+        if (!active) return sendJson(res, 409, { ok: false, error: 'no live browser' })
+        const body = await readJson(req) as { clientId: string; targetId: string; backend?: string; maxWidth?: number; activate?: boolean }
+        if (body.activate === true) await activateWatchedTarget(body.targetId)
+        return sendJson(res, 200, { ok: true, ...await manager.startWatch(body) })
+      }
+      if (req.method === 'POST' && url.pathname === '/api/watch/switch') {
+        const body = await readJson(req) as { clientId: string; targetId: string; maxWidth?: number; activate?: boolean }
+        if (body.activate === true) await activateWatchedTarget(body.targetId)
+        return sendJson(res, 200, { ok: true, ...await manager.switchWatch(body) })
+      }
       if (req.method === 'POST' && url.pathname === '/api/watch/stop') return sendJson(res, 200, { ok: true, ...await manager.stopWatch(await readJson(req) as { clientId: string }) })
       if (req.method === 'POST' && url.pathname === '/api/input') {
         const body = await readJson(req)
@@ -634,6 +687,22 @@ async function main(): Promise<void> {
           return sendJson(res, 200, { ok: true, targetId, ...(body.reload === true ? { reloaded: true } : { navigated: true }) })
         } catch (error) {
           return sendJson(res, 503, { ok: false, code: 'navigate-failed', error: (error as Error).message || String(error) })
+        }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/history') {
+        if (!active) return sendJson(res, 409, { ok: false, code: 'browser-disconnected', error: 'no live browser' })
+        const body = await readJson(req)
+        const targetId = typeof body.targetId === 'string' && body.targetId ? body.targetId : await activeTargetId()
+        if (!targetId) return sendJson(res, 409, { ok: false, error: 'no active target' })
+        const targets = await listTargets()
+        if (!targets.some((target) => target.targetId === targetId)) {
+          return sendJson(res, 409, { ok: false, code: 'target-stale', error: 'target is no longer available' })
+        }
+        try {
+          const action = body.action === 'back' || body.action === 'forward' ? body.action : undefined
+          return sendJson(res, 200, await navigationHistory(targetId, action))
+        } catch (error) {
+          return sendJson(res, 503, { ok: false, code: 'history-failed', error: (error as Error).message || String(error) })
         }
       }
       if (req.method === 'POST' && url.pathname === '/api/close') { const { targetId } = await readJson(req); if (!active || !targetId) return sendJson(res, 400, { ok: false, error: 'targetId required' }); await active.cdp.call('Target.closeTarget', { targetId }); return sendJson(res, 200, { ok: true }) }
